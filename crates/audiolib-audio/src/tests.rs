@@ -422,7 +422,7 @@ fn spectral_noise_tone_noise_survives_zoom_and_cache_rebuild() {
             } else if (2.3..3.7).contains(&time) {
                 assert!((peak.dominant_hz - 619.0).abs() < 3.0);
                 let color = peak.color.unwrap();
-                assert!(color[0] > color[2] + 70 && color[1] > color[2] + 70);
+                assert!(color[1] > color[0] + 70 && color[2] > color[0] + 70);
             }
         }
         let cache_path = fs::read_dir(&cache)
@@ -490,7 +490,7 @@ fn short_resonance_stays_colored_between_broadband_noise_segments() {
     let resonance = &wave.peaks[0][100];
     assert!((resonance.dominant_hz - 2470.0).abs() < 5.0);
     assert!(resonance.tonality > 0.4, "{resonance:?}");
-    assert!(resonance.color.unwrap()[1] > 150);
+    assert!(resonance.color.unwrap()[2] > 150);
     for index in [20, 60, 140, 180] {
         assert_eq!(wave.peaks[0][index].color, Some(SPECTRAL_PEAK_BASE));
     }

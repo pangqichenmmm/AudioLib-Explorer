@@ -1,6 +1,8 @@
-# AudioLib Explorer 便携版
+# AudioLib Explorer — Maomao Edition 便携版
 
-双击 `AudioLibExplorer.exe` 或 `Start-AudioLibExplorer.cmd` 启动。此版本不需要 Python。
+基于官方 0.7.5，由 Maomao（pangqichenmmm）维护。设置页色带与实际频谱峰值使用 REAPER 参考配色。
+
+双击 `Start-AudioLibExplorer.cmd` 启动。此入口会关闭官方更新检查，后续版本从 https://github.com/pangqichenmmm/AudioLib-Explorer/releases 下载。直接运行 EXE 会绕过该设置。此版本不需要 Python。
 
 窗口顶部的菜单栏提供日常基本操作，并随界面语言切换：
 

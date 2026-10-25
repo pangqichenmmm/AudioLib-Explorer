@@ -1,4 +1,8 @@
-# AudioLib Explorer
+# AudioLib Explorer — Maomao Edition
+
+Maintained by [Maomao (pangqichenmmm)](https://github.com/pangqichenmmm), based on [upstream AudioLib Explorer v0.7.5](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.7.5). The Windows client uses a vivid, REAPER-reference Spectral Peaks palette in both the settings legend and the Waveform. The underlying frequency analysis is preserved; the colors are a visual calibration, not a reproduction of REAPER's internal algorithm.
+
+由 Maomao 维护的个人分支，基于官方 0.7.5，保留 REAPER 参考频谱峰值配色。请从[本仓库 Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases)下载 Windows 便携包，并通过 `Start-AudioLibExplorer.cmd` 启动。启动脚本关闭官方更新检查，后续升级从本分支重新合并和发布。每台电脑的配置、凭据和缓存仍保存在本机。
 
 <img src="resources/icons/AudioLibExplorer.png" width="128" height="128" alt="AudioLib Explorer: audio library and Waveform icon">
 
@@ -36,11 +40,11 @@ The program version is read from the workspace `Cargo.toml` and is shared by the
 
 ## Download / Install
 
-Prebuilt packages are published on [GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases). Each Release ships exactly two packages, each with a matching `.sha256` file:
+Maomao Edition Windows packages are published on [this fork's GitHub Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases), with a matching `.sha256` file. When included, the macOS server is the unchanged upstream v0.7.5 package, identified separately in the release notes; it is not a Maomao rebuild.
 
 | Package | Asset | Auto-update |
 |---|---|---|
-| Windows x64 desktop client (portable) | `AudioLibExplorer-<tag>-win-x64-portable.zip` | Yes, in-app prompt |
+| Windows x64 desktop client (Maomao Edition, portable) | `AudioLibExplorer-<tag>-win-x64-portable.zip` | Disabled by the launcher; use this fork's releases |
 | macOS arm64 server | `AudioLibServer-<tag>-macos-arm64.tar.gz` | Yes, via the admin page (also for self-built macOS arm64) |
 
 Server packages for Windows, Linux or other architectures are not published; build them from source (see [Build](#build)). Tags with a `-beta.N` or `-rc.N` suffix are pre-releases.
@@ -54,7 +58,7 @@ Server packages for Windows, Linux or other architectures are not published; bui
    Get-FileHash .\AudioLibExplorer-<tag>-win-x64-portable.zip -Algorithm SHA256
    ```
 
-3. Extract the ZIP to a folder of your choice and start `Start-AudioLibExplorer.cmd` (or `AudioLibExplorer.exe`). No installer is needed; settings and libraries live in `%LOCALAPPDATA%/AudioLibExplorer/v1`, outside the program folder.
+3. Extract the ZIP to a folder of your choice and start `Start-AudioLibExplorer.cmd`. This launcher disables the upstream update checks so an official package cannot replace Maomao Edition through that launch. Opening `AudioLibExplorer.exe` directly bypasses this setting. No installer is needed; settings and libraries live in `%LOCALAPPDATA%/AudioLibExplorer/v1`, outside the program folder.
 
 ## Server deployment
 

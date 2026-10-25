@@ -9058,7 +9058,7 @@ mod tests {
             channels: 2,
             frames: 8,
             samples_per_pixel: 2,
-            peaks: vec![vec![peak(239.0); 4], vec![peak(36.0); 4]],
+            peaks: vec![vec![peak(241.0); 4], vec![peak(36.0); 4]],
         };
         let pixels = render_waveform(
             &data,
@@ -9071,8 +9071,8 @@ mod tests {
         );
         assert_eq!(pixels.len(), 4 * 20 * 4);
         let pixel = |x: usize, y: usize| &pixels[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
-        assert_eq!(pixel(2, 5), [197, 117, 100, 255]);
-        assert_eq!(pixel(2, 15), [112, 124, 190, 255]);
+        assert_eq!(pixel(2, 5), [61, 255, 0, 255]);
+        assert_eq!(pixel(2, 15), [255, 0, 24, 255]);
         assert_eq!(pixel(2, 10), [132, 144, 148, 255]);
         assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }

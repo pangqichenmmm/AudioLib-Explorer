@@ -27,6 +27,10 @@ function Invoke-View([string]$Name, [string]$Language, [string]$View) {
 }
 try {
     $env:AUDIOLIB_DATA_DIR = Join-Path $testRoot 'real-library-copy'
+    New-Item -ItemType Directory -Force -Path $env:AUDIOLIB_DATA_DIR | Out-Null
+    # Explicit isolated preferences prevent first-start legacy database discovery.
+    $initialSettings = @{active_database=(Join-Path $env:AUDIOLIB_DATA_DIR 'library.db');language='en';playback=@{volume=0.0};allowed_scan_roots=@()} | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText((Join-Path $env:AUDIOLIB_DATA_DIR 'settings.json'), $initialSettings, [Text.UTF8Encoding]::new($false))
     $views = @()
     $views += Invoke-View 'main-cn' 'cn' 'main'
     $views += Invoke-View 'compact-en' 'en' 'compact'
@@ -40,7 +44,7 @@ try {
     $fixtureRoot = Join-Path $testRoot 'fixtures'
     $paletteRoot = Join-Path $testRoot 'palette-userdata'
     New-Item -ItemType Directory -Path $fixtureRoot,$paletteRoot | Out-Null
-    $wavePath = Join-Path $fixtureRoot 'Spectral reference - 7 tones, white noise, 619Hz mixed -20 -10 0 +10 dB.wav'
+    $wavePath = Join-Path $fixtureRoot 'Spectral reference - 7 tones, white noise, 628Hz mixed -20 -10 0 +10 dB.wav'
     $writer = [IO.BinaryWriter]::new([IO.File]::Create($wavePath))
     try {
         $rate = 48000; $dataSize = 12 * $rate * 4
@@ -50,7 +54,7 @@ try {
         $writer.Write([uint32]($rate*4)); $writer.Write([uint16]4); $writer.Write([uint16]16)
         $writer.Write([Text.Encoding]::ASCII.GetBytes('data')); $writer.Write([uint32]$dataSize)
         $random = [Random]::new(73)
-        foreach ($frequency in @(14,36,92,239,619,1604,4155,0,-20,-10,-1,10)) {
+        foreach ($frequency in @(14,36,93,241,628,1632,4241,0,-20,-10,-1,10)) {
             for ($frame=0; $frame -lt $rate; $frame++) {
                 $time = $frame / $rate
                 $envelope = 0.5 - 0.5 * [Math]::Cos(2*[Math]::PI*$time)
@@ -61,7 +65,7 @@ try {
                 } else {
                     $snr = if ($frequency -eq -1) { 0 } else { $frequency }
                     $toneGain = [Math]::Pow(10,$snr/20)
-                    $tone = [Math]::Sin(2*[Math]::PI*619*$time)*[Math]::Sqrt(2)
+                    $tone = [Math]::Sin(2*[Math]::PI*628*$time)*[Math]::Sqrt(2)
                     $noise = ($random.NextDouble()*2-1)*[Math]::Sqrt(3)
                     ($tone*$toneGain+$noise)/(2*(1+$toneGain))
                 }

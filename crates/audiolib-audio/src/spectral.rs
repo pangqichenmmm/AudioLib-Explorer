@@ -13,27 +13,28 @@ pub(crate) struct SpectralFeature {
 /// Normal peak color used for non-tonal content and zero spectral opacity.
 pub const SPECTRAL_PEAK_BASE: [u8; 3] = [14; 3];
 
-/// Map the supplied REAPER reference's logarithmic frequency anchors to muted RGB.
+/// Map the supplied REAPER reference's logarithmic frequency anchors to vivid RGB.
 /// Noise threshold gates weak tonal evidence; variance controls the fade from black.
 /// This changes only the displayed RGB, never amplitude geometry or playback volume.
 pub fn spectral_color(frequency: f32, tonality: f32, noise: f32, variance: f32) -> [u8; 3] {
-    let anchors = [14.0_f32, 36.0, 92.0, 239.0, 619.0, 1604.0, 4155.0, 10760.0];
-    // Preserve the reference's hue sequence with softer cyan, blue, mauve,
-    // terracotta, ochre and sage. Full-tone HSV saturation is 35–56%, rather
-    // than 90%; capped brightness avoids fluorescent yellow/cyan peaks.
+    let anchors = [14.0_f32, 36.0, 93.0, 241.0, 628.0, 1632.0, 4241.0, 11025.0];
+    // Calibrated to the supplied REAPER color strip: magenta, red, yellow,
+    // green, turquoise, blue and violet. Full-tone colors use the full RGB
+    // range; tonality and opacity still provide the existing fade to black.
+    // The final pink endpoint continues the strip above its last visible label.
     // Keep the Peaks Display Settings legend in sync with these endpoints.
     let palette = [
-        [91.0_f32, 175.0, 181.0],
-        [112.0, 124.0, 190.0],
-        [176.0, 115.0, 171.0],
-        [197.0, 117.0, 100.0],
-        [192.0, 169.0, 84.0],
-        [111.0, 174.0, 121.0],
-        [91.0, 175.0, 181.0],
-        [112.0, 124.0, 190.0],
+        [251.0_f32, 0.0, 255.0],
+        [255.0, 0.0, 24.0],
+        [255.0, 211.0, 0.0],
+        [61.0, 255.0, 0.0],
+        [0.0, 255.0, 172.0],
+        [0.0, 100.0, 255.0],
+        [134.0, 0.0, 255.0],
+        [255.0, 0.0, 148.0],
     ];
     let frequency = if frequency.is_finite() {
-        frequency.clamp(14.0, 10760.0)
+        frequency.clamp(14.0, 11025.0)
     } else {
         14.0
     };
@@ -236,14 +237,14 @@ mod tests {
     #[test]
     fn reference_hues_follow_log_frequency_and_noise_fades_to_black() {
         for (hz, rgb) in [
-            (14.0, [91, 175, 181]),
-            (36.0, [112, 124, 190]),
-            (92.0, [176, 115, 171]),
-            (239.0, [197, 117, 100]),
-            (619.0, [192, 169, 84]),
-            (1604.0, [111, 174, 121]),
-            (4155.0, [91, 175, 181]),
-            (10760.0, [112, 124, 190]),
+            (14.0, [251, 0, 255]),
+            (36.0, [255, 0, 24]),
+            (93.0, [255, 211, 0]),
+            (241.0, [61, 255, 0]),
+            (628.0, [0, 255, 172]),
+            (1632.0, [0, 100, 255]),
+            (4241.0, [134, 0, 255]),
+            (11025.0, [255, 0, 148]),
         ] {
             assert_eq!(spectral_color(hz, 1.0, 1.0, 0.38), rgb);
         }
@@ -318,7 +319,7 @@ mod tests {
                 for frame in 0..analyzer.size() {
                     random = random.wrapping_mul(1664525).wrapping_add(1013904223);
                     let noise = (random as f32 / u32::MAX as f32 * 2.0 - 1.0) * 3.0_f32.sqrt();
-                    let tone = (std::f32::consts::TAU * 619.0 * frame as f32 / rate as f32).sin()
+                    let tone = (std::f32::consts::TAU * 628.0 * frame as f32 / rate as f32).sin()
                         * 2.0_f32.sqrt();
                     analyzer.push(&[(tone * tone_gain + noise) * 0.4 / (1.0 + tone_gain)]);
                 }
@@ -337,8 +338,8 @@ mod tests {
                     );
                 }
                 if snr >= 10.0 {
-                    assert!((feature.frequency - 619.0).abs() < 3.0);
-                    assert!(color[0] > color[2] + 70 && color[1] > color[2] + 70);
+                    assert!((feature.frequency - 628.0).abs() < 3.0);
+                    assert!(color[1] > color[0] + 70 && color[2] > color[0] + 70);
                 }
             }
         }

@@ -213,10 +213,10 @@ export component PeakSettings inherits FocusScope {
                 Slider { surface: Theme.panel; horizontal-stretch: 1; minimum: 0; maximum: 1; step: 0.01; value <=> root.opacity-value; changed => { root.changed(); } }
                 Caption { width: 60px * Theme.ui-scale; text: Math.round(root.opacity-value * 100) + "%"; horizontal-alignment: right; }
             }
-            // Muted frequency anchors from audiolib-audio/src/spectral.rs.
-            Rectangle { height: 92px * Theme.ui-scale; background: @linear-gradient(90deg, #5bafb5, #707cbe, #b073ab, #c57564, #c0a954, #6fae79, #5bafb5, #707cbe); border-radius: 3px * Theme.ui-scale;
+            // REAPER-reference frequency anchors from audiolib-audio/src/spectral.rs.
+            Rectangle { height: 92px * Theme.ui-scale; background: @linear-gradient(90deg, #fb00ff, #ff0018, #ffd300, #3dff00, #00ffac, #0064ff, #8600ff, #ff0094); border-radius: 3px * Theme.ui-scale;
                 Rectangle { x: 0px; y: 0px; background: @linear-gradient(180deg, #0e0e0eff, #0e0e0e00); height: 65px * Theme.ui-scale; }
-                for frequency[index] in ["14 Hz", "36 Hz", "92 Hz", "239 Hz", "619 Hz", "1604 Hz", "4155 Hz"]: Text { x: 4px * Theme.ui-scale + index * (parent.width - 8px * Theme.ui-scale) / 7; y: 69px * Theme.ui-scale; height: 20px * Theme.ui-scale; text: frequency; color: #101820; font-size: Theme.font(10); font-weight: 600; vertical-alignment: center; }
+                for frequency[index] in ["14 Hz", "36 Hz", "93 Hz", "241 Hz", "628 Hz", "1632 Hz", "4241 Hz"]: Text { x: 4px * Theme.ui-scale + index * (parent.width - 8px * Theme.ui-scale) / 7; y: 69px * Theme.ui-scale; height: 20px * Theme.ui-scale; text: frequency; color: #101820; font-size: Theme.font(10); font-weight: 600; vertical-alignment: center; }
             }
             HorizontalLayout { height: 26px * Theme.ui-scale; spacing: 8px * Theme.ui-scale;
                 Caption { text: root.chinese ? "噪声阈值" : "Noise threshold"; width: 80px * Theme.ui-scale; }

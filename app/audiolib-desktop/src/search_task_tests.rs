@@ -175,6 +175,10 @@ fn wait_for(ui: &AppWindow, ready: impl Fn(&AppWindow) -> bool + 'static) {
         slint::TimerMode::Repeated,
         Duration::from_millis(10),
         move || {
+            // The test backend can fire timers again before consuming a queued Quit.
+            if observed.get() {
+                return;
+            }
             let Some(ui) = weak.upgrade() else { return };
             assert!(
                 started.elapsed() < Duration::from_secs(12),

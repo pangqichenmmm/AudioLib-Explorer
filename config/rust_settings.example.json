@@ -6,6 +6,10 @@
   "pregenerate_list_waveforms": false,
   "hold_list_waveform_batches_after_audition": false,
   "max_search_tasks": 6,
+  "spectral_peaks": {
+    "noise": 1.0,
+    "variance": 0.38
+  },
   "audio_table": {
     "name_width": 360.0,
     "duration_width": 80.0,

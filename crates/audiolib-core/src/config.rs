@@ -356,6 +356,69 @@ fn deserialize_tags_width<'de, D: serde::Deserializer<'de>>(
     deserialize_table_width(deserializer, 80.0, 160.0)
 }
 
+/// Persistent spectral-color thresholds; old settings keep the original defaults.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SpectralPeakPreferences {
+    /// Noise threshold multiplier, matching the display slider's 0.1..=2 range.
+    #[serde(deserialize_with = "deserialize_peak_noise")]
+    pub noise: f32,
+    /// Frequency variance sensitivity, matching the display slider's 0.05..=1 range.
+    #[serde(deserialize_with = "deserialize_peak_variance")]
+    pub variance: f32,
+}
+
+impl Default for SpectralPeakPreferences {
+    fn default() -> Self {
+        Self {
+            noise: 1.0,
+            variance: 0.38,
+        }
+    }
+}
+
+impl SpectralPeakPreferences {
+    /// Clamp display-only values without discarding unrelated library preferences.
+    pub fn normalized(self) -> Self {
+        Self {
+            noise: normalize_peak_value(self.noise, 0.1, 2.0, 1.0),
+            variance: normalize_peak_value(self.variance, 0.05, 1.0, 0.38),
+        }
+    }
+}
+
+fn normalize_peak_value(value: f32, minimum: f32, maximum: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        default
+    }
+}
+
+fn deserialize_peak_noise<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<f32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(normalize_peak_value(
+        value.as_f64().map_or(1.0, |value| value as f32),
+        0.1,
+        2.0,
+        1.0,
+    ))
+}
+
+fn deserialize_peak_variance<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<f32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(normalize_peak_value(
+        value.as_f64().map_or(0.38, |value| value as f32),
+        0.05,
+        1.0,
+        0.38,
+    ))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     pub paths: AppPaths,
@@ -400,6 +463,9 @@ pub struct AppConfig {
     /// Persistent table layout and sorting, applied to every search page.
     #[serde(default)]
     pub audio_table: AudioTablePreferences,
+    /// Spectral color thresholds restored on the next launch.
+    #[serde(default)]
+    pub spectral_peaks: SpectralPeakPreferences,
     /// Desktop window geometry and pane layout restored on the next launch.
     #[serde(default)]
     pub window_layout: crate::window_layout::WindowLayoutPreferences,
@@ -451,6 +517,8 @@ struct SavedPreferences {
     list_font_size: u32,
     #[serde(default)]
     audio_table: AudioTablePreferences,
+    #[serde(default)]
+    spectral_peaks: SpectralPeakPreferences,
     #[serde(default)]
     window_layout: crate::window_layout::WindowLayoutPreferences,
     #[serde(default)]
@@ -640,6 +708,7 @@ impl AppConfig {
             ui_font_size: DEFAULT_FONT_SIZE,
             list_font_size: DEFAULT_FONT_SIZE,
             audio_table: AudioTablePreferences::default(),
+            spectral_peaks: SpectralPeakPreferences::default(),
             window_layout: Default::default(),
             allowed_scan_roots: Vec::new(),
             data_source: DataSourceSettings::default(),
@@ -698,6 +767,7 @@ impl AppConfig {
             config.ui_font_size = clamp_font_size(i64::from(saved.ui_font_size));
             config.list_font_size = clamp_font_size(i64::from(saved.list_font_size));
             config.audio_table = saved.audio_table.normalized();
+            config.spectral_peaks = saved.spectral_peaks.normalized();
             config.window_layout = saved.window_layout.normalized();
             config.allowed_scan_roots = saved.allowed_scan_roots;
             config.data_source = saved.data_source;
@@ -749,6 +819,7 @@ impl AppConfig {
             ui_font_size: clamp_font_size(i64::from(self.ui_font_size)),
             list_font_size: clamp_font_size(i64::from(self.list_font_size)),
             audio_table: self.audio_table.normalized(),
+            spectral_peaks: self.spectral_peaks.normalized(),
             window_layout: self.window_layout.normalized(),
             allowed_scan_roots: self.allowed_scan_roots.clone(),
             data_source: {
@@ -821,6 +892,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spectral_peak_thresholds_round_trip_minima_without_changing_library_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("userdata");
+        let mut config = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+        let database = config.paths.database.clone();
+        config.language = "cn".into();
+        config.playback = serde_json::json!({"volume":0.25,"device_id":"existing-device"});
+        config.allowed_scan_roots = vec![directory.path().join("sounds")];
+        config.spectral_peaks = SpectralPeakPreferences {
+            noise: 0.1,
+            variance: 0.05,
+        };
+        config.save().unwrap();
+        let loaded = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+        assert_eq!(loaded.spectral_peaks, config.spectral_peaks);
+        assert_eq!(loaded.paths.database, database);
+        assert_eq!(loaded.playback, config.playback);
+        assert_eq!(loaded.allowed_scan_roots, config.allowed_scan_roots);
+        assert_eq!(loaded.language, "cn");
+
+        config.spectral_peaks = SpectralPeakPreferences {
+            noise: f32::NAN,
+            variance: f32::INFINITY,
+        };
+        config.save().unwrap();
+        let loaded = AppConfig::load_with_roots(root, &[]).unwrap();
+        assert_eq!(loaded.spectral_peaks, SpectralPeakPreferences::default());
+        assert_eq!(loaded.paths.database, database);
+        assert_eq!(loaded.playback, config.playback);
+    }
+
+    #[test]
+    fn old_settings_and_invalid_spectral_values_retain_other_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        for (input, expected) in [
+            ("{}", SpectralPeakPreferences::default()),
+            (
+                r#"{"noise":"bad","variance":null}"#,
+                SpectralPeakPreferences::default(),
+            ),
+            (
+                r#"{"noise":-10,"variance":-10}"#,
+                SpectralPeakPreferences {
+                    noise: 0.1,
+                    variance: 0.05,
+                },
+            ),
+            (
+                r#"{"noise":100,"variance":100}"#,
+                SpectralPeakPreferences {
+                    noise: 2.0,
+                    variance: 1.0,
+                },
+            ),
+        ] {
+            std::fs::write(directory.path().join("settings.json"), format!(
+                "{{\"language\":\"cn\",\"playback\":{{\"volume\":0.35}},\"spectral_peaks\":{input}}}"
+            )).unwrap();
+            let loaded = AppConfig::load_with_roots(directory.path().to_owned(), &[]).unwrap();
+            assert_eq!(loaded.spectral_peaks, expected);
+            assert_eq!(loaded.language, "cn");
+            assert_eq!(loaded.playback["volume"], serde_json::json!(0.35));
+        }
+    }
+
+    #[test]
     fn client_local_history_limit_defaults_and_round_trips_without_moving_data_root() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("preferences");
@@ -859,6 +996,7 @@ mod tests {
         assert!(!config.pregenerate_list_waveforms);
         assert!(!config.hold_list_waveform_batches_after_audition);
         assert_eq!(config.audio_table, AudioTablePreferences::default());
+        assert_eq!(config.spectral_peaks, SpectralPeakPreferences::default());
         assert_eq!(config.language, "cn");
         assert_eq!(config.playback["volume"], serde_json::json!(0.35));
         config.save().unwrap();

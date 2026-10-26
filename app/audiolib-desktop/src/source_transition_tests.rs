@@ -98,6 +98,7 @@ pub(super) fn configuration(preferences: &Path) -> AppConfig {
         ui_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         list_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         audio_table: Default::default(),
+        spectral_peaks: Default::default(),
         window_layout: Default::default(),
         allowed_scan_roots: Vec::new(),
         data_source: Default::default(),

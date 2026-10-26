@@ -18,7 +18,8 @@ use audiolib_audio::{
     PlaybackConfig, PlaybackState, RatePolicy, WaveformRequest,
 };
 use audiolib_core::config::{
-    AppConfig, AudioTablePreferences, UI_SCALE_PERCENTS, normalize_ui_scale_percent,
+    AppConfig, AudioTablePreferences, SpectralPeakPreferences, UI_SCALE_PERCENTS,
+    normalize_ui_scale_percent,
 };
 use audiolib_core::{
     AudioFile, BatchMetadataRequest, DataProvider, FileVisibility, Folder, LibraryExportFormat,
@@ -396,6 +397,30 @@ struct FolderTreeModel {
     expanded: HashSet<i64>,
 }
 
+impl FolderTreeModel {
+    fn has_same_rows(&self, visible: &[(Folder, usize, bool)], expanded: &HashSet<i64>) -> bool {
+        self.expanded == *expanded
+            && self.visible.len() == visible.len()
+            && self.visible.iter().zip(visible).all(|(old, new)| {
+                (
+                    old.0.id,
+                    &old.0.path,
+                    &old.0.name,
+                    old.0.file_count,
+                    old.1,
+                    old.2,
+                ) == (
+                    new.0.id,
+                    &new.0.path,
+                    &new.0.name,
+                    new.0.file_count,
+                    new.1,
+                    new.2,
+                )
+            })
+    }
+}
+
 impl Model for FolderTreeModel {
     type Data = FolderRow;
 
@@ -418,6 +443,10 @@ impl Model for FolderTreeModel {
 
     fn model_tracker(&self) -> &dyn slint::ModelTracker {
         &()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -764,6 +793,15 @@ impl Controller {
         self.sqlite.read().unwrap().clone()
     }
 
+    fn spectral_peak_preferences(&self) -> SpectralPeakPreferences {
+        let view = self.wave_view.lock().unwrap().1;
+        SpectralPeakPreferences {
+            noise: view.noise,
+            variance: view.variance,
+        }
+        .normalized()
+    }
+
     /// Provider for annotation writes: the local library, or in server mode the
     /// server API (`RemoteProvider`; the snapshot follows by the revision rule).
     fn metadata_provider(self: &Arc<Self>) -> Result<Arc<dyn DataProvider>, String> {
@@ -822,6 +860,9 @@ impl Controller {
         crate::theme::apply_theme(ui, &config.theme);
         crate::theme::apply_font_sizes(ui, config.ui_font_size, config.list_font_size);
         let table = config.audio_table.normalized();
+        let spectral_peaks = config.spectral_peaks.normalized();
+        ui.set_peak_noise(spectral_peaks.noise);
+        ui.set_peak_variance(spectral_peaks.variance);
         ui.set_table_name_width(table.name_width);
         ui.set_table_duration_width(table.duration_width);
         ui.set_table_format_width(table.format_width);
@@ -920,7 +961,14 @@ impl Controller {
             waveform_job: Mutex::new(None),
             waveform_wake: Condvar::new(),
             waveform_size: Mutex::new((1300, 100)),
-            wave_view: Mutex::new((String::new(), WaveView::default())),
+            wave_view: Mutex::new((
+                String::new(),
+                WaveView {
+                    noise: spectral_peaks.noise,
+                    variance: spectral_peaks.variance,
+                    ..Default::default()
+                },
+            )),
             devices: Mutex::new(Vec::new()),
             device_generation: AtomicU64::new(0),
             scan_generation: AtomicU64::new(0),
@@ -1528,14 +1576,26 @@ impl Controller {
         let c = self.clone();
         ui.on_peak_style_requested(move || {
             if let Some(ui) = c.ui.upgrade() {
+                let preferences = SpectralPeakPreferences {
+                    noise: ui.get_peak_noise(),
+                    variance: ui.get_peak_variance(),
+                }
+                .normalized();
+                let save_preferences;
                 {
                     let mut state = c.wave_view.lock().unwrap();
                     let view = &mut state.1;
                     view.gain_db = ui.get_peak_gain();
                     view.opacity = ui.get_peak_opacity();
-                    view.noise = ui.get_peak_noise();
-                    view.variance = ui.get_peak_variance();
+                    save_preferences =
+                        view.noise != preferences.noise || view.variance != preferences.variance;
+                    view.noise = preferences.noise;
+                    view.variance = preferences.variance;
                     view.spectral = ui.get_peak_mode() == 1;
+                }
+                if save_preferences {
+                    *c.single_click_play_pending.lock().unwrap() = true;
+                    c.single_click_play_wake.notify_one();
                 }
                 if let Some(file) = c.waveform_file(&c.audio.status()) {
                     c.queue_waveform(&file);
@@ -2777,6 +2837,7 @@ impl Controller {
                     }
                     *pending = false;
                     drop(pending);
+                    let spectral_peaks = c.spectral_peak_preferences();
                     let result = {
                         let mut config = c.config.lock().unwrap();
                         // Checking under the save lock prevents a late worker from
@@ -2795,6 +2856,7 @@ impl Controller {
                         config.ui_font_size = c.ui_font_size.load(Ordering::Acquire);
                         config.list_font_size = c.list_font_size.load(Ordering::Acquire);
                         config.audio_table = c.audio_table.lock().unwrap().clone();
+                        config.spectral_peaks = spectral_peaks;
                         config.max_search_tasks = c.max_search_tasks.load(Ordering::Acquire);
                         config.window_layout = c.window_layout.lock().unwrap().clone();
                         config.save()
@@ -3708,10 +3770,17 @@ impl Controller {
 
     fn select_folder_id(self: &Arc<Self>, id: i64) {
         self.clear_task_folder_error();
+        let path = {
+            let tree = self.tree.lock().unwrap();
+            if tree.selected == Some(id) {
+                return;
+            }
+            tree.known.get(&id).map(|folder| folder.path.clone())
+        };
         if let Some(ui) = self.ui.upgrade() {
-            // Disable current-folder menu actions until this selection's tree
-            // publication supplies its path; search may finish before the tree.
-            ui.set_selected_folder_path("".into());
+            // Visible folders and breadcrumbs already have a validated owned
+            // path. Keep the scope indicator stable while workers publish.
+            ui.set_selected_folder_path(path.unwrap_or_default().into());
         }
         self.tree.lock().unwrap().selected = Some(id);
         self.request.lock().unwrap().folder_id = Some(id);
@@ -3837,10 +3906,19 @@ impl Controller {
                         .map_or_else(String::new, |folder| folder.path.clone())
                         .into(),
                 );
-                ui.set_folders(ModelRc::new(FolderTreeModel {
-                    visible: visible.clone(),
-                    expanded,
-                }));
+                // Selection-only publications must keep the same TouchAreas:
+                // Slint resets double-click counting when the target changes.
+                let unchanged = ui
+                    .get_folders()
+                    .as_any()
+                    .downcast_ref::<FolderTreeModel>()
+                    .is_some_and(|model| model.has_same_rows(&visible, &expanded));
+                if !unchanged {
+                    ui.set_folders(ModelRc::new(FolderTreeModel {
+                        visible: visible.clone(),
+                        expanded,
+                    }));
+                }
                 ui.set_crumbs(ModelRc::new(VecModel::from(
                     crumbs
                         .iter()
@@ -6038,6 +6116,7 @@ impl Controller {
         let confirmed = self
             .audio
             .send_and_wait(AudioCommand::Synchronize, Duration::from_secs(4));
+        let spectral_peaks = self.spectral_peak_preferences();
         let mut config = self.config.lock().unwrap();
         config.audition_play_on_single_click = self.single_click_play.load(Ordering::Acquire);
         config.pregenerate_list_waveforms = self.pregenerate_list_waveforms.load(Ordering::Acquire);
@@ -6048,6 +6127,7 @@ impl Controller {
         config.ui_font_size = self.ui_font_size.load(Ordering::Acquire);
         config.list_font_size = self.list_font_size.load(Ordering::Acquire);
         config.audio_table = self.audio_table.lock().unwrap().clone();
+        config.spectral_peaks = spectral_peaks;
         config.max_search_tasks = self.max_search_tasks.load(Ordering::Acquire);
         config.window_layout = self.window_layout.lock().unwrap().clone();
         if let Ok(status) = confirmed {
@@ -7870,6 +7950,7 @@ mod tests {
             ui_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
             list_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
             audio_table: Default::default(),
+            spectral_peaks: Default::default(),
             window_layout: Default::default(),
             allowed_scan_roots: Vec::new(),
             data_source: Default::default(),

@@ -633,8 +633,9 @@ export component AppWindow inherits Window {
         root.task-wanted-folder-y = folder-y;
         root.task-wanted-filter-y = filter-y;
         root.task-wanted-inspector-y = inspector-y;
+        // Let the running change handler start the native timer. restart()
+        // could expire an existing handle before that handler observes true.
         task-viewport-timer.running = true;
-        task-viewport-timer.restart();
     }
     public function reveal-search-task(index: int) {
         let left = max(0, index) * (root.task-tab-width + 3px * Theme.ui-scale);
@@ -1581,15 +1582,19 @@ export component AppWindow inherits Window {
         running: false; interval: 1ms;
         triggered => {
             self.running = false;
-            result-list.viewport-y = clamp(root.task-wanted-result-y * 1px, min(0px, result-list.visible-height - result-list.viewport-height), 0px);
-            root.table-viewport-x = clamp(root.task-wanted-result-x * 1px, min(0px, result-list.visible-width - root.table-content-size), 0px);
-            folder-list.viewport-y = clamp(root.task-wanted-folder-y * 1px, min(0px, folder-list.visible-height - folder-list.viewport-height), 0px);
-            root.task-filter-viewport-y = min(0px, root.task-wanted-filter-y * 1px);
-            root.task-inspector-viewport-y = min(0px, root.task-wanted-inspector-y * 1px);
-            root.task-viewport-pending = false;
-            root.task-restoring = false;
-            root.sync-table-viewport();
-            root.report-result-window();
+            // Timer.running is applied by a deferred change handler. Consume the
+            // request once, even if another native expiration is already queued.
+            if root.task-viewport-pending {
+                root.task-viewport-pending = false;
+                result-list.viewport-y = clamp(root.task-wanted-result-y * 1px, min(0px, result-list.visible-height - result-list.viewport-height), 0px);
+                root.table-viewport-x = clamp(root.task-wanted-result-x * 1px, min(0px, result-list.visible-width - root.table-content-size), 0px);
+                folder-list.viewport-y = clamp(root.task-wanted-folder-y * 1px, min(0px, folder-list.visible-height - folder-list.viewport-height), 0px);
+                root.task-filter-viewport-y = min(0px, root.task-wanted-filter-y * 1px);
+                root.task-inspector-viewport-y = min(0px, root.task-wanted-inspector-y * 1px);
+                root.task-restoring = false;
+                root.sync-table-viewport();
+                root.report-result-window();
+            }
         }
     }
     clipboard-input := TextInput { visible: false; }

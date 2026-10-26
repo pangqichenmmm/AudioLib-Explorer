@@ -1906,12 +1906,13 @@ export component AppWindow inherits Window {
                             }
                             folder-hit := TouchArea { x: folder-indent.width + 22px * Theme.ui-scale; width: max(0px, parent.width - 18px * Theme.ui-scale - self.x); mouse-cursor: pointer;
                                 clicked => { folder-focus.focus(); root.folder-requested(index); }
+                                double-clicked => { if folder.has-children { folder-focus.focus(); root.folder-toggle-requested(index); } }
                                 pointer-event(event) => { if event.button == PointerEventButton.right && event.kind == PointerEventKind.down { root.show-folder-menu(folder, {x: self.absolute-position.x + self.mouse-x, y: self.absolute-position.y + self.mouse-y}); } }
                             }
                         }
                     }
                     }
-                    if root.library-sidebar-page == 0: Label { height: 34px * Theme.ui-scale; text: root.chinese ? "方向键浏览目录 · 右键管理素材库" : "Right-click folders to manage"; wrap: word-wrap; font-size: Theme.font(10); }
+                    if root.library-sidebar-page == 0: Label { height: 34px * Theme.ui-scale; text: root.chinese ? "双击展开/折叠 · 方向键浏览 · 右键管理" : "Double-click to expand/collapse · Right-click to manage"; wrap: word-wrap; font-size: Theme.font(10); }
                 }
             }
             PaneDivider {

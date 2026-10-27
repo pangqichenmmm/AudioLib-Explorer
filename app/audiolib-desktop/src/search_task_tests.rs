@@ -191,7 +191,11 @@ fn wait_for(ui: &AppWindow, ready: impl Fn(&AppWindow) -> bool + 'static) {
             }
         },
     );
-    ui.show().unwrap();
+    // Re-showing a ComponentHandle reattaches its component and resets pointer
+    // tracking. Keep the same visible window across consecutive interactions.
+    if !ui.window().is_visible() {
+        ui.show().unwrap();
+    }
     slint::run_event_loop().unwrap();
     timer.stop();
     assert!(

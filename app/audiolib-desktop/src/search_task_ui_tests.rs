@@ -425,6 +425,76 @@ fn task_viewport_restore_survives_model_and_selection_replacement() {
 }
 
 #[test]
+fn restored_task_allows_independent_result_and_folder_scrolling() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = window();
+    ui.window()
+        .set_size(slint::LogicalSize::new(1440.0, 1560.0));
+    ui.set_rows(ModelRc::new(VecModel::from(
+        (0..200)
+            .map(|index| AudioRow {
+                id: index.to_string().into(),
+                name: format!("Sound {index}").into(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_folders(ModelRc::new(VecModel::from(
+        (0..200)
+            .map(|index| FolderRow {
+                name: format!("Folder {index}").into(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )));
+    settle();
+
+    // Give the declarative timer a native handle before restarting it, as
+    // happens when creating a second search task after startup restoration.
+    ui.invoke_restore_search_task_viewport(0.0, 0.0, 0.0, 0.0, 0.0);
+    settle();
+    // A fresh default task restores zero, while an existing task restores its
+    // saved position. Neither restoration may retain ownership of user input.
+    for restored_y in [0.0, -2618.0, 0.0] {
+        ui.invoke_restore_search_task_viewport(restored_y, 0.0, -440.0, 0.0, 0.0);
+        // Unlike settle(), expire the restarted native timer before flushing
+        // running's deferred change handler, matching a busy UI event loop.
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+        // A timer started safely by that handler is allowed one further turn
+        // to finish the requested restoration before accepting user input.
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+        assert!(!ui.get_task_restoring());
+        let result_before = ui.get_task_result_scroll_y();
+        let folder_before = ui.get_task_folder_scroll_y();
+        for id in ["AppWindow::result-list", "AppWindow::folder-list"] {
+            let list = ElementHandle::find_by_element_id(&ui, id).next().unwrap();
+            ui.window().dispatch_event(WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(
+                    list.absolute_position().x + 24.0,
+                    list.absolute_position().y + 24.0,
+                ),
+                delta_x: 0.0,
+                delta_y: -220.0,
+            });
+            settle();
+        }
+        assert!(ui.get_task_result_scroll_y() < result_before - 100.0);
+        assert!(ui.get_task_folder_scroll_y() < folder_before - 100.0);
+        let result_after = ui.get_task_result_scroll_y();
+        let folder_after = ui.get_task_folder_scroll_y();
+        for _ in 0..60 {
+            settle();
+        }
+        assert!((ui.get_task_result_scroll_y() - result_after).abs() < 1.0);
+        assert!((ui.get_task_folder_scroll_y() - folder_after).abs() < 1.0);
+    }
+    ui.set_selected_row(199);
+    settle();
+    assert!(ui.get_task_result_scroll_y() < -3000.0);
+    ui.hide().unwrap();
+}
+
+#[test]
 fn six_task_tabs_and_saved_searches_render_at_all_supported_layout_extremes() {
     slint::platform::set_platform(Box::new(TestingBackend::new(TestingBackendOptions {
         mock_time: true,

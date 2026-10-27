@@ -12,13 +12,14 @@ use crate::list_waveforms::{
     ListWaveformCell, ListWaveformHost, ListWaveforms, render_list_waveform, window_ids,
 };
 use crate::waveform_view::{WaveView, db_from_gain, gain_from_db, render_waveform};
-use crate::{AppWindow, AudioRow, CrumbRow, FolderRow};
+use crate::{AppWindow, AudioRow, CrumbRow, FolderRow, LocalScanRootRow};
 use audiolib_audio::{
     AudioBackend, AudioCommand, AudioDevice, AudioEvent, AudioHandle, AuditionSettings,
     PlaybackConfig, PlaybackState, RatePolicy, WaveformRequest,
 };
 use audiolib_core::config::{
-    AppConfig, AudioTablePreferences, UI_SCALE_PERCENTS, normalize_ui_scale_percent,
+    AppConfig, AudioTablePreferences, SpectralPeakPreferences, UI_SCALE_PERCENTS,
+    normalize_ui_scale_percent,
 };
 use audiolib_core::{
     AudioFile, BatchMetadataRequest, DataProvider, FileVisibility, Folder, LibraryExportFormat,
@@ -36,6 +37,27 @@ enum ScanPresentation {
     Progress(audiolib_core::ScanProgress, bool),
     Complete(audiolib_core::ScanProgress, bool),
     Failure(String, String),
+}
+
+/// Latest scan snapshot the UI thread pulls. A failed cross-thread post must not
+/// freeze this mailbox: the UI timer publishes whatever is stored.
+#[derive(Default)]
+struct ScanUiMailbox {
+    full: bool,
+    library_generation: u64,
+    scan_generation: u64,
+    progress: Option<audiolib_core::ScanProgress>,
+    progress_nonce: u64,
+    published_nonce: u64,
+    terminal: Option<ScanTerminal>,
+}
+
+struct ScanTerminal {
+    library_generation: u64,
+    scan_generation: u64,
+    full: bool,
+    admitted: bool,
+    result: audiolib_core::Result<audiolib_core::ScanProgress>,
 }
 #[cfg(test)]
 #[path = "client_review_tests.rs"]
@@ -396,6 +418,30 @@ struct FolderTreeModel {
     expanded: HashSet<i64>,
 }
 
+impl FolderTreeModel {
+    fn has_same_rows(&self, visible: &[(Folder, usize, bool)], expanded: &HashSet<i64>) -> bool {
+        self.expanded == *expanded
+            && self.visible.len() == visible.len()
+            && self.visible.iter().zip(visible).all(|(old, new)| {
+                (
+                    old.0.id,
+                    &old.0.path,
+                    &old.0.name,
+                    old.0.file_count,
+                    old.1,
+                    old.2,
+                ) == (
+                    new.0.id,
+                    &new.0.path,
+                    &new.0.name,
+                    new.0.file_count,
+                    new.1,
+                    new.2,
+                )
+            })
+    }
+}
+
 impl Model for FolderTreeModel {
     type Data = FolderRow;
 
@@ -418,6 +464,10 @@ impl Model for FolderTreeModel {
 
     fn model_tracker(&self) -> &dyn slint::ModelTracker {
         &()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -655,6 +705,9 @@ pub struct Controller {
     /// Background drain completion is retained until the closing UI timer consumes
     /// it; a rejected cross-thread event-loop notification must not lose it.
     close_completion: Mutex<Option<Result<(), String>>>,
+    /// After a rejected close, keep the recovery/status line until the user saves again.
+    /// A late Metadata / LibraryChanged publication must not hide the close-owned message.
+    close_retains_status: AtomicBool,
     tree: Mutex<TreeState>,
     tree_generation: AtomicU64,
     selection_generation: AtomicU64,
@@ -688,6 +741,10 @@ pub struct Controller {
     scan_validating: AtomicBool,
     scan_presentation: Mutex<Option<ScanPresentation>>,
     scan_cancel: Mutex<Option<ScanCancellation>>,
+    /// Progress and the one-shot terminal result, applied on the UI thread.
+    scan_ui: Mutex<ScanUiMailbox>,
+    /// Generation of the single-shot scan UI timer. A new scan invalidates the old chain.
+    scan_ui_poll: AtomicU64,
     shutdown: AtomicBool,
     chinese: AtomicBool,
     remote: Mutex<remote_mode::RemoteRuntime>,
@@ -735,11 +792,18 @@ pub struct Controller {
 }
 
 fn post(ui: slint::Weak<AppWindow>, action: impl FnOnce(AppWindow) + Send + 'static) {
-    let _ = slint::invoke_from_event_loop(move || {
+    let _ = try_post(ui, action);
+}
+
+/// `false` when the event loop rejected the callback. Callers that must not wait
+/// for a dead loop use this instead of treating the post as delivered.
+fn try_post(ui: slint::Weak<AppWindow>, action: impl FnOnce(AppWindow) + Send + 'static) -> bool {
+    slint::invoke_from_event_loop(move || {
         if let Some(window) = ui.upgrade() {
             action(window);
         }
-    });
+    })
+    .is_ok()
 }
 
 /// Run one worker job. A panic becomes this job's error, so the worker thread keeps
@@ -762,6 +826,15 @@ fn internal_error(chinese: bool, task_cn: &str, task_en: &str) -> String {
 impl Controller {
     fn provider(&self) -> Arc<SqliteProvider> {
         self.sqlite.read().unwrap().clone()
+    }
+
+    fn spectral_peak_preferences(&self) -> SpectralPeakPreferences {
+        let view = self.wave_view.lock().unwrap().1;
+        SpectralPeakPreferences {
+            noise: view.noise,
+            variance: view.variance,
+        }
+        .normalized()
     }
 
     /// Provider for annotation writes: the local library, or in server mode the
@@ -822,6 +895,9 @@ impl Controller {
         crate::theme::apply_theme(ui, &config.theme);
         crate::theme::apply_font_sizes(ui, config.ui_font_size, config.list_font_size);
         let table = config.audio_table.normalized();
+        let spectral_peaks = config.spectral_peaks.normalized();
+        ui.set_peak_noise(spectral_peaks.noise);
+        ui.set_peak_variance(spectral_peaks.variance);
         ui.set_table_name_width(table.name_width);
         ui.set_table_duration_width(table.duration_width);
         ui.set_table_format_width(table.format_width);
@@ -896,6 +972,7 @@ impl Controller {
             metadata_recovery_notice: Mutex::new(None),
             closing: AtomicBool::new(false),
             close_completion: Mutex::new(None),
+            close_retains_status: AtomicBool::new(false),
             tree: Mutex::new(TreeState::default()),
             tree_generation: AtomicU64::new(0),
             selection_generation: AtomicU64::new(0),
@@ -920,13 +997,22 @@ impl Controller {
             waveform_job: Mutex::new(None),
             waveform_wake: Condvar::new(),
             waveform_size: Mutex::new((1300, 100)),
-            wave_view: Mutex::new((String::new(), WaveView::default())),
+            wave_view: Mutex::new((
+                String::new(),
+                WaveView {
+                    noise: spectral_peaks.noise,
+                    variance: spectral_peaks.variance,
+                    ..Default::default()
+                },
+            )),
             devices: Mutex::new(Vec::new()),
             device_generation: AtomicU64::new(0),
             scan_generation: AtomicU64::new(0),
             scan_validating: AtomicBool::new(false),
             scan_presentation: Mutex::new(None),
             scan_cancel: Mutex::new(None),
+            scan_ui: Mutex::new(ScanUiMailbox::default()),
+            scan_ui_poll: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             chinese: AtomicBool::new(chinese),
             remote: Mutex::new(remote_mode::RemoteRuntime::default()),
@@ -1261,6 +1347,42 @@ impl Controller {
             c.drag_cancel.lock().unwrap().store(true, Ordering::Release);
         });
         let c = self.clone();
+        ui.on_local_scan_root_remove_requested(move || {
+            if c.remote_read_only() || !c.available() {
+                return;
+            }
+            let Some(ui) = c.ui.upgrade() else {
+                return;
+            };
+            let selected = ui.get_local_scan_root_selected();
+            if selected < 0 {
+                return;
+            }
+            let Some(row) = ui.get_local_scan_roots().row_data(selected as usize) else {
+                return;
+            };
+            let path = row.path.to_string();
+            let id = match c.provider().find_folder_by_path(Path::new(&path)) {
+                Ok(Some(folder)) => folder.id,
+                Ok(None) => {
+                    c.status(
+                        if c.chinese.load(Ordering::Acquire) {
+                            "未找到该扫描根目录的库记录。"
+                        } else {
+                            "No library record for that scan root."
+                        }
+                        .to_string(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    c.status(error.to_string());
+                    return;
+                }
+            };
+            c.propose_operation(LibraryOperation::RemoveFolder(id));
+        });
+        let c = self.clone();
         ui.on_folder_action_requested(move |path, action| {
             // Server mode: removing a folder's records is a server call when this PC may
             // manage; everything else (reveal) stays local-only.
@@ -1528,14 +1650,26 @@ impl Controller {
         let c = self.clone();
         ui.on_peak_style_requested(move || {
             if let Some(ui) = c.ui.upgrade() {
+                let preferences = SpectralPeakPreferences {
+                    noise: ui.get_peak_noise(),
+                    variance: ui.get_peak_variance(),
+                }
+                .normalized();
+                let save_preferences;
                 {
                     let mut state = c.wave_view.lock().unwrap();
                     let view = &mut state.1;
                     view.gain_db = ui.get_peak_gain();
                     view.opacity = ui.get_peak_opacity();
-                    view.noise = ui.get_peak_noise();
-                    view.variance = ui.get_peak_variance();
+                    save_preferences =
+                        view.noise != preferences.noise || view.variance != preferences.variance;
+                    view.noise = preferences.noise;
+                    view.variance = preferences.variance;
                     view.spectral = ui.get_peak_mode() == 1;
+                }
+                if save_preferences {
+                    *c.single_click_play_pending.lock().unwrap() = true;
+                    c.single_click_play_wake.notify_one();
                 }
                 if let Some(file) = c.waveform_file(&c.audio.status()) {
                     c.queue_waveform(&file);
@@ -2585,6 +2719,8 @@ impl Controller {
         }
         ui.set_rows(ModelRc::new(VecModel::<AudioRow>::default()));
         ui.set_folders(ModelRc::new(VecModel::<FolderRow>::default()));
+        ui.set_local_scan_roots(ModelRc::new(VecModel::<LocalScanRootRow>::default()));
+        ui.set_local_scan_root_selected(-1);
         ui.set_crumbs(ModelRc::new(VecModel::<CrumbRow>::default()));
         ui.set_history_rows(ModelRc::new(VecModel::<slint::SharedString>::default()));
         ui.set_history_missing(ModelRc::new(VecModel::<bool>::default()));
@@ -2777,6 +2913,7 @@ impl Controller {
                     }
                     *pending = false;
                     drop(pending);
+                    let spectral_peaks = c.spectral_peak_preferences();
                     let result = {
                         let mut config = c.config.lock().unwrap();
                         // Checking under the save lock prevents a late worker from
@@ -2795,6 +2932,7 @@ impl Controller {
                         config.ui_font_size = c.ui_font_size.load(Ordering::Acquire);
                         config.list_font_size = c.list_font_size.load(Ordering::Acquire);
                         config.audio_table = c.audio_table.lock().unwrap().clone();
+                        config.spectral_peaks = spectral_peaks;
                         config.max_search_tasks = c.max_search_tasks.load(Ordering::Acquire);
                         config.window_layout = c.window_layout.lock().unwrap().clone();
                         config.save()
@@ -2872,7 +3010,11 @@ impl Controller {
                                     }
                                     ui.set_metadata_dirty(dirty);
                                 }
-                                if !c2.closing.load(Ordering::Acquire) {
+                                // Close recovery owns the status until the user saves again.
+                                if !c2.closing.load(Ordering::Acquire)
+                                    && !c2.close_retains_status.load(Ordering::Acquire)
+                                    && !ui.get_closing()
+                                {
                                     let chinese = c2.chinese.load(Ordering::Acquire);
                                     ui.set_status(
                                         match (remote, chinese) {
@@ -2889,6 +3031,14 @@ impl Controller {
                                 }
                             }
                             Err(error) => {
+                                // Mirror the Ok path: close owns the status while draining,
+                                // and after a rejected close until the user saves again.
+                                if c2.closing.load(Ordering::Acquire)
+                                    || c2.close_retains_status.load(Ordering::Acquire)
+                                    || ui.get_closing()
+                                {
+                                    return;
+                                }
                                 let message = c2.metadata_failure_message(job.id, &error);
                                 ui.set_status(message.into());
                             }
@@ -3708,10 +3858,17 @@ impl Controller {
 
     fn select_folder_id(self: &Arc<Self>, id: i64) {
         self.clear_task_folder_error();
+        let path = {
+            let tree = self.tree.lock().unwrap();
+            if tree.selected == Some(id) {
+                return;
+            }
+            tree.known.get(&id).map(|folder| folder.path.clone())
+        };
         if let Some(ui) = self.ui.upgrade() {
-            // Disable current-folder menu actions until this selection's tree
-            // publication supplies its path; search may finish before the tree.
-            ui.set_selected_folder_path("".into());
+            // Visible folders and breadcrumbs already have a validated owned
+            // path. Keep the scope indicator stable while workers publish.
+            ui.set_selected_folder_path(path.unwrap_or_default().into());
         }
         self.tree.lock().unwrap().selected = Some(id);
         self.request.lock().unwrap().folder_id = Some(id);
@@ -3719,6 +3876,47 @@ impl Controller {
         if let Some(ui) = self.ui.upgrade() {
             self.request_navigation_search(&ui, true, true);
         }
+    }
+
+    fn local_scan_root_rows(folders: &[Folder]) -> Vec<LocalScanRootRow> {
+        folders
+            .iter()
+            .map(|folder| LocalScanRootRow {
+                name: folder.name.clone().into(),
+                path: folder.path.clone().into(),
+                file_count: folder.file_count.to_string().into(),
+                // Missing or non-directory paths stay listed so the user can remove the DB records.
+                invalid: !Path::new(&folder.path).is_dir(),
+            })
+            .collect()
+    }
+
+    fn publish_local_scan_roots(self: &Arc<Self>, ui: &AppWindow, folders: &[Folder]) {
+        let previous_path = {
+            let selected = ui.get_local_scan_root_selected();
+            let model = ui.get_local_scan_roots();
+            if selected >= 0 {
+                model
+                    .row_data(selected as usize)
+                    .map(|row| row.path.to_string())
+            } else {
+                None
+            }
+        };
+        let rows = if self.remote_read_only() {
+            Vec::new()
+        } else {
+            Self::local_scan_root_rows(folders)
+        };
+        let next_selected = previous_path
+            .as_deref()
+            .and_then(|path| {
+                rows.iter()
+                    .position(|row| same_path(Path::new(row.path.as_str()), Path::new(path)))
+            })
+            .map_or(-1, |index| index as i32);
+        ui.set_local_scan_roots(ModelRc::new(VecModel::from(rows)));
+        ui.set_local_scan_root_selected(next_selected);
     }
 
     fn reload_tree(self: &Arc<Self>) {
@@ -3758,6 +3956,13 @@ impl Controller {
             let mut known = known.as_ref().clone();
             let mut matches = matches.as_ref().clone();
             c.hide_removed_folders(&mut matches);
+            // Top-level folders are the local scan-roots list (independent of the
+            // search-filtered tree matches).
+            let scan_roots = if c.remote_read_only() {
+                Vec::new()
+            } else {
+                c.provider().folders(None).unwrap_or_default()
+            };
             let mut children = HashMap::<Option<i64>, Vec<Folder>>::new();
             for folder in matches {
                 known.insert(folder.id, folder.clone());
@@ -3837,10 +4042,20 @@ impl Controller {
                         .map_or_else(String::new, |folder| folder.path.clone())
                         .into(),
                 );
-                ui.set_folders(ModelRc::new(FolderTreeModel {
-                    visible: visible.clone(),
-                    expanded,
-                }));
+                // Selection-only publications must keep the same TouchAreas:
+                // Slint resets double-click counting when the target changes.
+                let unchanged = ui
+                    .get_folders()
+                    .as_any()
+                    .downcast_ref::<FolderTreeModel>()
+                    .is_some_and(|model| model.has_same_rows(&visible, &expanded));
+                if !unchanged {
+                    ui.set_folders(ModelRc::new(FolderTreeModel {
+                        visible: visible.clone(),
+                        expanded,
+                    }));
+                }
+                c2.publish_local_scan_roots(&ui, &scan_roots);
                 ui.set_crumbs(ModelRc::new(VecModel::from(
                     crumbs
                         .iter()
@@ -4392,6 +4607,7 @@ impl Controller {
     }
 
     fn save_metadata(self: &Arc<Self>, ui: &AppWindow) {
+        self.close_retains_status.store(false, Ordering::Release);
         if !self.available() {
             return;
         }
@@ -4614,6 +4830,11 @@ impl Controller {
         self.schedule_close_poll(Some(Instant::now() + Duration::from_secs(5)));
         let c = self.clone();
         std::thread::spawn(move || {
+            // Release a final folder rollup before waiting on writers. Enumeration
+            // itself is cancelled only after Metadata has drained.
+            if let Some(cancel) = c.scan_cancel.lock().unwrap().as_ref() {
+                cancel.interrupt_finish();
+            }
             let metadata_result = c.wait_workspace_writes().and_then(|_| {
                 if recover {
                     c.wait_metadata(barrier, false)
@@ -4622,10 +4843,22 @@ impl Controller {
                     c.wait_transition_metadata(barrier)
                 }
             });
+            // The finish interrupt was only there so Metadata could take the writer.
+            // If the window stays open, clear it before a later rollup observes it.
+            // Shutdown still aborts that statement instead of starting it over.
+            if metadata_result.is_err()
+                && let Some(cancel) = c.scan_cancel.lock().unwrap().as_ref()
+            {
+                if c.shutdown.load(Ordering::Acquire) {
+                    cancel.interrupt();
+                } else {
+                    cancel.clear_finish_interrupt();
+                }
+            }
             let mut result = metadata_result.and_then(|_| {
-                tracing::info!("Desktop Metadata drained; cancelling scan");
+                tracing::info!("Desktop Metadata drained; interrupting scan");
                 if let Some(cancel) = c.scan_cancel.lock().unwrap().as_ref() {
-                    cancel.cancel();
+                    cancel.interrupt();
                 }
                 // The worker releases its database scan lease before clearing
                 // this token. Wait off the event loop before exiting the process.
@@ -4716,6 +4949,9 @@ impl Controller {
         });
         if let Err(error) = result {
             tracing::warn!(%error, "Desktop close failed; retaining drafts");
+            // Claim status before restore; clear closing so resumed reads can publish.
+            // close_retains_status keeps late Metadata/LibraryChanged off the status line.
+            self.close_retains_status.store(true, Ordering::Release);
             self.closing.store(false, Ordering::Release);
             let resumed_task = self.resume_search_task_after_failed_close(ui);
             let scanning = self.scan_cancel.lock().unwrap().is_some();
@@ -4903,6 +5139,19 @@ impl Controller {
                 .into(),
             );
         }
+        {
+            let mut mailbox = self.scan_ui.lock().unwrap();
+            *mailbox = ScanUiMailbox {
+                full,
+                library_generation,
+                scan_generation,
+                ..ScanUiMailbox::default()
+            };
+        }
+        // Same delivery as close: a 50ms UI timer pulls terminal state, so a rejected
+        // cross-thread post cannot leave `scanning` set after the worker has finished.
+        self.scan_ui_poll.store(scan_generation, Ordering::Release);
+        self.schedule_scan_ui_poll(scan_generation);
         let c = self.clone();
         std::thread::spawn(move || {
             let options = ScanOptions {
@@ -4922,9 +5171,6 @@ impl Controller {
             let scanner = ScanService::new(provider);
             let mut last = Instant::now() - Duration::from_secs(1);
             let mut last_phase = (false, false);
-            // At most one progress event is queued. A busy event loop receives the
-            // newest owned snapshot, not an ever-growing backlog of old paths.
-            let mailbox = Arc::new(Mutex::new(None));
             let result = if c.closing.load(Ordering::Acquire)
                 || c.shutdown.load(Ordering::Acquire)
                 || cancel.is_cancelled()
@@ -4942,35 +5188,23 @@ impl Controller {
                     admitted = true;
                     scanner.scan(&root, &options, &cancel, |progress| {
                         let phase = (progress.paused, progress.finalizing);
-                        if c.available()
-                            && c.library_generation.load(Ordering::Acquire) == library_generation
+                        if c.library_generation.load(Ordering::Acquire) == library_generation
                             && (last.elapsed() >= Duration::from_millis(120) || phase != last_phase)
                         {
                             last = Instant::now();
                             last_phase = phase;
-                            let already_queued =
-                                mailbox.lock().unwrap().replace(progress).is_some();
-                            if already_queued {
-                                return;
-                            }
-                            let pending = mailbox.clone();
-                            let c2 = c.clone();
-                            post(c.ui.clone(), move |ui| {
-                                let progress = pending.lock().unwrap().take();
-                                if c2.available()
-                                    && ui.get_scanning()
-                                    && c2.library_generation.load(Ordering::Acquire)
-                                        == library_generation
-                                    && c2.scan_generation.load(Ordering::Acquire) == scan_generation
-                                    && let Some(progress) = progress
-                                {
-                                    c2.publish_scan_progress(&ui, progress, full);
-                                }
-                            });
+                            c.store_scan_progress(scan_generation, progress);
                         }
                     })
                 })
             };
+            c.store_scan_terminal(ScanTerminal {
+                library_generation,
+                scan_generation,
+                full,
+                admitted,
+                result,
+            });
             {
                 let mut current = c.scan_cancel.lock().unwrap();
                 if c.scan_generation.load(Ordering::Acquire) == scan_generation {
@@ -4979,16 +5213,107 @@ impl Controller {
                 }
             }
             let c2 = c.clone();
-            post(c.ui.clone(), move |ui| {
-                c2.publish_scan_completion(
-                    &ui,
-                    library_generation,
-                    scan_generation,
-                    full,
-                    admitted,
-                    result,
-                );
-            });
+            let _ = try_post(c.ui.clone(), move |ui| c2.apply_scan_ui(&ui));
+        });
+    }
+
+    /// Keep the newest progress snapshot. The UI timer publishes it; a failed post
+    /// must not make later snapshots look already queued.
+    fn store_scan_progress(&self, scan_generation: u64, progress: audiolib_core::ScanProgress) {
+        let mut mailbox = self.scan_ui.lock().unwrap();
+        if mailbox.scan_generation != scan_generation {
+            return;
+        }
+        mailbox.progress = Some(progress);
+        mailbox.progress_nonce = mailbox.progress_nonce.wrapping_add(1);
+    }
+
+    fn store_scan_terminal(&self, terminal: ScanTerminal) {
+        let mut mailbox = self.scan_ui.lock().unwrap();
+        if mailbox.scan_generation != terminal.scan_generation {
+            return;
+        }
+        mailbox.terminal = Some(terminal);
+    }
+
+    /// Called only on the UI thread while a scan's poll generation is current.
+    fn apply_scan_ui(self: &Arc<Self>, ui: &AppWindow) {
+        let (terminal, progress, full, library_generation, scan_generation) = {
+            let mut mailbox = self.scan_ui.lock().unwrap();
+            let terminal = mailbox.terminal.take();
+            let progress = if mailbox.progress_nonce != mailbox.published_nonce {
+                mailbox.published_nonce = mailbox.progress_nonce;
+                mailbox.progress.clone()
+            } else {
+                None
+            };
+            (
+                terminal,
+                progress,
+                mailbox.full,
+                mailbox.library_generation,
+                mailbox.scan_generation,
+            )
+        };
+        if let Some(terminal) = terminal {
+            self.publish_scan_completion(
+                ui,
+                terminal.library_generation,
+                terminal.scan_generation,
+                terminal.full,
+                terminal.admitted,
+                terminal.result,
+            );
+        } else if ui.get_scanning()
+            && self.scan_cancel.lock().unwrap().is_none()
+            && self.scan_generation.load(Ordering::Acquire) == scan_generation
+            && scan_generation != 0
+        {
+            // The worker finished and its completion post was lost. Hide the chrome
+            // so Add Folder and quit are not stuck on a scan that already ended.
+            ui.set_scanning(false);
+            ui.set_scan_validating(false);
+            ui.set_scan_paused(false);
+            ui.set_scan_cancelling(false);
+            ui.set_scan_finalizing(false);
+            ui.set_scan_current_path("".into());
+        }
+        if ui.get_scanning()
+            && self.available()
+            && self.library_generation.load(Ordering::Acquire) == library_generation
+            && self.scan_generation.load(Ordering::Acquire) == scan_generation
+            && let Some(progress) = progress
+        {
+            self.publish_scan_progress(ui, progress, full);
+        }
+    }
+
+    /// Single-shot chain, stopped once the scan token, chrome and mailbox are idle.
+    fn schedule_scan_ui_poll(self: &Arc<Self>, generation: u64) {
+        let c = self.clone();
+        slint::Timer::single_shot(Duration::from_millis(50), move || {
+            if c.shutdown.load(Ordering::Acquire)
+                || c.scan_ui_poll.load(Ordering::Acquire) != generation
+            {
+                return;
+            }
+            let Some(ui) = c.ui.upgrade() else {
+                return;
+            };
+            c.apply_scan_ui(&ui);
+            if c.shutdown.load(Ordering::Acquire)
+                || c.scan_ui_poll.load(Ordering::Acquire) != generation
+            {
+                return;
+            }
+            let pending = {
+                let mailbox = c.scan_ui.lock().unwrap();
+                mailbox.terminal.is_some() || mailbox.progress_nonce != mailbox.published_nonce
+            };
+            let active = pending || ui.get_scanning() || c.scan_cancel.lock().unwrap().is_some();
+            if active {
+                c.schedule_scan_ui_poll(generation);
+            }
         });
     }
 
@@ -5033,7 +5358,8 @@ impl Controller {
         let (reply, receive) = std::sync::mpsc::sync_channel(1);
         let c = self.clone();
         let pending_cancel = cancel.clone();
-        post(self.ui.clone(), move |ui| {
+        // A rejected post drops `reply`, so admission observes disconnect immediately.
+        let _ = try_post(self.ui.clone(), move |ui| {
             let admitted = c.available()
                 && !pending_cancel.is_cancelled()
                 && c.library_generation.load(Ordering::Acquire) == library_generation
@@ -5621,7 +5947,14 @@ impl Controller {
         completion
     }
     fn status(&self, message: String) {
-        post(self.ui.clone(), move |ui| ui.set_status(message.into()));
+        let retain = self.closing.load(Ordering::Acquire)
+            || self.close_retains_status.load(Ordering::Acquire);
+        post(self.ui.clone(), move |ui| {
+            if retain || ui.get_closing() {
+                return;
+            }
+            ui.set_status(message.into());
+        });
     }
 
     fn reveal(self: &Arc<Self>) {
@@ -5730,11 +6063,11 @@ impl Controller {
     }
 
     /// Drag the row (or every checked row when the dragged one is checked) to another
-    /// program as real files (CF_HDROP, copy only). Local mode offers the library files
-    /// directly. Server mode first makes complete copies in the download cache
-    /// (`<data dir>/cache`), with progress and Cancel in the status bar. The native drag
-    /// only starts while the mouse button is still held; otherwise the prepared files are
-    /// cached and the next drag starts at once.
+    /// program as real files (Windows `CF_HDROP` / macOS `public.file-url`, copy only).
+    /// Local mode offers the library files directly. Server mode first makes complete
+    /// copies in the download cache (`<data dir>/cache`), with progress and Cancel in the
+    /// status bar. The native drag only starts while the mouse button is still held;
+    /// otherwise the prepared files are cached and the next drag starts at once.
     fn drag_out(self: &Arc<Self>, id: i64) {
         const MAX_DRAG_FILES: usize = 500;
         if !self.available() || self.drag_busy.swap(true, Ordering::AcqRel) {
@@ -5995,7 +6328,7 @@ impl Controller {
             .unwrap()
             .store(true, Ordering::Release);
         if let Some(cancel) = self.scan_cancel.lock().unwrap().as_ref() {
-            cancel.cancel();
+            cancel.interrupt();
         }
         self.search_cancel
             .lock()
@@ -6038,6 +6371,7 @@ impl Controller {
         let confirmed = self
             .audio
             .send_and_wait(AudioCommand::Synchronize, Duration::from_secs(4));
+        let spectral_peaks = self.spectral_peak_preferences();
         let mut config = self.config.lock().unwrap();
         config.audition_play_on_single_click = self.single_click_play.load(Ordering::Acquire);
         config.pregenerate_list_waveforms = self.pregenerate_list_waveforms.load(Ordering::Acquire);
@@ -6048,6 +6382,7 @@ impl Controller {
         config.ui_font_size = self.ui_font_size.load(Ordering::Acquire);
         config.list_font_size = self.list_font_size.load(Ordering::Acquire);
         config.audio_table = self.audio_table.lock().unwrap().clone();
+        config.spectral_peaks = spectral_peaks;
         config.max_search_tasks = self.max_search_tasks.load(Ordering::Acquire);
         config.window_layout = self.window_layout.lock().unwrap().clone();
         if let Ok(status) = confirmed {
@@ -7870,6 +8205,7 @@ mod tests {
             ui_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
             list_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
             audio_table: Default::default(),
+            spectral_peaks: Default::default(),
             window_layout: Default::default(),
             allowed_scan_roots: Vec::new(),
             data_source: Default::default(),
@@ -7883,6 +8219,11 @@ mod tests {
         present_file(&ui, &file);
         ui.set_edit_notes("draft retained after failed close".into());
         ui.set_metadata_dirty(true);
+        // Close interrupts folder rollup before this drain. A failed save must
+        // clear that flag; the retry below must not inherit a sticky interrupt.
+        let finish_interrupt = ScanCancellation::default();
+        *controller.scan_cancel.lock().unwrap() = Some(finish_interrupt.clone());
+        let failed_close_scan = finish_interrupt;
         // Real cross-instance administration exclusion rejects the first save.
         // Release only after the UI has consumed the failed close completion.
         let lease = std::fs::OpenOptions::new()
@@ -7936,6 +8277,17 @@ mod tests {
                     slint::quit_event_loop().unwrap();
                     return;
                 }
+                if failed_close_scan.is_interrupted() || failed_close_scan.is_cancelled() {
+                    *errors.borrow_mut() = Some(
+                        "Failed close left the scan finish interrupt set, so a later rollup would abort"
+                            .into(),
+                    );
+                    slint::quit_event_loop().unwrap();
+                    return;
+                }
+                // The simulated scan never reaches finish. Drop it before the
+                // successful retry, which would otherwise wait on this token.
+                *c.scan_cancel.lock().unwrap() = None;
                 retry_lease.borrow_mut().take().unwrap().unlock().unwrap();
                 observed_retry.set(true);
                 c.request_close(&ui);
@@ -8523,6 +8875,43 @@ mod tests {
     }
 
     #[test]
+    fn local_scan_root_rows_flag_missing_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "audiolib-desktop-scan-roots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("does-not-exist");
+        let rows = Controller::local_scan_root_rows(&[
+            Folder {
+                id: 1,
+                path: root.to_string_lossy().into_owned(),
+                name: "present".into(),
+                parent_id: None,
+                file_count: 4,
+            },
+            Folder {
+                id: 2,
+                path: missing.to_string_lossy().into_owned(),
+                name: "gone".into(),
+                parent_id: None,
+                file_count: 0,
+            },
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name.as_str(), "present");
+        assert_eq!(rows[0].file_count.as_str(), "4");
+        assert!(!rows[0].invalid, "existing directory must be valid");
+        assert_eq!(rows[1].name.as_str(), "gone");
+        assert!(rows[1].invalid, "missing directory must be invalid");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn library_management_drains_drafts_before_batch_switch_and_close() {
         i_slint_backend_testing::init_integration_test_with_system_time();
         let root = std::env::temp_dir().join(format!(
@@ -9075,5 +9464,281 @@ mod tests {
         assert_eq!(pixel(2, 15), [255, 0, 24, 255]);
         assert_eq!(pixel(2, 10), [132, 144, 148, 255]);
         assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn scan_completion_while_library_open_survives_rejected_posts() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "controller::tests::child_scan_completion_while_library_open_survives_rejected_posts",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "Rejected-post scan completion regression failed: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+    }
+
+    #[test]
+    #[ignore = "helper invoked by the rejected-post scan completion regression"]
+    fn child_scan_completion_while_library_open_survives_rejected_posts() {
+        let rejected = init_close_without_post_delivery();
+        let root = std::env::temp_dir().join(format!(
+            "audiolib-desktop-scan-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sounds = root.join("sounds");
+        std::fs::create_dir_all(&sounds).unwrap();
+        let provider = Arc::new(SqliteProvider::open(&root.join("library.db")).unwrap());
+        let engine = audiolib_audio::AudioEngine::new(PlaybackConfig::default()).unwrap();
+        let ui = AppWindow::new().unwrap();
+        let mut config = AppConfig::load_in(root.join("preferences")).unwrap();
+        config.language = "cn".into();
+        config.pregenerate_list_waveforms = false;
+        let controller = Controller::new(
+            &ui,
+            provider,
+            engine.handle(),
+            config,
+            PlaybackConfig::default(),
+        );
+        ui.invoke_open_library(0);
+        assert!(ui.get_library_visible());
+        let started = Instant::now();
+        controller.scan_with_validator(sounds, audiolib_core::validate_scan_root);
+        assert!(ui.get_scanning());
+        let failure = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let errors = failure.clone();
+        let cleared = std::rc::Rc::new(std::cell::Cell::new(false));
+        let saw_clear = cleared.clone();
+        let c = controller.clone();
+        let window = ui.as_weak();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(20),
+            move || {
+                if started.elapsed() > Duration::from_secs(8) {
+                    *errors.borrow_mut() =
+                        Some("Scan chrome stayed up or close did not finish".into());
+                    slint::quit_event_loop().ok();
+                    return;
+                }
+                let Some(ui) = window.upgrade() else { return };
+                if !saw_clear.get() {
+                    if ui.get_scanning() || !ui.get_library_visible() {
+                        return;
+                    }
+                    if !ui.get_scan_summary().contains("已取消，未开始扫描") {
+                        *errors.borrow_mut() = Some(format!(
+                            "Unexpected scan summary: {}",
+                            ui.get_scan_summary()
+                        ));
+                        slint::quit_event_loop().ok();
+                        return;
+                    }
+                    if started.elapsed() > Duration::from_secs(2) {
+                        *errors.borrow_mut() = Some(
+                            "Admission waited instead of failing with the rejected post".into(),
+                        );
+                        slint::quit_event_loop().ok();
+                        return;
+                    }
+                    saw_clear.set(true);
+                    c.request_close(&ui);
+                    return;
+                }
+                if !ui.window().is_visible() {
+                    slint::quit_event_loop().ok();
+                }
+            },
+        );
+        ui.show().unwrap();
+        slint::run_event_loop().unwrap();
+        timer.stop();
+        let hidden = !ui.window().is_visible();
+        let scanning = ui.get_scanning();
+        controller.shutdown();
+        ui.hide().ok();
+        assert!(failure.borrow().is_none(), "{:?}", failure.borrow());
+        assert!(cleared.get(), "scan chrome was not cleared");
+        assert!(hidden, "close stayed on the saving overlay");
+        assert!(!scanning);
+        assert!(rejected.load(Ordering::Acquire) > 0);
+        drop(controller);
+        drop(engine);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scan_completion_clears_chrome_while_library_stays_open() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "controller::tests::child_scan_completion_clears_chrome_while_library_stays_open",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "Open-library scan completion regression failed: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+    }
+
+    #[test]
+    #[ignore = "helper invoked by the open-library scan completion regression"]
+    fn child_scan_completion_clears_chrome_while_library_stays_open() {
+        i_slint_backend_testing::init_integration_test_with_system_time();
+        let root = std::env::temp_dir().join(format!(
+            "audiolib-desktop-scan-library-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sounds = root.join("sounds");
+        std::fs::create_dir_all(&sounds).unwrap();
+        std::fs::write(sounds.join("tone.wav"), tiny_pcm_wav()).unwrap();
+        let provider = Arc::new(SqliteProvider::open(&root.join("library.db")).unwrap());
+        ScanService::new(provider.clone())
+            .scan(
+                &sounds,
+                &ScanOptions::default(),
+                &ScanCancellation::default(),
+                |_| {},
+            )
+            .unwrap();
+        let engine = audiolib_audio::AudioEngine::new(PlaybackConfig::default()).unwrap();
+        let ui = AppWindow::new().unwrap();
+        let mut config = AppConfig::load_in(root.join("preferences")).unwrap();
+        config.language = "cn".into();
+        config.pregenerate_list_waveforms = false;
+        let controller = Controller::new(
+            &ui,
+            provider,
+            engine.handle(),
+            config,
+            PlaybackConfig::default(),
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        controller.scan_with_validator(sounds, move |path, roots| {
+            release_rx
+                .recv_timeout(Duration::from_secs(8))
+                .map_err(|_| audiolib_core::Error::Busy("Manage Library was not opened".into()))?;
+            audiolib_core::validate_scan_root(path, roots)
+        });
+        assert!(ui.get_scanning());
+        let failure = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let errors = failure.clone();
+        let stage = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let observed = stage.clone();
+        let c = controller.clone();
+        let window = ui.as_weak();
+        let started = Instant::now();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(20),
+            move || {
+                if started.elapsed() > Duration::from_secs(12) {
+                    *errors.borrow_mut() = Some(format!(
+                        "Library-open scan did not settle at stage {}",
+                        observed.get()
+                    ));
+                    slint::quit_event_loop().ok();
+                    return;
+                }
+                let Some(ui) = window.upgrade() else { return };
+                match observed.get() {
+                    0 if ui.get_scanning() => {
+                        ui.invoke_open_library(0);
+                        if !ui.get_library_visible() {
+                            *errors.borrow_mut() =
+                                Some("Manage Library did not open during the scan".into());
+                            slint::quit_event_loop().ok();
+                            return;
+                        }
+                        release_tx.send(()).ok();
+                        observed.set(1);
+                    }
+                    1 if !ui.get_scanning() && ui.get_scan_summary().contains("增量扫描已完成") =>
+                    {
+                        if !ui.get_library_visible() || c.scan_cancel.lock().unwrap().is_some() {
+                            *errors.borrow_mut() = Some(
+                                "Completed scan left its token or closed the library early".into(),
+                            );
+                            slint::quit_event_loop().ok();
+                            return;
+                        }
+                        ui.invoke_close_library_manager();
+                        if ui.get_library_visible() || ui.get_scanning() {
+                            *errors.borrow_mut() = Some(
+                                "Closing Manage Library left scan chrome or the manager open"
+                                    .into(),
+                            );
+                            slint::quit_event_loop().ok();
+                            return;
+                        }
+                        c.request_close(&ui);
+                        observed.set(2);
+                    }
+                    2 if !ui.window().is_visible() => {
+                        observed.set(3);
+                        slint::quit_event_loop().ok();
+                    }
+                    _ => {}
+                }
+            },
+        );
+        ui.show().unwrap();
+        slint::run_event_loop().unwrap();
+        timer.stop();
+        let hidden = !ui.window().is_visible();
+        let scanning = ui.get_scanning();
+        controller.shutdown();
+        ui.hide().ok();
+        assert!(failure.borrow().is_none(), "{:?}", failure.borrow());
+        // Close hides the window and quits the loop from its own timer, which can
+        // run before this test timer records the final stage.
+        assert!(stage.get() >= 2, "stage {}", stage.get());
+        assert!(hidden && !scanning);
+        drop(controller);
+        drop(engine);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn tiny_pcm_wav() -> Vec<u8> {
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF");
+        wav.extend(38u32.to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(48000u32.to_le_bytes());
+        wav.extend(96000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend(2u32.to_le_bytes());
+        wav.extend(0i16.to_le_bytes());
+        wav
     }
 }

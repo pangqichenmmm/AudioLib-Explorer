@@ -274,7 +274,13 @@ mod tests {
             ..Default::default()
         };
         provider
-            .finish_scan(Path::new("/"), &mut progress, true, true)
+            .finish_scan(
+                Path::new("/"),
+                &mut progress,
+                true,
+                true,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
             .unwrap();
         assert!(provider.get_audio(1).unwrap().missing);
         assert!(!provider.get_audio(2).unwrap().missing);
@@ -299,7 +305,13 @@ mod tests {
             ..Default::default()
         };
         provider
-            .finish_scan(Path::new("/offline/Äudio"), &mut progress, true, true)
+            .finish_scan(
+                Path::new("/offline/Äudio"),
+                &mut progress,
+                true,
+                true,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
             .unwrap();
         assert_eq!(progress.removed, 1);
         assert!(provider.get_audio(1).unwrap().missing);
@@ -325,7 +337,13 @@ mod tests {
             ..Default::default()
         };
         provider
-            .finish_scan(source, &mut progress, true, true)
+            .finish_scan(
+                source,
+                &mut progress,
+                true,
+                true,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
             .unwrap();
         assert_eq!(progress.removed, 1);
         assert!(provider.get_audio(1).unwrap().missing);

@@ -47,6 +47,7 @@ fn real_windows_empty_library_closes_after_startup_event_loop() {
         ui_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         list_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         audio_table: Default::default(),
+        spectral_peaks: Default::default(),
         window_layout: Default::default(),
         allowed_scan_roots: Vec::new(),
         data_source: Default::default(),

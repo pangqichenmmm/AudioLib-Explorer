@@ -569,7 +569,10 @@ fn child_facet_publication() {
     let window = ui.as_weak();
     let stage = Rc::new(Cell::new(0));
     let next = stage.clone();
-    let previous = Rc::new(RefCell::new(ui.get_folders()));
+    let previous = Rc::new(RefCell::new((
+        ui.get_folders(),
+        controller.tree.lock().unwrap().visible.clone(),
+    )));
     let failure = Rc::new(RefCell::new(None::<String>));
     let errors = failure.clone();
     let started = Instant::now();
@@ -619,11 +622,15 @@ fn child_facet_publication() {
                             .model_published
                     );
                     ui.set_status("Preserve subsequent error".into());
-                    *previous.borrow_mut() = ui.get_folders();
+                    *previous.borrow_mut() =
+                        (ui.get_folders(), c.tree.lock().unwrap().visible.clone());
                     c.reload_tree();
                     next.set(2);
                 }
-                2 if ui.get_folders() != *previous.borrow() => {
+                2 if !Arc::ptr_eq(&c.tree.lock().unwrap().visible, &previous.borrow().1) => {
+                    // The worker has published, but identical rows deliberately
+                    // retain their pointer targets for directory double-clicks.
+                    assert_eq!(ui.get_folders(), previous.borrow().0);
                     assert_eq!(ui.get_status(), "Preserve subsequent error");
                     next.set(3);
                     slint::quit_event_loop().unwrap();

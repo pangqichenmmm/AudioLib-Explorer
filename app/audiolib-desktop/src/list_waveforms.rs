@@ -1171,6 +1171,70 @@ mod tests {
     }
 
     #[test]
+    fn enabled_pregeneration_with_empty_backlog_idles_without_hanging() {
+        // Fresh start with the new-install default (pregenerate on): worker is ready,
+        // but an empty library finishes the pass and waits — no busy loop.
+        let service = ListWaveforms::new(true);
+        let mut state = std::mem::take(&mut *service.lock());
+        assert!(state.pregenerate && state.backfill.active);
+        let now = Instant::now();
+        let local = ListWaveformSource::Local;
+        assert_eq!(state.next_step(now, false, local), Step::Run);
+        let Task::Backlog { generation, after } = take_task(&mut state) else {
+            panic!("empty library still asks for a backlog page")
+        };
+        assert_eq!(after, 0);
+        state.finish(Outcome::Backlog {
+            generation,
+            result: Ok(Vec::new()),
+        });
+        assert!(
+            !state.backfill.active,
+            "empty backlog ends the pass so the worker does not hang"
+        );
+        assert_eq!(state.next_step(now, false, local), Step::Wait(None));
+    }
+
+    #[test]
+    fn scan_finished_restarts_pregeneration_pass_when_enabled() {
+        let service = ListWaveforms::new(true);
+        {
+            let mut state = service.lock();
+            // Simulate a completed first pass.
+            state.backfill.active = false;
+            state.backfill.cursor = 99;
+            state.backfill.queue.push_back(1);
+        }
+        service.scan_finished();
+        let state = service.lock();
+        assert!(state.pregenerate);
+        assert!(
+            state.backfill.active,
+            "a finished local scan starts a new pre-generation pass"
+        );
+        assert_eq!(state.backfill.cursor, 0);
+        assert!(state.backfill.queue.is_empty());
+    }
+
+    #[test]
+    fn unavailable_or_suspended_source_idles_without_starting_backfill_work() {
+        let service = ListWaveforms::new(true);
+        let mut state = std::mem::take(&mut *service.lock());
+        let now = Instant::now();
+        assert_eq!(
+            state.next_step(now, false, ListWaveformSource::Unavailable),
+            Step::Wait(Some(IDLE_POLL))
+        );
+        assert!(state.task.is_none(), "Unavailable must not enqueue work");
+        state.suspended = true;
+        assert_eq!(
+            state.next_step(now, false, ListWaveformSource::Local),
+            Step::Wait(Some(IDLE_POLL))
+        );
+        assert!(state.task.is_none(), "suspended must not enqueue work");
+    }
+
+    #[test]
     fn stale_generations_are_dropped_and_scans_reverify_cached_rows() {
         let service = ListWaveforms::new(false);
         service.set_window(vec![1], usize::MAX);

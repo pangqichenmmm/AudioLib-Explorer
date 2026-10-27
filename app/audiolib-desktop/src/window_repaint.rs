@@ -5,9 +5,71 @@ use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEve
 /// Install once, before the first show, on the event-loop-owned desktop window.
 pub(crate) fn install(window: &slint::Window) {
     window.on_winit_window_event(|window, event| {
+        if matches!(event, WindowEvent::Focused(_) | WindowEvent::Resized(_)) {
+            install_native_redraw_guard(window);
+        }
         crate::gui_search_benchmark::window_event(window, event);
+        log_native_window_state(window, event);
         handle_event(window, event);
         EventResult::Propagate
+    });
+}
+
+/// Bind after first show, and again if winit recreates the native window.
+pub(crate) fn install_native_redraw_guard(_window: &slint::Window) {
+    #[cfg(windows)]
+    {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        _window.with_winit_window(|native| {
+            if let Ok(handle) = native.window_handle()
+                && let RawWindowHandle::Win32(handle) = handle.as_raw()
+            {
+                match audiolib_windows::window_redraw::install(handle.hwnd.get() as usize) {
+                    Ok(true) => tracing::info!("Desktop native-menu visibility guard installed"),
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(%error, "Desktop visibility guard unavailable"),
+                }
+            }
+        });
+    }
+}
+
+// Record native state without activating or changing the window. This lets an
+// intermittent loss of foreground be distinguished from minimization or exit;
+// no other window's identity, folder names or credentials enter the log.
+fn log_native_window_state(window: &slint::Window, event: &WindowEvent) {
+    let reason = match event {
+        WindowEvent::Focused(true) => "focus-gained",
+        WindowEvent::Focused(false) => "focus-lost",
+        WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => "zero-sized",
+        WindowEvent::MouseInput {
+            state: slint::winit_030::winit::event::ElementState::Released,
+            button: slint::winit_030::winit::event::MouseButton::Left,
+            ..
+        } if tracing::enabled!(tracing::Level::DEBUG) => "left-button-released",
+        _ => return,
+    };
+    window.with_winit_window(|native| {
+        let focused = native.has_focus();
+        let minimized = native.is_minimized();
+        let visible = native.is_visible();
+        if reason == "left-button-released" {
+            tracing::debug!(
+                reason,
+                focused,
+                ?minimized,
+                ?visible,
+                "Desktop native window state"
+            );
+        } else {
+            tracing::info!(
+                reason,
+                focused,
+                ?minimized,
+                ?visible,
+                "Desktop native window state"
+            );
+        }
     });
 }
 

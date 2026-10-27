@@ -2,7 +2,8 @@
 //! Interaction regressions for the client review; all data belongs to the test backend.
 use crate::ui_tests::{click_connection_field, click_label, send_keys};
 use crate::{AppWindow, FolderRow, SourceRow};
-use slint::{ComponentHandle, ModelRc, VecModel, platform::Key};
+use i_slint_backend_testing::ElementHandle;
+use slint::{ComponentHandle, Model, ModelRc, VecModel, platform::Key};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 fn window() -> AppWindow {
@@ -163,6 +164,100 @@ fn folder_tree_supports_keyboard_selection_and_expansion() {
     assert_eq!(&*toggles.borrow(), &[0, 1]);
     assert_eq!(ui.get_query(), "background query");
     ui.hide().unwrap();
+}
+
+#[test]
+fn folder_double_click_expands_and_collapses_without_toggling_leaves_or_arrow_twice() {
+    i_slint_backend_testing::init_no_event_loop();
+    for scale in [1.0, 2.0] {
+        let ui = window();
+        ui.global::<crate::Theme>().set_ui_scale(scale);
+        ui.window()
+            .set_size(slint::LogicalSize::new(1440.0 * scale, 1000.0 * scale));
+        let folders = Rc::new(VecModel::from(vec![
+            FolderRow {
+                name: "Parent".into(),
+                has_children: true,
+                ..Default::default()
+            },
+            FolderRow {
+                name: "Leaf".into(),
+                ..Default::default()
+            },
+        ]));
+        ui.set_folders(ModelRc::from(folders.clone()));
+        let weak = ui.as_weak();
+        ui.on_folder_requested(move |index| weak.upgrade().unwrap().set_selected_folder(index));
+        let toggles = Rc::new(RefCell::new(Vec::new()));
+        let observed = toggles.clone();
+        let rows = folders.clone();
+        ui.on_folder_toggle_requested(move |index| {
+            observed.borrow_mut().push(index);
+            assert_eq!(index, 0, "Only the parent has child folders");
+            let mut parent = rows.row_data(0).unwrap();
+            parent.expanded = !parent.expanded;
+            if parent.expanded {
+                rows.insert(
+                    1,
+                    FolderRow {
+                        name: "Child".into(),
+                        depth: 1,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                rows.remove(1);
+            }
+            rows.set_row_data(0, parent);
+        });
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
+
+        click_label(&ui, "Parent");
+        assert_eq!(ui.get_selected_folder(), 0);
+        assert!(toggles.borrow().is_empty(), "A single click only selects");
+        assert_eq!(folders.row_count(), 2);
+
+        for expanded in [true, false] {
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
+            click_label(&ui, "Parent");
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+            click_label(&ui, "Parent");
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+            assert_eq!(folders.row_data(0).unwrap().expanded, expanded);
+            assert_eq!(folders.row_count(), if expanded { 3 } else { 2 });
+            assert_eq!(ui.get_selected_folder(), 0);
+        }
+        assert_eq!(&*toggles.borrow(), &[0, 0]);
+
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
+        click_label(&ui, "Leaf");
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+        click_label(&ui, "Leaf");
+        assert_eq!(ui.get_selected_folder(), 1);
+        assert_eq!(&*toggles.borrow(), &[0, 0], "Leaves only select");
+
+        // The disclosure control handles each click itself. The name's
+        // double-click handler must not also receive those same clicks.
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
+        let disclosure = |label: &'static str| {
+            ElementHandle::find_by_accessible_label(&ui, "Folder: Parent")
+                .next()
+                .unwrap()
+                .query_descendants()
+                .match_predicate(move |item| item.accessible_label().as_deref() == Some(label))
+                .find_first()
+                .unwrap()
+        };
+        let plus = disclosure("+");
+        plus.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert!(folders.row_data(0).unwrap().expanded);
+        let minus = disclosure("−");
+        minus.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert!(!folders.row_data(0).unwrap().expanded);
+        assert_eq!(&*toggles.borrow(), &[0, 0, 0, 0]);
+        assert_eq!(ui.get_query(), "background query");
+        ui.hide().unwrap();
+    }
 }
 
 #[test]

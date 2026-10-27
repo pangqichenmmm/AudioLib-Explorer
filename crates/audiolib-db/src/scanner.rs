@@ -56,6 +56,9 @@ struct ScanControl {
     cancelled: AtomicBool,
     paused: AtomicBool,
     finishing: AtomicBool,
+    /// Aborts the final folder-statistics statement. Independent of `cancelled` so a
+    /// close can release that statement without changing enumeration-cancel timing.
+    interrupt: Arc<AtomicBool>,
     gate: Mutex<()>,
     wake: Condvar,
 }
@@ -68,6 +71,40 @@ impl ScanCancellation {
             self.0.paused.store(false, Ordering::Release);
             self.0.wake.notify_all();
         }
+    }
+    /// Stop enumeration and abort the final folder-statistics statement.
+    /// Unlike [`Self::cancel`], this still applies while that statement is draining.
+    pub fn interrupt(&self) {
+        let _guard = self.0.gate.lock().unwrap();
+        self.0.interrupt.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.paused.store(false, Ordering::Release);
+        self.0.wake.notify_all();
+    }
+    /// Abort only the final folder-statistics statement. Enumeration keeps running
+    /// until [`Self::cancel`] or [`Self::interrupt`].
+    ///
+    /// Close sets this before Metadata drain so that statement can release the
+    /// writer. A failed close must call [`Self::clear_finish_interrupt`]; leaving
+    /// the flag set aborts a later rollup and keeps folder statistics stale.
+    pub fn interrupt_finish(&self) {
+        self.0.interrupt.store(true, Ordering::Release);
+    }
+    /// Drop a finish-only interrupt after close is abandoned.
+    /// [`Self::interrupt`] also marks the scan cancelled and is left intact, so
+    /// quit can still abort the folder-statistics statement.
+    pub fn clear_finish_interrupt(&self) {
+        let _guard = self.0.gate.lock().unwrap();
+        if !self.is_cancelled() {
+            self.0.interrupt.store(false, Ordering::Release);
+        }
+    }
+    /// Whether [`Self::interrupt`] or [`Self::interrupt_finish`] requested the final statement to stop.
+    pub fn is_interrupted(&self) -> bool {
+        self.0.interrupt.load(Ordering::Acquire)
+    }
+    pub(crate) fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0.interrupt)
     }
     /// Whether cancellation was accepted before final reconciliation.
     pub fn is_cancelled(&self) -> bool {
@@ -188,8 +225,7 @@ impl ScanService {
         if cancellation.is_cancelled() {
             cancellation.begin_finish(&mut progress, &mut progress_callback);
             progress.state = ScanState::Cancelled;
-            self.provider
-                .finish_scan(&root, &mut progress, false, options.recursive)?;
+            self.finish_session(&root, &mut progress, false, options.recursive, cancellation)?;
             progress_callback(progress.clone());
             return Ok(progress);
         }
@@ -207,8 +243,7 @@ impl ScanService {
             progress.state = ScanState::Failed;
             let failed_path = progress.current_path.clone();
             record_issue(&mut progress, failed_path, error.to_string());
-            self.provider
-                .finish_scan(&root, &mut progress, false, options.recursive)?;
+            self.finish_session(&root, &mut progress, false, options.recursive, cancellation)?;
             progress_callback(progress);
             return Err(error);
         }
@@ -226,10 +261,47 @@ impl ScanService {
             && progress.errors == 0
             && progress.state == ScanState::Completed
             && (progress.discovered > 0 || root_has_entries(&root));
-        self.provider
-            .finish_scan(&root, &mut progress, cleanup, options.recursive)?;
+        self.finish_session(
+            &root,
+            &mut progress,
+            cleanup,
+            options.recursive,
+            cancellation,
+        )?;
         progress_callback(progress.clone());
         Ok(progress)
+    }
+
+    /// Run final reconciliation. A finish-only interrupt waits, then runs again
+    /// when that interrupt is cleared (failed close). [`ScanCancellation::interrupt`]
+    /// stays terminal so quit does not sit on the folder-statistics statement.
+    fn finish_session(
+        &self,
+        root: &Path,
+        progress: &mut ScanProgress,
+        cleanup: bool,
+        recursive: bool,
+        cancellation: &ScanCancellation,
+    ) -> Result<()> {
+        loop {
+            match self.provider.finish_scan(
+                root,
+                progress,
+                cleanup,
+                recursive,
+                &cancellation.interrupt_flag(),
+            ) {
+                Err(Error::Cancelled) if !cancellation.is_cancelled() => {
+                    while cancellation.is_interrupted() && !cancellation.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if cancellation.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                }
+                other => return other,
+            }
+        }
     }
 
     fn consume(
@@ -611,4 +683,37 @@ fn producer_ready(cancellation: &ScanCancellation, stop: &AtomicBool) -> bool {
         cancellation.wait();
     }
     !cancellation.is_cancelled() && !stop.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_during_finish_does_not_interrupt_and_interrupt_does() {
+        let cancellation = ScanCancellation::default();
+        let mut progress = ScanProgress::default();
+        cancellation.begin_finish(&mut progress, &mut |_| {});
+        assert!(cancellation.is_finishing());
+        cancellation.cancel();
+        assert!(!cancellation.is_cancelled());
+        assert!(!cancellation.is_interrupted());
+        cancellation.interrupt_finish();
+        assert!(cancellation.is_interrupted());
+        assert!(!cancellation.is_cancelled());
+        cancellation.clear_finish_interrupt();
+        assert!(
+            !cancellation.is_interrupted(),
+            "a finish-only interrupt must be retractable"
+        );
+        cancellation.interrupt_finish();
+        cancellation.interrupt();
+        assert!(cancellation.is_cancelled());
+        assert!(cancellation.is_interrupted());
+        cancellation.clear_finish_interrupt();
+        assert!(
+            cancellation.is_interrupted() && cancellation.is_cancelled(),
+            "quit's full interrupt must survive a later retract"
+        );
+    }
 }

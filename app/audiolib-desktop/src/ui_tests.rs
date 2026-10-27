@@ -915,14 +915,9 @@ fn library_management_prioritizes_scanning_and_collapses_advanced_maintenance() 
             );
         }
         for label in if chinese {
-            ["添加文件夹…", "增量扫描…", "全量扫描…", "修复文件引用"]
+            ["添加文件夹…", "增量扫描…", "全量扫描…"]
         } else {
-            [
-                "Add folder…",
-                "Incremental scan…",
-                "Full scan…",
-                "Repair file references",
-            ]
+            ["Add folder…", "Incremental scan…", "Full scan…"]
         } {
             let element = ElementHandle::find_by_accessible_label(&ui, label)
                 .next()
@@ -938,6 +933,29 @@ fn library_management_prioritizes_scanning_and_collapses_advanced_maintenance() 
                 "{label} is vertically clipped"
             );
         }
+        let remove_root = if chinese {
+            "从库中移除此根目录…"
+        } else {
+            "Remove root from library…"
+        };
+        let remove = ElementHandle::find_by_accessible_label(&ui, remove_root)
+            .next()
+            .expect(remove_root);
+        assert_eq!(
+            remove.accessible_enabled(),
+            Some(false),
+            "Remove root stays disabled with an empty selection"
+        );
+        // Scan-roots list sits above repair; scroll so the maintenance action stays reachable.
+        scroll_library_management(&ui, -400.0);
+        let repair = if chinese {
+            "修复文件引用"
+        } else {
+            "Repair file references"
+        };
+        ElementHandle::find_by_accessible_label(&ui, repair)
+            .next()
+            .expect(repair);
         scroll_library_management(&ui, -5000.0);
         click_label(&ui, advanced);
         scroll_library_management(&ui, -5000.0);
@@ -1019,6 +1037,9 @@ fn repair_references_shows_missing_files_across_the_library_in_both_languages() 
                         "Manage library"
                     },
                 );
+                // The scan-roots list added in 0.7.7 moves repair below the
+                // initial viewport. Reach it through the real scroll area.
+                scroll_library_management(&ui, -400.0);
                 click_label(
                     &ui,
                     if chinese {

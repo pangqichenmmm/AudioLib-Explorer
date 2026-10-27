@@ -654,6 +654,7 @@ fn run() -> Result<()> {
         );
     }
     ui.show().context("Show desktop")?;
+    window_repaint::install_native_redraw_guard(ui.window());
     // An event-loop failure must still stop the workers, flush preferences and
     // release the audio engine before returning the original platform error.
     let event_loop_result = slint::run_event_loop().context("Run desktop event loop");

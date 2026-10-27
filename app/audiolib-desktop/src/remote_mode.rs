@@ -870,6 +870,13 @@ impl Controller {
                         return;
                     }
                     c.publish_data_source(&ui);
+                    // Close recovery owns the status line after a rejected close.
+                    if c.closing.load(Ordering::Acquire)
+                        || c.close_retains_status.load(Ordering::Acquire)
+                        || ui.get_closing()
+                    {
+                        return;
+                    }
                     ui.set_status(reason.into());
                 });
                 self.post_remote_resync("server library identity changed");

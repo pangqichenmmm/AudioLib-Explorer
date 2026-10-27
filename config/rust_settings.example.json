@@ -3,7 +3,7 @@
   "active_database": null,
   "audition_play_on_single_click": true,
   "play_history_limit": 5000,
-  "pregenerate_list_waveforms": false,
+  "pregenerate_list_waveforms": true,
   "hold_list_waveform_batches_after_audition": false,
   "max_search_tasks": 6,
   "spectral_peaks": {

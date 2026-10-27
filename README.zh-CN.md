@@ -1,6 +1,6 @@
 # AudioLib Explorer — Maomao Edition
 
-由 [Maomao（pangqichenmmm）](https://github.com/pangqichenmmm)维护，基于[官方 AudioLib Explorer 0.7.5](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.7.5)。本分支的 Windows 客户端保留 REAPER 参考频谱峰值配色，设置页色带与实际 Waveform 使用相同颜色。颜色按参考截图校准，频率分析仍沿用原有实现。
+由 [Maomao（pangqichenmmm）](https://github.com/pangqichenmmm)维护，基于[官方 AudioLib Explorer 0.7.7](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.7.7)。本分支的 Windows 客户端保留 REAPER 参考频谱峰值配色，设置页色带与实际 Waveform 使用相同颜色。颜色按参考截图校准，频率分析仍沿用原有实现。
 
 从[本仓库 Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases)下载 Windows 便携包，通过 `Start-AudioLibExplorer.cmd` 启动。脚本关闭官方更新检查；后续升级会将本分支修改合并到新版源码后重新发布。程序目录可以同步，每台电脑的配置、凭据和缓存继续保存在本机。Release 中如附带 macOS 服务端，属于官方原始包，其来源与校验值会在发布说明中单独标明。
 
@@ -10,7 +10,7 @@
 
 AudioLib Explorer 是一款面向 Windows 的本地优先音效库管理软件，使用 Rust 编写，桌面界面基于 [Slint](https://slint.dev)。它把大型 WAV 音效库索引到 SQLite（FTS5）中，提供即时搜索，通过 WASAPI（可选 ASIO）试听，也可以浏览由自带的 `audiolib-server` 提供的远程音效库。
 
-- **程序版本：** 0.7.5（工作区 `Cargo.toml`）
+- **程序版本：** 0.7.7（工作区 `Cargo.toml`）
 - **HTTP API：** `/api/v1/`（客户端与服务端）
 - **数据库 schema：** 6（快照读取范围 3..=6，仍须验证实际格式）
 - **可写库格式：** `ale-s6-cld1-t3-m2-p1`；此前 p0 库仅作为只读来源，经 owned 候选迁移后写入

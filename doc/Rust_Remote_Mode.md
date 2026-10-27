@@ -921,8 +921,9 @@ cache for 200 items was 108 KiB.
 
 Result rows can be dragged to Explorer, a DAW or any program that accepts dropped files.
 Dragging a checked row drags all checked rows; otherwise only the dragged row. The drag is a
-native OLE `DoDragDrop` (`audiolib_windows::drag_files`) offering `CF_HDROP` with real file
-paths and only `DROPEFFECT_COPY`, so the target always copies and never moves a file.
+native drag (`audiolib_windows::drag_files`): on Windows OLE `DoDragDrop` + `CF_HDROP`, on
+macOS AppKit `beginDraggingSession` + `NSURL`/`public.file-url`, copy-only, so the target
+always copies and never moves a file.
 There are no virtual or delayed-rendered files.
 
 - **Local mode** offers the library files themselves (missing records are skipped).

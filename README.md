@@ -1,8 +1,8 @@
 # AudioLib Explorer — Maomao Edition
 
-Maintained by [Maomao (pangqichenmmm)](https://github.com/pangqichenmmm), based on [upstream AudioLib Explorer v0.7.5](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.7.5). The Windows client uses a vivid, REAPER-reference Spectral Peaks palette in both the settings legend and the Waveform. The underlying frequency analysis is preserved; the colors are a visual calibration, not a reproduction of REAPER's internal algorithm.
+Maintained by [Maomao (pangqichenmmm)](https://github.com/pangqichenmmm), based on [upstream AudioLib Explorer v0.7.7](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.7.7). The Windows client uses a vivid, REAPER-reference Spectral Peaks palette in both the settings legend and the Waveform. The underlying frequency analysis is preserved; the colors are a visual calibration, not a reproduction of REAPER's internal algorithm.
 
-由 Maomao 维护的个人分支，基于官方 0.7.5，保留 REAPER 参考频谱峰值配色。请从[本仓库 Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases)下载 Windows 便携包，并通过 `Start-AudioLibExplorer.cmd` 启动。启动脚本关闭官方更新检查，后续升级从本分支重新合并和发布。每台电脑的配置、凭据和缓存仍保存在本机。
+由 Maomao 维护的个人分支，基于官方 0.7.7，保留 REAPER 参考频谱峰值配色。请从[本仓库 Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases)下载 Windows 便携包，并通过 `Start-AudioLibExplorer.cmd` 启动。启动脚本关闭官方更新检查，后续升级从本分支重新合并和发布。每台电脑的配置、凭据和缓存仍保存在本机。
 
 <img src="resources/icons/AudioLibExplorer.png" width="128" height="128" alt="AudioLib Explorer: audio library and Waveform icon">
 
@@ -30,7 +30,7 @@ A free, open-source sound effects (SFX) library manager for sound design, game a
 
 AudioLib Explorer is a fast, local-first sound-effects library manager for Windows, written in Rust with a [Slint](https://slint.dev) desktop UI. It indexes large WAV libraries into SQLite (FTS5), searches them instantly, previews sounds through WASAPI (optionally ASIO), and can also browse a remote library served by the bundled `audiolib-server`.
 
-- **Program version:** 0.7.5 (workspace `Cargo.toml`)
+- **Program version:** 0.7.7 (workspace `Cargo.toml`)
 - **HTTP API:** `/api/v1/` (client and server)
 - **Database schema:** 6 (snapshot read range 3..=6, subject to actual format validation)
 - **Writable library format:** `ale-s6-cld1-t3-m2-p1`; earlier p0 libraries are read-only sources for an owned migration

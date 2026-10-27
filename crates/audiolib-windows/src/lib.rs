@@ -15,6 +15,10 @@ pub mod gui_capture;
 #[cfg(windows)]
 pub mod gui_geometry;
 
+/// Preserve own-window visibility during native menu redraw suppression.
+#[cfg(windows)]
+pub mod window_redraw;
+
 /// Display a fatal startup diagnostic for a desktop application without a console.
 /// Headless callers should write their diagnostics directly and skip this dialog.
 pub fn show_error_dialog(message: &str) {

@@ -434,7 +434,8 @@ pub struct AppConfig {
     #[serde(default = "default_play_history_limit")]
     pub play_history_limit: u32,
     /// Local mode: pre-generate list thumbnail Waveforms in the background after scans
-    /// (doc/api/README.md §9.3). Off by default: only visible rows are computed.
+    /// (doc/api/README.md §9.3). New installs default on; an existing settings.json that
+    /// omits the key stays off (`#[serde(default)]` on the saved field is false).
     #[serde(default)]
     pub pregenerate_list_waveforms: bool,
     /// Server mode: hold new `POST /api/v1/waveforms` batches until 3 s after the latest
@@ -700,7 +701,7 @@ impl AppConfig {
             playback: default_playback(),
             audition_play_on_single_click: true,
             play_history_limit: PLAY_HISTORY_LIMIT_PER_LIBRARY,
-            pregenerate_list_waveforms: false,
+            pregenerate_list_waveforms: true,
             hold_list_waveform_batches_after_audition: false,
             max_search_tasks: DEFAULT_MAX_SEARCH_TASKS,
             ui_scale_percent: 0,
@@ -993,6 +994,8 @@ mod tests {
         .unwrap();
         let config = AppConfig::load_with_roots(directory.path().to_owned(), &[]).unwrap();
         assert!(config.audition_play_on_single_click);
+        // Existing settings.json without the key keeps serde's false default (do not
+        // flip upgrades that never wrote the field).
         assert!(!config.pregenerate_list_waveforms);
         assert!(!config.hold_list_waveform_batches_after_audition);
         assert_eq!(config.audio_table, AudioTablePreferences::default());
@@ -1004,6 +1007,35 @@ mod tests {
         assert_eq!(loaded.audio_table, AudioTablePreferences::default());
         assert_eq!(loaded.language, config.language);
         assert_eq!(loaded.playback, config.playback);
+    }
+
+    #[test]
+    fn fresh_install_without_settings_enables_list_waveform_pregeneration() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("userdata");
+        assert!(!root.join("settings.json").exists());
+        let config = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+        assert!(
+            config.pregenerate_list_waveforms,
+            "brand-new data root defaults pre-generation on"
+        );
+        assert!(!config.hold_list_waveform_batches_after_audition);
+        // First save persists the construction default so later loads stay on.
+        config.save().unwrap();
+        let loaded = AppConfig::load_with_roots(root, &[]).unwrap();
+        assert!(loaded.pregenerate_list_waveforms);
+    }
+
+    #[test]
+    fn existing_settings_explicit_false_keeps_list_waveform_pregeneration_off() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("settings.json"),
+            r#"{"language":"cn","pregenerate_list_waveforms":false}"#,
+        )
+        .unwrap();
+        let config = AppConfig::load_with_roots(directory.path().to_owned(), &[]).unwrap();
+        assert!(!config.pregenerate_list_waveforms);
     }
 
     #[test]

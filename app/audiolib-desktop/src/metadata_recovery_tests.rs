@@ -485,11 +485,10 @@ fn child_close_retry() {
     run_until(&fixture.ui, move || !c.closing.load(Ordering::Acquire));
     assert!(fixture.ui.window().is_visible());
     assert!(fixture.ui.get_metadata_dirty());
+    let status = fixture.ui.get_status().to_string();
     assert!(
-        fixture
-            .ui
-            .get_status()
-            .contains("original drafts were retained")
+        status.contains("original drafts were retained"),
+        "unexpected status after rejected close: {status:?}"
     );
     assert!(
         fixture

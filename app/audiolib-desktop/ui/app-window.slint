@@ -36,6 +36,8 @@ export struct SavedSearchTaskRow { id: string, name: string, summary: string }
 export struct SourceRow { id: string, name: string, subtitle: string, kind: int, active: bool, status: string, status-kind: int }
 // One server root on the 服务器音效库 page (GET /roots).
 export struct ServerRootRow { name: string, path: string, status: string, offline: bool, scanning: bool, file-count: string, missing: string, last-scan: string, message: string }
+// Top-level local folders (parent_id IS NULL): the Manage library scan-roots list.
+export struct LocalScanRootRow { name: string, path: string, file-count: string, invalid: bool }
 export struct RemoteFolderRow { name: string, path: string }
 export struct RemoteBreadcrumbRow { name: string, path: string }
 // One include/exclude filter term; `index` is its position among all terms.
@@ -681,6 +683,13 @@ export component AppWindow inherits Window {
     // The controller updates this stored value only on empty/nonempty transitions.
     in property <bool> menu-has-page-rows: false;
     in property <[FolderRow]> folders;
+    // Local scan roots = folders with parent_id IS NULL. Hidden when remote-mode.
+    in property <[LocalScanRootRow]> local-scan-roots;
+    in-out property <int> local-scan-root-selected: -1;
+    property <bool> local-scan-root-has-selection: root.local-scan-root-selected >= 0 && root.local-scan-root-selected < root.local-scan-roots.length;
+    // Prefer the selected scan root for Incremental/Full in the management panel.
+    property <string> local-scan-target-path: root.local-scan-root-has-selection ? root.local-scan-roots[root.local-scan-root-selected].path : root.selected-folder-path;
+    callback local-scan-root-remove-requested();
     in property <[CrumbRow]> crumbs;
     in property <string> library-summary: "";
     in property <string> result-summary: "";
@@ -722,7 +731,7 @@ export component AppWindow inherits Window {
     // Server mode: the server offers usable list Waveforms (`/capabilities`).
     in property <bool> list-waveforms-server: false;
     private property <bool> list-waveforms-visible: root.list-waveforms-enabled && (!root.remote-mode || root.list-waveforms-server);
-    in-out property <bool> pregenerate-list-waveforms: false;
+    in-out property <bool> pregenerate-list-waveforms: true;
     callback pregenerate-list-waveforms-requested(bool);
     in-out property <bool> hold-list-waveform-batches: false;
     callback hold-list-waveform-batches-requested(bool);
@@ -2921,8 +2930,8 @@ export component AppWindow inherits Window {
                                                 Label { height: 32px * Theme.ui-scale; text: root.chinese ? "添加新音效用增量扫描；整理或移动文件后，用全量扫描检查所选文件夹。均包含子文件夹。" : "Use incremental scans to add sounds; use full scans to recheck a folder after reorganizing files. Both include subfolders."; wrap: word-wrap; }
                                                 HorizontalLayout { height: 36px * Theme.ui-scale; spacing: 8px * Theme.ui-scale;
                                                     Action { horizontal-stretch: 1; primary: true; enabled: !root.library-busy && !root.scanning; label: root.chinese ? "添加文件夹…" : "Add folder…"; clicked => { root.prepare-scan(0, ""); } }
-                                                    Action { horizontal-stretch: 1; enabled: !root.library-busy && !root.scanning; label: root.chinese ? "增量扫描…" : "Incremental scan…"; clicked => { root.prepare-scan(0, root.selected-folder-path); } }
-                                                    Action { horizontal-stretch: 1; enabled: !root.library-busy && !root.scanning; label: root.chinese ? "全量扫描…" : "Full scan…"; clicked => { root.prepare-scan(1, root.selected-folder-path); } }
+                                                    Action { horizontal-stretch: 1; enabled: !root.library-busy && !root.scanning; label: root.chinese ? "增量扫描…" : "Incremental scan…"; clicked => { root.prepare-scan(0, root.local-scan-target-path); } }
+                                                    Action { horizontal-stretch: 1; enabled: !root.library-busy && !root.scanning; label: root.chinese ? "全量扫描…" : "Full scan…"; clicked => { root.prepare-scan(1, root.local-scan-target-path); } }
                                                 }
                                                 if root.scanning: HorizontalLayout { height: 34px * Theme.ui-scale; spacing: 8px * Theme.ui-scale;
                                                     Label { horizontal-stretch: 1; text: root.scan-paused ? (root.chinese ? "扫描已请求暂停，可继续或取消。" : "Pause requested. Resume or cancel at any time.") : (root.chinese ? "扫描正在后台进行，可以继续浏览和试听。" : "Scanning in the background. You can keep browsing and auditioning."); }
@@ -2930,6 +2939,41 @@ export component AppWindow inherits Window {
                                                     Action { width: 130px * Theme.ui-scale; enabled: root.scan-controllable; label: root.chinese ? "取消当前扫描" : "Cancel current scan"; clicked => { root.scan-cancel-requested(); } }
                                                 }
                                                 if root.scan-summary != "": Text { height: 44px * Theme.ui-scale; text: root.scan-summary; color: Theme.accent; wrap: word-wrap; font-size: Theme.font(11); }
+                                                Text { height: 22px * Theme.ui-scale; text: root.chinese ? "扫描根目录" : "Scan roots"; color: Theme.ink; font-size: Theme.font(14); font-weight: 600; }
+                                                Label { wrap: word-wrap; font-size: Theme.font(10); color: Theme.muted;
+                                                    text: root.chinese ? "以下是已加入本机音效库的顶层文件夹。移除只删除库记录与标注，不会删除磁盘目录或 WAV 文件。" : "Top-level folders currently in this local library. Removing one deletes library records and annotations only; disk folders and WAV files stay.";
+                                                }
+                                                for row[index] in root.local-scan-roots: Rectangle {
+                                                    height: 40px * Theme.ui-scale; border-radius: 4px * Theme.ui-scale;
+                                                    background: root.local-scan-root-selected == index ? Theme.selected : (local-root-hit.has-hover ? Theme.hover : Theme.raised);
+                                                    accessible-role: button;
+                                                    accessible-label: row.name + " · " + row.path + (row.invalid ? (root.chinese ? " · 无效" : " · invalid") : "");
+                                                    accessible-enabled: !root.library-busy && !root.scanning;
+                                                    accessible-action-default => { if !root.library-busy && !root.scanning { root.local-scan-root-selected = index; } }
+                                                    forward-focus: local-root-focus;
+                                                    border-width: local-root-focus.has-focus ? 1px : 0px;
+                                                    border-color: Theme.accent;
+                                                    VerticalLayout { padding-left: 8px * Theme.ui-scale; padding-right: 8px * Theme.ui-scale; padding-top: 4px * Theme.ui-scale; padding-bottom: 4px * Theme.ui-scale; spacing: 2px * Theme.ui-scale;
+                                                        HorizontalLayout { height: 20px * Theme.ui-scale; spacing: 8px * Theme.ui-scale;
+                                                            Text { width: 132px * Theme.ui-scale; text: row.name; color: Theme.ink; font-size: Theme.font(11); overflow: elide; vertical-alignment: center; }
+                                                            Text { width: 72px * Theme.ui-scale; text: row.file-count; color: Theme.ink; font-size: Theme.font(11); vertical-alignment: center; }
+                                                            Text { width: 96px * Theme.ui-scale; text: row.invalid ? (root.chinese ? "路径无效" : "Invalid path") : (root.chinese ? "可用" : "Ready"); color: row.invalid ? Theme.warning : Theme.ink; font-size: Theme.font(11); overflow: elide; vertical-alignment: center; }
+                                                            Text { horizontal-stretch: 1; text: row.path; color: Theme.dim; font-size: Theme.font(10); overflow: elide; vertical-alignment: center; }
+                                                        }
+                                                        if row.invalid: Text { height: 14px * Theme.ui-scale; text: root.chinese ? "目录不存在或不可访问；可移除库记录后重新添加。" : "Folder missing or inaccessible; remove the library records, then add it again."; color: Theme.warning; font-size: Theme.font(9); overflow: elide; }
+                                                    }
+                                                    local-root-focus := FocusScope {
+                                                        enabled: !root.library-busy && !root.scanning;
+                                                        focus-on-click: false;
+                                                        key-pressed(event) => { if event.text == " " || event.text == Key.Return { root.local-scan-root-selected = index; return accept; } reject }
+                                                    }
+                                                    local-root-hit := TouchArea { enabled: !root.library-busy && !root.scanning; mouse-cursor: pointer; clicked => { local-root-focus.focus(); root.local-scan-root-selected = index; } }
+                                                }
+                                                if root.local-scan-roots.length == 0: Label { font-size: Theme.font(11); color: Theme.muted; text: root.chinese ? "尚未添加扫描根目录。用「添加文件夹…」选择一个目录开始。" : "No scan roots yet. Use “Add folder…” to choose a directory."; }
+                                                HorizontalLayout { height: 30px * Theme.ui-scale; spacing: 6px * Theme.ui-scale;
+                                                    Action { width: 168px * Theme.ui-scale; enabled: !root.library-busy && !root.scanning && root.local-scan-root-has-selection; label: root.chinese ? "从库中移除此根目录…" : "Remove root from library…"; clicked => { root.local-scan-root-remove-requested(); } }
+                                                    Rectangle { horizontal-stretch: 1; }
+                                                }
                                                 pregenerate-waveforms-check := CheckBox {
                                                     height: 28px * Theme.ui-scale; enabled: !root.library-busy;
                                                     text: root.chinese ? "预生成列表波形" : "Pre-generate list Waveforms";

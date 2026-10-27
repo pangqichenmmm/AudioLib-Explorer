@@ -1398,31 +1398,98 @@ impl SqliteProvider {
         progress: &mut audiolib_core::ScanProgress,
         cleanup: bool,
         recursive: bool,
+        interrupt: &Arc<AtomicBool>,
     ) -> Result<()> {
         let mut conn = self.writer()?;
-        let tx = conn.transaction().map_err(db_error)?;
-        if cleanup {
-            let folder = ensure_folder(&tx, root, root)?;
-            let stored_root: String = tx
-                .query_row(
-                    "SELECT folder_path FROM folders WHERE id=?1",
-                    [folder],
-                    |row| row.get(0),
-                )
-                .map_err(db_error)?;
-            // Missing files retain annotations, playlists, and IDs and can reconnect later.
-            let (scope, scope_value) = if recursive {
-                (
-                    // Hierarchy membership survives native case-only aliases and
-                    // volume roots. Rows without a folder retain the old path scope.
-                    "(folder_id IN (SELECT descendant_id FROM folder_closure WHERE ancestor_id=?1) OR (folder_id IS NULL AND ((?3='/' AND substr(file_path,1,1)='/') OR audiolib_path_identity(file_path)=?3 COLLATE BINARY OR substr(audiolib_path_identity(file_path),1,length(?3)+1)=?3||'/' COLLATE BINARY)))",
-                    Value::Integer(folder),
-                )
-            } else {
-                ("folder_id=?1 AND ?3 IS NOT NULL", Value::Integer(folder))
-            };
-            ensure_scan_seen_table(&tx)?;
-            progress.removed = tx.execute(
+        let result = run_interruptible(&mut conn, interrupt, |conn| {
+            let tx = conn.transaction().map_err(db_error)?;
+            finish_scan_transaction(&tx, root, progress, cleanup, recursive)?;
+            tx.commit().map_err(db_error)
+        });
+        if result.is_err()
+            && (interrupt.load(Ordering::Acquire) || matches!(result, Err(Error::Cancelled)))
+        {
+            // The heavy transaction rolled back. Leave a terminal session row so
+            // history does not stay "running" after quit aborted the rollup.
+            mark_scan_session_cancelled(&conn, progress)?;
+            return Err(Error::Cancelled);
+        }
+        result
+    }
+}
+
+/// Stop a statement on this connection when `interrupt` becomes set.
+/// The progress handler is removed and the watcher joined before return, so the
+/// next statement is not cancelled. A successful `work` result is preserved when
+/// the flag races in after commit.
+#[cfg(feature = "scanner")]
+fn run_interruptible<T>(
+    conn: &mut Connection,
+    interrupt: &Arc<AtomicBool>,
+    work: impl FnOnce(&mut Connection) -> Result<T>,
+) -> Result<T> {
+    if interrupt.load(Ordering::Acquire) {
+        return Err(Error::Cancelled);
+    }
+    let flag = Arc::clone(interrupt);
+    conn.progress_handler(2000, Some(move || flag.load(Ordering::Acquire)))
+        .map_err(db_error)?;
+    let handle = conn.get_interrupt_handle();
+    let flag = Arc::clone(interrupt);
+    let result = std::thread::scope(|scope| {
+        let (done, waiting) = std::sync::mpsc::sync_channel::<()>(1);
+        scope.spawn(move || {
+            loop {
+                if flag.load(Ordering::Acquire) {
+                    handle.interrupt();
+                }
+                match waiting.recv_timeout(Duration::from_millis(20)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            }
+        });
+        let result = work(conn);
+        drop(done);
+        result
+    });
+    if conn.progress_handler(0, None::<fn() -> bool>).is_err() {
+        // A handler that still returns true would cancel the next writer user.
+        let _ = conn.progress_handler(2000, Some(|| false));
+    }
+    result
+}
+
+#[cfg(feature = "scanner")]
+fn finish_scan_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    progress: &mut audiolib_core::ScanProgress,
+    cleanup: bool,
+    recursive: bool,
+) -> Result<()> {
+    if cleanup {
+        let folder = ensure_folder(tx, root, root)?;
+        let stored_root: String = tx
+            .query_row(
+                "SELECT folder_path FROM folders WHERE id=?1",
+                [folder],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        // Missing files retain annotations, playlists, and IDs and can reconnect later.
+        let (scope, scope_value) = if recursive {
+            (
+                // Hierarchy membership survives native case-only aliases and
+                // volume roots. Rows without a folder retain the old path scope.
+                "(folder_id IN (SELECT descendant_id FROM folder_closure WHERE ancestor_id=?1) OR (folder_id IS NULL AND ((?3='/' AND substr(file_path,1,1)='/') OR audiolib_path_identity(file_path)=?3 COLLATE BINARY OR substr(audiolib_path_identity(file_path),1,length(?3)+1)=?3||'/' COLLATE BINARY)))",
+                Value::Integer(folder),
+            )
+        } else {
+            ("folder_id=?1 AND ?3 IS NOT NULL", Value::Integer(folder))
+        };
+        ensure_scan_seen_table(tx)?;
+        progress.removed = tx.execute(
                 &format!(
                     "UPDATE audio_files SET missing=1 WHERE {scope} AND missing=0 AND lower(filename) LIKE '%.wav'
                 AND (seen_scan_id IS NULL OR seen_scan_id<>?2)
@@ -1431,28 +1498,54 @@ impl SqliteProvider {
                 params![scope_value, progress.session_id, path_identity::comparison_key(&stored_root)],
             )
             .map_err(db_error)? as u64;
-        }
-        ensure_scan_seen_table(&tx)?;
-        tx.execute(
-            "DELETE FROM temp.scan_seen WHERE session_id<=?1",
-            [progress.session_id],
-        )
-        .map_err(db_error)?;
-        refresh_folder_statistics(&tx)?;
-        let status = match progress.state {
-            audiolib_core::ScanState::Running => "running",
-            audiolib_core::ScanState::Completed => "completed",
-            audiolib_core::ScanState::Cancelled => "cancelled",
-            audiolib_core::ScanState::Failed => "failed",
-        };
-        tx.execute("UPDATE scan_sessions SET end_time=strftime('%Y-%m-%d %H:%M:%f','now'),status=?2,
+    }
+    ensure_scan_seen_table(tx)?;
+    tx.execute(
+        "DELETE FROM temp.scan_seen WHERE session_id<=?1",
+        [progress.session_id],
+    )
+    .map_err(db_error)?;
+    refresh_folder_statistics(tx)?;
+    let status = match progress.state {
+        audiolib_core::ScanState::Running => "running",
+        audiolib_core::ScanState::Completed => "completed",
+        audiolib_core::ScanState::Cancelled => "cancelled",
+        audiolib_core::ScanState::Failed => "failed",
+    };
+    tx.execute("UPDATE scan_sessions SET end_time=strftime('%Y-%m-%d %H:%M:%f','now'),status=?2,
             files_scanned=?3,files_added=?4,files_updated=?5,files_skipped=?6,errors=?7,error_details=?8,
             files_removed=?9,errors_truncated=?10 WHERE id=?1",
             params![progress.session_id,status,progress.processed as i64,progress.added as i64,progress.updated as i64,progress.unchanged as i64,
                 progress.errors as i64,serde_json::to_string(&progress.error_details).map_err(|e|Error::Validation(e.to_string()))?,
                 progress.removed as i64,progress.errors_truncated as i64]).map_err(db_error)?;
-        tx.commit().map_err(db_error)
-    }
+    Ok(())
+}
+
+#[cfg(feature = "scanner")]
+fn mark_scan_session_cancelled(
+    conn: &Connection,
+    progress: &audiolib_core::ScanProgress,
+) -> Result<()> {
+    let details = serde_json::to_string(&progress.error_details)
+        .map_err(|error| Error::Validation(error.to_string()))?;
+    conn.execute(
+        "UPDATE scan_sessions SET end_time=strftime('%Y-%m-%d %H:%M:%f','now'),status='cancelled',
+            files_scanned=?2,files_added=?3,files_updated=?4,files_skipped=?5,errors=?6,error_details=?7,
+            files_removed=?8,errors_truncated=?9 WHERE id=?1 AND status='running'",
+        params![
+            progress.session_id,
+            progress.processed as i64,
+            progress.added as i64,
+            progress.updated as i64,
+            progress.unchanged as i64,
+            progress.errors as i64,
+            details,
+            progress.removed as i64,
+            progress.errors_truncated as i64
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
 }
 
 #[cfg(feature = "scanner")]
@@ -3739,5 +3832,72 @@ mod search_cancellation_tests {
         assert_eq!(provider.search(&request).unwrap().total_count, 0);
         assert!(provider.search_folders(&request).unwrap().is_empty());
         assert_eq!(provider.stats().unwrap().audio_files, 0);
+    }
+}
+
+#[cfg(all(test, feature = "scanner"))]
+mod finish_interrupt_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn interrupt_before_finish_marks_the_session_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let sounds = root.path().join("sounds");
+        std::fs::create_dir(&sounds).unwrap();
+        let provider = SqliteProvider::open(&root.path().join("library.db")).unwrap();
+        let session = provider.start_scan(&sounds, true).unwrap();
+        let mut progress = audiolib_core::ScanProgress {
+            session_id: session,
+            state: audiolib_core::ScanState::Completed,
+            ..Default::default()
+        };
+        let interrupt = Arc::new(AtomicBool::new(true));
+        let started = Instant::now();
+        let error = provider
+            .finish_scan(&sounds, &mut progress, true, true, &interrupt)
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(error, Error::Cancelled));
+        let status: String = Connection::open(provider.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT status FROM scan_sessions WHERE id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn interrupt_during_statement_returns_cancelled_and_the_connection_recovers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&interrupt);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = run_interruptible(&mut conn, &interrupt, |conn| {
+            conn.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT SUM(x) FROM n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(db_error)
+        });
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

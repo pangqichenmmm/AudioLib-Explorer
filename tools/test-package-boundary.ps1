@@ -123,8 +123,13 @@ try {
     try { & (Join-Path $testRoot 'tools/validate-portable-zip.ps1') -Archive $badZip } catch { $rejected = $_.Exception.Message -match 'separators' }
     if (!$rejected) { throw 'Backslash ZIP entry names were accepted.' }
     & (Join-Path $testRoot 'tools/install-beta.ps1') -Source $staleRoot -Destination (Join-Path $testRoot 'development-beta') -Development
-    if ((Get-Content -LiteralPath (Join-Path $testRoot 'development-beta/update-version.txt') -Raw).Trim() -cne '0.4.4-0' -or
-        (Get-Content -LiteralPath (Join-Path $testRoot 'development-beta/update-channel.txt') -Raw).Trim() -cne 'beta') { throw 'Development beta baseline does not sort before a same-version prerelease.' }
+    # The development identity includes a binary-derived build suffix. SemVer
+    # ignores that suffix for precedence, so numeric -0 still sorts before beta.
+    $developmentHash = (Get-FileHash -LiteralPath (Join-Path $staleRoot 'AudioLibExplorer.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $developmentVersion = '0.4.4-0+local.' + $developmentHash.Substring(0, 12)
+    if ((Get-Content -LiteralPath (Join-Path $testRoot 'development-beta/update-version.txt') -Raw).Trim() -cne $developmentVersion -or
+        (Get-Content -LiteralPath (Join-Path $testRoot 'development-beta/update-development.txt') -Raw).Trim() -cne $developmentVersion -or
+        (Get-Content -LiteralPath (Join-Path $testRoot 'development-beta/update-channel.txt') -Raw).Trim() -cne 'beta') { throw 'Development beta identity does not match its binary and update marker.' }
     if ((Get-Content -LiteralPath (Join-Path $staleRoot 'update-channel.txt') -Raw).Trim() -cne 'stable' -or
         (Get-Content -LiteralPath (Join-Path $staleRoot 'update-version.txt') -Raw).Trim() -cne '0.4.4') { throw 'Stable package update metadata differs.' }
     & (Join-Path $testRoot 'tools/package-portable.ps1') -SkipBuild -WithoutAsio -Tag v0.4.4-beta.12

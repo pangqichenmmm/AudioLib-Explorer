@@ -323,7 +323,7 @@ fn escaped_source_keys_repair_completed_and_partial_old_backfills() {
         let conn = support::connection(&path).unwrap();
         let stored: String = conn
             .query_row(
-                "SELECT metadata_json FROM audio_files WHERE id=2",
+                "SELECT audiolib_metadata_json(metadata_json) FROM audio_files WHERE id=2",
                 [],
                 |row| row.get(0),
             )
@@ -430,7 +430,7 @@ fn extracted_compound_codes_keep_numeric_and_single_letter_components_searchable
     let stored: String = support::connection(&path)
         .unwrap()
         .query_row(
-            "SELECT metadata_json FROM audio_files WHERE id=2",
+            "SELECT audiolib_metadata_json(metadata_json) FROM audio_files WHERE id=2",
             [],
             |row| row.get(0),
         )

@@ -1,16 +1,16 @@
 # Search tasks and saved searches
 
-The desktop supports up to six independent search tasks for the active library. Each task owns its query, directory navigation, filters and result-list view. Search-task favorites are personal client state; audio favorites keep their existing library Metadata behavior.
+The desktop supports up to 30 independent search tasks for the active library. Each task owns its query, directory navigation, filters and result-list view. Search-task favorites are personal client state; audio favorites keep their existing library Metadata behavior.
 
 ## Using tasks
 
-The document-style task strip sits above the search field. Its active task has a connected content edge and emphasis line, making it distinct from toolbar buttons and the smaller panel selectors. The creation `+` follows the last task inside the horizontally scrolling strip. New blank tasks are named `default` in English and `默认搜索` in Chinese; older automatically numbered titles display with the same localized default name, while custom titles remain intact.
+The document-style task strip sits above the search field. Its active task has a connected content edge and emphasis line, making it distinct from toolbar buttons and the smaller panel selectors. Tabs retain their readable width when their combined width exceeds the window: the strip scrolls horizontally, with left/right controls to move through the overflow. Activating or creating a task reveals its tab automatically. The creation `+` remains fixed beside the scrolling strip so creating a task does not require scrolling to the end. New blank tasks are named `default` in English and `默认搜索` in Chinese; older automatically numbered titles display with the same localized default name, while custom titles remain intact.
 
 Explicit task and favorite renames are stored with their name provenance, so names such as `Search 2` or `default` remain literal across language changes, task switching and restart. Older workspaces without that optional field retain their existing automatic-name behavior.
 
 After a search, the tab shows `Search:` / `搜索:` with compact, unboxed text: pale teal keywords and a different warm text color for the directory name. Neither uses a border or filled badge. The prefix and terms align left and share the tab row's vertical center. The displayed conditions come from the executable search definition, so invalid or unsubmitted editor drafts do not rename the tab's current results. Long conditions elide in one row; hovering the tab reveals the full query, indexed directory path, descendant policy, filters and sorting. A custom task name remains available in the hover summary and rename dialog. Search-task favorite controls are grouped with the filter and details icons at the right of the sound-list header; they always act on the active task.
 
-New tasks start with an empty query, the whole current library and default filters. Closing a task leaves other tasks intact; closing the last task leaves one empty task available. Appearance settings select the maximum number of open tasks from one to six, with six as the default. Reaching the limit never replaces an existing task. Lowering the limit below the current task count requires closing tasks first.
+New tasks start with an empty query, the whole current library and default filters. Closing a task leaves other tasks intact; closing the last task leaves one empty task available. Appearance settings select the maximum number of open tasks from one to 30, with 30 as the default. Previously saved limits, including six, remain personal preferences and can be raised in Appearance settings. Reaching the limit never replaces an existing task. Lowering the limit below the current task count requires closing tasks first.
 
 All tasks use the current data source. Switching between libraries saves the old library's task group and restores the destination library's group. Connections to the same server library share that library's personal group, including LAN and external connection profiles. A different server library has a separate group.
 
@@ -42,7 +42,23 @@ Personal search favorites remain on this computer, independently of server write
 
 The client stores task order, active task, search definitions, navigation and view state in a versioned `workspace.json` under the configured user data root. The default root is `%LOCALAPPDATA%/AudioLibExplorer/v1`; `AUDIOLIB_DATA_DIR` selects an isolated alternative. Per-library scopes use the existing canonical local-library identity or the server library ID. Tokens, passwords, decoded audio, result rows, Slint models and Waveform images are not persisted in a task workspace.
 
+Schema-8 clients write workspace format 2 and explicitly admit existing format-1
+files in memory before the next ordered save. All tasks, favorites and drafts
+remain. The user-data directory stays at `v1`. Older clients reject format 2
+instead of silently ignoring an album-ID filter; a downgrade must restore a
+matching older workspace backup to reuse those conditions. Unknown fields,
+unknown filter conditions, foreign scopes and future versions preserve the
+original file and open a protected temporary workspace.
+
 All open tasks, including tasks without a favorite, are restored on the next launch. Only the active task queries at startup; other tasks query when activated. Restoration never resumes audio automatically. Persisted file and directory identities include their indexed paths and are resolved against the opened library before reuse. A missing saved directory is reported as an unavailable scope, rather than silently broadening the search to the whole library.
+
+Album filters store the album namespace and Metadata key or folder identity along
+with the numeric ID. When an old server adopts native shared albums, all open
+and saved filters resolve their semantic owner before querying. A matching
+numeric ID alone cannot select a different album. Missing albums remain visibly
+unavailable and block execution until reselected or reset; original conditions
+are retained. Within one namespace, a supported root relocation keeps the live
+folder album ID and updates its stored path.
 
 Workspace writes run off the Slint event loop and retain their original library target. Switching the current source cannot redirect a late save into another library's group. Unknown or damaged workspace formats are preserved and reported; an empty fallback must not overwrite them as an ordinary save.
 
@@ -54,7 +70,7 @@ If a task's identity lookup fails, its stored definition and navigation remain i
 
 Tasks share the existing bounded result and directory-facet workers. Switching tasks cancels obsolete requests. Every asynchronous result, directory model, detail response and visible-row Waveform publication must match the current task, request and library/source generations before updating the UI.
 
-An inactive task can retain its completed result-page cache in memory. Reuse requires the same provider identity and a matching `DataProvider::search_revision`; a missing or failed revision probe causes a fresh query. Provider replacement invalidates old caches even when revision numbers coincide. Metadata changes, scans, removals and refreshes invalidate dependent task views. Background tasks refresh lazily when selected, avoiding six simultaneous whole-library searches.
+An inactive task can retain its completed result-page cache in memory. Reuse requires the same provider identity and a matching `DataProvider::search_revision`; a missing or failed revision probe causes a fresh query. Provider replacement invalidates old caches even when revision numbers coincide. Metadata changes, scans, removals and refreshes invalidate dependent task views. Background tasks refresh lazily when selected, avoiding simultaneous whole-library searches for every open task.
 
 Query validation and FTS5 behavior remain the existing core contracts, including the 500-character query limit. The performance target remains **P95 latency <500ms for 1M+ records**. Task behavior tests and layout checks do not establish a new million-record benchmark or physical button-to-audio-output measurement.
 
@@ -72,4 +88,4 @@ The final CR integrates beta commit `7b97a78` and passed strict Clippy for core/
 
 On the same Windows x64 host (Ryzen 7 9800X3D, Rust 1.97.1 MSVC), `cargo run --release --locked -p audiolib-db --bin search-benchmark -- --records 1000000 --queries 100` passed on an independent generated temporary library. At code commit `f81401a`, the 100 default mixed result-page queries measured P50 2.11 ms, P95 150.67 ms and P99 194.78 ms, with 65 ranking-cache hits. The initial mixed pass measured P95 308.17 ms. These are DataProvider result-page execution times after fixture generation/indexing, with OS caches retained; directory aggregation, new-provider cold starts, GUI debounce/queue/rendering and physical playback latency were not measured. No other build ran during measurement. The target remains **P95 latency <500ms for 1M+ records**.
 
-Layout acceptance covers six long task titles, both desktop languages, the minimum 1080×700 logical window and supported interface scaling. Keyboard navigation must remain available without interpreting task changes as audio transport. Real-device audio and performance acceptance are recorded separately from synthetic UI checks.
+Layout regression coverage includes 30 task tabs, horizontal overflow, both desktop languages, the minimum 1080×700 logical window and supported interface scaling. Keyboard navigation must remain available without interpreting task changes as audio transport. Real-device audio and performance acceptance are recorded separately from synthetic UI checks.

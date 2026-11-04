@@ -191,7 +191,7 @@ impl Shared {
         if *remaining == 0 {
             match self
                 .reserved
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     (used < search_cache::MAX_RANKED_IDS)
                         .then(|| used + (search_cache::MAX_RANKED_IDS - used).min(BUDGET_BATCH))
                 }) {

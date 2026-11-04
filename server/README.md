@@ -23,6 +23,12 @@ page. It never modifies audio files.
 - `/audio/{id}/preview` for low-bandwidth playback: in-process PCM decimation for WAV
   (`codec=pcm`) and an optional ffmpeg FLAC transcode (`codec=flac`).
 - `/audio/{id}/waveform` with an on-disk LRU cache.
+- `/albums/{id}/artwork` returns a shared album's embedded JPEG or PNG (optional
+  `?side=`), bound to library identity and album namespace with the
+  `album_entity_artwork` capability. The compatible `/audio/{id}/artwork` retains
+  its per-audio meaning. Image bytes stay outside SQLite; a cache lives in
+  `<library directory>/artwork`. Upgrade schema-8 clients and servers together and
+  retain the rollback database. See [shared albums and storage](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md).
 - Metadata writes, play counts, remote scans (start/pause/resume/cancel), record and folder
   removal (`manage_mode` can restrict them).
 - Token authentication with three modes (`off`, `external`, `all`), tokens generated on the
@@ -31,7 +37,7 @@ page. It never modifies audio files.
 
 ## Download a prebuilt server
 
-[GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) provide Windows x64 ZIP and Linux x64 GNU tar.gz archives with SHA256 files. Verify the checksum, extract, then use the executable at the archive root with your own configuration (`--config <path>`). Public configuration examples are under `server/audiolib-server/`; the Linux archive is built on Ubuntu 22.04. Keep your existing library, roots, configuration and credentials when upgrading. See the [deployment guide](deploy/README.md) for installation and rollback. Other platforms can build from source below.
+[GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) provide macOS arm64 and, from 0.8.4, Linux x64 GNU server archives with SHA256 files. Version 0.8.4 also includes Docker amd64/arm64 offline images. Verify the checksum before extracting a native package or loading an image. Native archives keep the executable at their root and public configuration examples under `server/audiolib-server/`; Linux packages use Debian 12 as their GNU libc build baseline. Keep existing libraries, roots, configuration and credentials when upgrading. See [Linux/Docker delivery](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Linux_Docker_Release.md) and the [deployment guide](deploy/README.md). From 0.8.5 (first included version) a prebuilt Windows x64 server ZIP is provided (`AudioLibServer-<tag>-win-x64.zip`); earlier versions and source builds remain available. Standalone Linux arm64 servers build from source.
 
 ## Quick start: build from source
 
@@ -207,6 +213,7 @@ rollback, backup and health check).
 
 `/health`, `/library`, `/library/snapshot`, `/roots`, `POST /roots/{name}/check`,
 `/audio/{id}`, `/audio/{id}/waveform`, `/audio/{id}/preview`, `/audio/{id}/stream`,
+`/audio/{id}/artwork`,
 metadata writes (`PATCH /audio/{id}/metadata`, `POST /audio/metadata/batch`,
 deprecated no-op `POST /audio/{id}/plays`), remote scans (`POST /scans`, `GET /scans/current`,
 `GET /scans/{id}`, `POST /scans/{id}/pause|resume|cancel`), history

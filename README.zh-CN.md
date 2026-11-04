@@ -1,24 +1,44 @@
 # AudioLib Explorer — Maomao Edition
 
-由 [Maomao（pangqichenmmm）](https://github.com/pangqichenmmm)维护，基于[官方 AudioLib Explorer 0.7.7](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.7.7)。本分支的 Windows 客户端保留 REAPER 参考频谱峰值配色，设置页色带与实际 Waveform 使用相同颜色。颜色按参考截图校准，频率分析仍沿用原有实现。
+由 [Maomao（pangqichenmmm）](https://github.com/pangqichenmmm)维护，基于[官方 AudioLib Explorer 0.8.7](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.8.7)。本分支的 Windows 客户端保留 REAPER 参考频谱峰值配色，设置页色带与实际 Waveform 使用相同颜色。颜色按参考截图校准，频率分析仍沿用原有实现。
 
-从[本仓库 Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases)下载 Windows 便携包，通过 `Start-AudioLibExplorer.cmd` 启动。脚本关闭官方更新检查；后续升级会将本分支修改合并到新版源码后重新发布。程序目录可以同步，每台电脑的配置、凭据和缓存继续保存在本机。Release 中如附带 macOS 服务端，属于官方原始包，其来源与校验值会在发布说明中单独标明。
+已发布的 Maomao Windows 便携包见[本仓库 Releases](https://github.com/pangqichenmmm/AudioLib-Explorer/releases)；发布包的版本可能早于本分支源码。通过 `Start-AudioLibExplorer.cmd` 启动可关闭官方更新检查；后续升级将本分支修改合并到新版源码后再构建。程序目录可以同步，每台电脑的配置、凭据和缓存继续保存在本机。Release 中如附带 macOS 服务端，属于官方原始包，其来源与校验值会在发布说明中单独标明。
 
 <img src="resources/icons/AudioLibExplorer.png" width="128" height="128" alt="AudioLib Explorer：音频素材库与 Waveform 图标">
 
 [English](README.md)
 
-AudioLib Explorer 是一款面向 Windows 的本地优先音效库管理软件，使用 Rust 编写，桌面界面基于 [Slint](https://slint.dev)。它把大型 WAV 音效库索引到 SQLite（FTS5）中，提供即时搜索，通过 WASAPI（可选 ASIO）试听，也可以浏览由自带的 `audiolib-server` 提供的远程音效库。
+AudioLib Explorer 是一款本地优先音效库管理软件，使用 Rust 编写，桌面界面基于 [Slint](https://slint.dev)。它把大型 WAV 音效库索引到 SQLite（FTS5）中，提供即时搜索，在 Windows 上通过 WASAPI（可选 ASIO）试听，也可以浏览由 `audiolib-server` 提供的远程音效库。macOS arm64 客户端使用 CoreAudio；0.8.4 增加 Linux x64 服务端和 Docker amd64/arm64 离线镜像。
 
-- **程序版本：** 0.7.7（工作区 `Cargo.toml`）
+- **源码开发版本：** 0.8.7（工作区 `Cargo.toml`）
 - **HTTP API：** `/api/v1/`（客户端与服务端）
-- **数据库 schema：** 6（快照读取范围 3..=6，仍须验证实际格式）
-- **可写库格式：** `ale-s6-cld1-t3-m2-p1`；此前 p0 库仅作为只读来源，经 owned 候选迁移后写入
+- **数据库 schema：** 8（快照 schema 范围 3..=8；仅支持明确识别的完整格式）
+- **可写库格式：** `ale-s8-cld1-t3-m2-p1-a1`；受支持的 schema 3–7 仅作为只读迁移来源。schema 8 使用共享专辑实体，Metadata 保留为原始 JSON TEXT。Metadata 压缩暂缓，快照传输仍使用 zstd。
 - **许可证：** [GPL-3.0-only](LICENSE)
+
+程序版本取自工作区 `Cargo.toml`，由客户端、CLI 和服务端共用。当前格式以[兼容目录](crates/audiolib-core/src/compatibility.rs)为准；[历史 schema v6 契约](doc/api/Schema_V6_Iteration.md)描述此前的格式。
+
+## 下载与安装
+
+从 0.8.5 起，每次 Release 发布七个归档及各自的 `.sha256`，共十四个资产（新增 Windows x64 服务端）；0.8.4 保留六个归档、十二个资产；0.8.3 保留三个包、六个资产，0.8.2 及更早版本保留两个包、四个资产。
+
+| 程序包 | Release 文件名 | 更新方式 |
+| --- | --- | --- |
+| Windows x64 客户端 | `AudioLibExplorer-<tag>-win-x64-portable.zip` | Maomao 启动脚本关闭官方自动更新；使用本分支构建更新 |
+| macOS arm64 客户端 | `AudioLibExplorer-<tag>-macos-arm64.zip` | 初期手动安装与更新 |
+| macOS arm64 服务端 | `AudioLibServer-<tag>-macos-arm64.tar.gz` | 管理页面自动更新 |
+| Windows x64 服务端（0.8.5 起） | `AudioLibServer-<tag>-win-x64.zip` | 服务端管理页面更新，程序目录需可写；须显式指定配置，见下方启动说明 |
+| Linux x64 服务端 | `AudioLibServer-<tag>-linux-x64.tar.gz` | 管理页面自动更新 |
+| Docker amd64 | `AudioLibServer-<tag>-docker-linux-amd64.tar.gz` | 导入镜像并重建容器 |
+| Docker arm64 | `AudioLibServer-<tag>-docker-linux-arm64.tar.gz` | 导入镜像并重建容器 |
+
+Windows 客户端解压后通过 `Start-AudioLibExplorer.cmd` 启动。Mac 客户端面向 Apple Silicon，校验 ZIP 的 SHA256 后解压得到 `AudioLib Explorer.app`，手动安装；替换旧 app 前先正常退出，并保留原数据目录和资料库。详见 [Mac 客户端指南](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/MACOS_README.md)。
+
+首次 Mac 分发计划使用 ad-hoc 签名，未经 Apple 公证。原生签名、隔离启动和包边界检查须在 Mac 上通过后才可发布，Windows 验证结果不能替代这些检查。Windows 服务端包自 0.8.5 起提供，见 [Windows 服务端发布](doc/Rust_Windows_Server_Release.md)。独立 Linux arm64 服务端包不发布。Docker 离线包校验后使用 `docker load` 导入；详见 [Linux 与 Docker 交付](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Linux_Docker_Release.md)。
 
 ## 功能
 
-- 最多 6 个独立搜索任务页签（外观设置可调整上限），分别保留目录、筛选和列表状态；个人搜索任务收藏按库分类保存，重启恢复打开任务。详见[搜索任务](doc/Rust_Search_Tasks.md)。
+- 最多 30 个独立搜索任务页签（外观设置可调整上限，保留已有个人限制），分别保留目录、筛选和列表状态；溢出时可用箭头翻页，新增按钮始终可见。个人搜索任务收藏按库分类保存，重启恢复打开任务。详见[搜索任务](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Search_Tasks.md)。
 - 增量/完整文件夹扫描，提取专业 WAV Metadata（BWF `bext`、iXML、INFO、ID3、XMP，只读兼容 Soundminer SMED）。不会修改源 WAV 文件。
 - 基于 SQLite FTS5 的搜索，支持中文分词（jieba-rs）、标签/分类筛选；文档化目标为 100 万以上记录 P95 < 500 ms。
 - 流式解码播放、设备采样率重采样、波形与频谱视图、独立的音高/速率试听（SoundTouch），支持 WASAPI 与可选 ASIO 输出。
@@ -27,23 +47,25 @@ AudioLib Explorer 是一款面向 Windows 的本地优先音效库管理软件�
 - 服务器模式：`server/audiolib-server` 通过 `/api/v1/` 提供一个资料库（快照、Range 流式音频、预览、Waveform、令牌认证、仅局域网管理页）。客户端只读打开经过校验的快照；Metadata 和管理写入使用绑定库身份的 HTTP 请求。已测旧服务端 0.4.11 和 0.5.0 仍可读取。
 - 中英文双语界面。
 
-部署 schema v6 前先升级客户端，再在维护窗口迁移服务端。实际库修改必须携带有效现代兼容目录，明确支持服务端当前完整格式。旧播放路由继续返回空操作结果，但 HTTP 200 不保证旧客户端能反序列化响应。播放历史仅保存在各客户端本机。详见 [v6 契约](doc/api/Schema_V6_Iteration.md)。
+将服务端库迁移为当前格式前，先升级到支持该格式的客户端版本，再在维护窗口迁移服务端库。实际库修改必须携带有效现代兼容目录，明确支持服务端当前完整格式。旧播放路由继续返回空操作结果，但 HTTP 200 不保证旧客户端能反序列化响应。播放历史仅保存在各客户端本机。播放历史调整的背景见[历史 v6 契约](doc/api/Schema_V6_Iteration.md)。
 
 ## 构建
 
-要求：Windows、MSVC 构建工具以及固定版本的 Rust 工具链（见 `rust-toolchain.toml`）。ASIO 构建还需要 LLVM（libclang），并使用固定且校验哈希的 Steinberg ASIO SDK（由 `tools/prepare-asio.ps1` 下载）。
+Windows 客户端要求 MSVC 构建工具以及固定版本的 Rust 工具链（见 `rust-toolchain.toml`）。ASIO 构建还需要 LLVM（libclang），并使用固定且校验哈希的 Steinberg ASIO SDK（由 `tools/prepare-asio.ps1` 下载）。
 
 ```powershell
-cargo build --release -p audiolib-desktop -p audiolib-cli
-
-# 可选：ASIO 支持
-. ./tools/prepare-asio.ps1
-cargo build --release -p audiolib-desktop -p audiolib-cli --features audiolib-desktop/asio,audiolib-cli/asio
-
-# 便携包（dist/latest/portable）
+# 使用已校验的 ASIO SDK 构建一次，再打包（dist/latest/portable）。
 ./tools/build-release.ps1
 ./tools/package-portable.ps1 -SkipBuild
 ```
+
+发布脚本只构建 desktop/CLI binaries。交付无 ASIO 版本时，上述两条命令及 portable 验收均传入 `-WithoutAsio`。带标签的 Windows 包也可改用兼容手动入口 `tools/ci-release.ps1 -Tag <tag>`，替代上述两条命令；其报告中运行时为 `not-run`。随后完整 portable 验收一次，再按[固定本地安装流程](AGENTS.md#mandatory-local-application-delivery-and-release-installation)交付。服务端使用 `tools/build-server-release.ps1` 及对应平台打包器。
+
+带标签的本地交付可用 `pwsh tools/release-pipeline.ps1 -Action Run -Tag <tag>`，一次串联预检、构建、打包、portable 验收和固定安装。默认只预览计划；执行时输出短 JSON，完整日志落盘，续跑复用仍有效的阶段。源码检查仍按改动选择。服务端、Mac 和只读发布资产检查计划见[管线指南](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Release_Pipeline.md)。
+
+完成实际编译/测试后，可给本地检查或发布管线加 `-CleanBuildArtifacts`，超过默认 40 GiB 预算才清理 debug 缓存，预算由 `-BuildCacheLimitGiB` 调整。独立预览用 `pwsh tools/clean-build-artifacts.ps1`；release 产物、包、固定安装、SDK 和用户数据保留。详见[编译缓存维护](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Build_Cache.md)。
+
+Mac 客户端在 Apple Silicon Mac 上构建，需要 Xcode 命令行工具、固定的原生 Rust 工具链和 PowerShell 7.3 以上版本。在已验收的 main/tag 提交上运行 `tools/build-macos-client.ps1 -ExpectedCommit <完整提交> -ReportPath <私有构建证明.json>`，再使用该证明运行 `tools/package-macos-client.ps1 -Tag v0.8.7 -ExpectedCommit <完整提交> -BuildReport <私有构建证明.json>`。在已登录桌面的 Mac 上给打包命令加 `-ValidateRuntime`，一次完成结构与原生运行验收；仅延后运行验收、产物变化或换机复核时单独运行 `validate-macos-client.ps1`。仅结构检查的运行时结果为 `not-run`。完整参数见 [Mac 客户端指南](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/MACOS_README.md)。
 
 服务端可在 Windows、Linux、macOS 上构建（不需要音频播放支持）。由于仓库的 `.cargo/config.toml` 默认目标是 Windows，需显式指定目标：
 
@@ -59,7 +81,7 @@ cargo clippy -p audiolib-db --all-targets --locked -- -D warnings
 cargo test -p audiolib-db --test search_fragments --locked
 ```
 
-纯文档只需检查差异、链接和 `git diff --check`；UI 文案和布局改动检查编译及受影响界面。影响广泛时在本地运行 `./tools/check-local.ps1`，打发布标签前加 `-Asio` 完成本地发布矩阵；专项回归和性能测量按实际行为变化触发。GitHub 常规 CI 只检查格式。详见[验证范围](AGENTS.md#development-checks-by-change-scope)和[测试示例](doc/Testing_Strategy.md)。
+纯文档只需检查差异、链接和 `git diff --check`；UI 文案和布局改动检查编译及受影响界面。用 `./tools/check-local.ps1 -Package audiolib-desktop,audiolib-cli -Asio` 检查受影响客户端包，或使用更窄的既有测试命令；仅影响广泛或不明确时省略 `-Package`。`-Asio` 选择 Windows 发布特性，同一套检查只跑一遍；无 ASIO 条件分支仅在受改动影响时定向补测。相关源码、feature、工具链和环境未变时复用通过结果；专项回归和性能测量按实际行为变化触发。详见[验证范围](AGENTS.md#development-checks-by-change-scope)和[阶段职责](doc/Testing_Strategy.md#本地验证与云端最小检查)。
 
 ## 使用
 
@@ -76,6 +98,31 @@ cargo run -p audiolib-cli -- stats
 
 ### 服务端
 
+服务端必须通过 `--config <路径>` 或 `AUDIOLIB_SERVER_CONFIG` 指定配置；不会自动发现默认配置或创建资料库。
+
+Windows：校验 `AudioLibServer-<tag>-win-x64.zip` 的 SHA256 后解压到可写的程序目录。已选定的推荐配置/数据目录为 `%ProgramData%\AudioLibServer`，与程序目录分离，须显式创建。在解压目录中首次复制配置示例：
+
+```powershell
+$serverData = Join-Path $env:ProgramData 'AudioLibServer'
+New-Item -ItemType Directory -Path $serverData -Force | Out-Null
+$serverConfig = Join-Path $serverData 'config.toml'
+if (!(Test-Path -LiteralPath $serverConfig)) {
+    Copy-Item -LiteralPath .\server\audiolib-server\config.example.toml -Destination $serverConfig
+}
+```
+
+启动前编辑该配置：把 Unix 示例中的 `library_db` 和每个 `[[roots]].server_path` 换为已有的 Windows 资料库和真实音频目录。Windows 路径可使用 TOML 单引号字符串，例如 `library_db = 'C:\ProgramData\AudioLibServer\library.db'` 和 `server_path = 'D:\Sounds'`；升级时保留已有的配置路径与资料库。需要 FLAC 试听时，单独安装 ffmpeg，并设置绝对路径，例如 `ffmpeg_path = 'C:\Tools\ffmpeg\bin\ffmpeg.exe'`。默认值仍为 macOS Homebrew 的 `/opt/homebrew/bin/ffmpeg`；缺少 ffmpeg 时仅 FLAC 试听返回 503 `TRANSCODER_UNAVAILABLE`，PCM 试听和直接流不受影响。
+
+保存配置后显式启动：
+
+```powershell
+.\audiolib-server.exe --config $serverConfig
+```
+
+Windows 服务端通过自身管理页面更新，程序目录须可写；桌面客户端更新器不更新服务端。ZIP 不包含 Windows 服务注册，详见 [Windows 服务端发布](doc/Rust_Windows_Server_Release.md)。
+
+Linux 示例：
+
 ```sh
 cp server/audiolib-server/config.example.toml /etc/audiolib/config.toml   # 编辑根目录和数据库路径
 audiolib-server --config /etc/audiolib/config.toml
@@ -85,15 +132,15 @@ audiolib-server --config /etc/audiolib/config.toml
 
 ## 版本规范
 
-程序 SemVer（工作区 `Cargo.toml`，客户端、CLI、服务端共用）、HTTP API 版本（`/api/v1/`）、数据库 schema（`SCHEMA_VERSION`，当前为 6）互相独立。允许的操作还须由兼容目录及完整 feature/format 描述判定；同为 schema 6 的 p0 只读，p1 才是当前可写目标。详见[迁移兼容契约](doc/api/Library_Migration_Compatibility.md)。schema 变化时程序版本至少升 MINOR。发布标签为 `vX.Y.Z` 或 `vX.Y.Z-rc.N`，必须与 `Cargo.toml` 一致，由 `tools/check-release.ps1` 检查。详见 [doc/Rust_Versioning.md](doc/Rust_Versioning.md)。
+程序 SemVer（工作区 `Cargo.toml`，客户端、CLI、服务端共用）、HTTP API 版本（`/api/v1/`）、数据库 schema（`SCHEMA_VERSION`，当前为 8）互相独立。允许的操作还须由兼容目录及完整 feature/format 描述判定，不能仅凭 schema 数字认定兼容。仅精确匹配当前目标的格式可写；受支持的 schema 3–7 格式须经校验并迁移为当前目标后才能写入。迁移保护约束见[历史迁移兼容设计](doc/api/Library_Migration_Compatibility.md)，当前格式见[兼容目录](crates/audiolib-core/src/compatibility.rs)。schema 变化时程序版本至少升 MINOR。发布标签为 `vX.Y.Z`、`vX.Y.Z-beta.N` 或 `vX.Y.Z-rc.N`，必须与 `Cargo.toml` 版本一致（忽略标签后缀），由 `tools/check-release.ps1` 检查。详见 [doc/Rust_Versioning.md](doc/Rust_Versioning.md)。
 
 ## 发布与 CI
 
-客户端与服务端在每次正常启动后于后台检查 GitHub Release。发现新版后，在客户端提示或服务端管理页面确认，即可下载、校验，并在现有工作排空后部署。正式版和 beta 保留各自的更新渠道，资料库和偏好设置不属于更新包。渠道、打包元数据及部署方式详见[自动更新](doc/Rust_Auto_Update.md)。
+官方 Windows 客户端与受支持的服务端会在启动后检查 GitHub Release。Maomao Windows 客户端通过 `Start-AudioLibExplorer.cmd` 启动时关闭官方更新检查，以保留本分支修改；直接运行 EXE 会绕过此设置。受支持的服务端仍可通过管理页面确认更新，Mac 客户端采用手动更新。资料库和偏好设置不属于更新包。官方渠道与部署方式详见[自动更新](doc/Rust_Auto_Update.md)。
 
-当前开发分支为 `0.6.0-dev.1`，已合入发布的 0.5.0 主线。此分支的 schema-v6 改动尚未发布或部署，现有安装和工作库保持不变。
+源码开发版本以工作区 `Cargo.toml` 为准。发布状态和实际安装版本需分别核对。
 
-GitHub Actions 在相关 `main` / `codex/**` 推送及 Pull Request 时只运行一个 Linux 格式检查作业，纯文档和截图变更跳过。Rust 测试、Clippy、ASIO 矩阵、UI/服务端启动、回归和性能测量按范围在本地执行。发布包在本机构建、验证并上传；`.github/workflows/release.yml` 只保留手动触发，推送标签不会启动它。云端只核验实际包的允许文件、隐私、二进制/归档身份和校验和，运行时验证明确报告为 `not-run`。发布归档附 SHA-256 和公开构建报告。
+GitHub Actions 在相关 `main`、`beta`、`codex/**` 推送及所有 Pull Request 时只运行一个 Linux 格式检查作业。纯文档和截图推送跳过；每个 PR 均返回 required `Linux (fmt)` 检查。Rust 测试、Clippy、UI/服务端启动、回归和性能测量按范围在本地执行。每份正式 payload 从最终 main/tag 身份构建、打包一次并本地验收，再上传发布。`.github/workflows/release.yml` 仅可选手动触发，只读核验 Release 身份、[版本对应的精确资产集合](doc/Rust_Versioning.md#规则)和 SHA256，不重复运行验收；推送标签不会启动它。实际包的白名单、隐私及二进制身份由本地打包/验收负责。构建与运行验收报告保持私有，不作为额外 Release 资产上传。
 
 ## 文档
 

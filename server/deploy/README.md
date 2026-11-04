@@ -39,7 +39,7 @@ documentation placeholders: `192.0.2.10` (RFC 5737), `audiolib.example.com`,
 
 ## Install
 
-Official [GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) ship only the Windows client and the macOS arm64 server, each with a `.sha256` file. Verify the checksum before extracting. The server executable is at the archive root; public configuration examples and this deployment guide are under `server/`. Other platforms (including Linux) must build from source (`cargo build --release -p audiolib-server --target <triple>`); such builds do not auto-update because no packages are published for them. Keep your existing configuration, token files and library when upgrading; the archive does not contain runtime data.
+Official [GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) provide Windows and Mac clients, macOS arm64 and Linux x64 native servers, plus Docker amd64/arm64 offline images from 0.8.4. Each archive has a `.sha256`; verify it before extraction or `docker load`. Native archives contain the executable at their root and public examples under `server/`. From 0.8.5 (first included version) a prebuilt Windows x64 server ZIP is provided; earlier versions and source builds remain available. Standalone Linux arm64 server packages are not published. Keep existing libraries, roots, configuration and credentials. See [Linux/Docker delivery](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Linux_Docker_Release.md) for versioned images, Compose, architecture and acceptance details.
 
 Build the binary first: see [Quick start](../README.md#quick-start-build-from-source)
 (Linux: `RUSTUP_TOOLCHAIN=1.97.1` and an explicit `--target`). After installing, continue
@@ -67,8 +67,10 @@ The library (`library_db`) must already exist and be writable by the `audiolib` 
 
 Install the binary to `/opt/audiolib/`, data to `/usr/local/var/audiolib/`, then copy
 `launchd/io.github.audiolib.server.plist.example` to `~/Library/LaunchAgents/`, adjust the
-paths and `launchctl bootstrap "gui/$(id -u)" <plist>`. Restart with
-`launchctl kickstart -k "gui/$(id -u)/io.github.audiolib.server"`. If macOS repeatedly asks
+paths and `launchctl bootstrap "gui/$(id -u)" <plist>`. To restart after a binary swap,
+`launchctl bootout "gui/$(id -u)/io.github.audiolib.server"`, wait until the process has
+exited and the port is free, then `launchctl bootstrap "gui/$(id -u)" <plist>` again
+(`redeploy-server.sh` does exactly this, with a timeout). If macOS repeatedly asks
 for removable/network volume access after each binary swap, use the optional
 [launcher](../launcher/README.md).
 
@@ -79,7 +81,7 @@ launchd's `XPC_SERVICE_NAME`; otherwise it `exec`s in place.
 
 ### Docker
 
-Build from the repository root (the build context needs the whole workspace):
+For published images, use the offline archive and `docker-compose.release.yml` described in [Linux/Docker delivery](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Linux_Docker_Release.md). Official runtime images consume only accepted Linux packages, carry their license closure, and disable in-container updates. The following local source-build example uses the public source context selected by `.dockerignore`; Git metadata is excluded, so its health commit is `unknown`:
 
 ```sh
 docker build -f server/deploy/docker/Dockerfile -t audiolib-server .
@@ -103,7 +105,7 @@ Notes / 说明:
 - 只有 `/data` 是卷（library.db、快照、缓存、tokens.json）。`/config` 不是卷：镜像自带 `/config/config.toml`，可选地用只读 bind mount 覆盖（`-v ./my-config.toml:/config/config.toml:ro`）。
 - 镜像内置配置使用 `auth_mode = "all"`。直接 `docker run` 时必须传 `-e AUDIOLIB_SERVER_TOKEN=...`，否则服务能启动，但所有请求都会返回 401；compose 文件用 `${AUDIOLIB_SERVER_TOKEN:?}` 强制要求填写。
 
-(The Dockerfile still installs `libasound2-dev`/`libasound2`; the server no longer needs them since it builds `audiolib-audio` without `playback`.)
+The headless source and runtime images do not install ALSA libraries; the server builds `audiolib-audio` without `playback`. Historical stock-Dockerfile measurements above retain their original commit scope and do not establish current release acceptance.
 
 Build dependencies in the builder stage: `build-essential`, `pkg-config`, `clang` +
 `libclang-dev`. Put an existing `library.db` in the `audiolib-data` volume
@@ -234,8 +236,9 @@ over a running binary.
 Either use the script:
 
 ```sh
+: "${EXPECTED_SERVER_COMMIT:?Set the new release's expected short commit first}"
 INSTALL_DIR=/opt/audiolib DATA_DIR=/var/lib/audiolib SERVICE_NAME=audiolib-server \
-  EXPECT_SCHEMA_VERSION=5 \
+  EXPECT_SCHEMA_VERSION=8 EXPECT_COMMIT="$EXPECTED_SERVER_COMMIT" \
   ./server/deploy/redeploy-server.sh target/<target>/release/audiolib-server
 # macOS: SERVICE_NAME=io.github.audiolib.server INSTALL_DIR=/opt/audiolib DATA_DIR=/usr/local/var/audiolib
 ```
@@ -244,17 +247,38 @@ It checks that no scan is running, backs up the library and the old binary to
 `$DATA_DIR/backups/<timestamp>/` (plus `<binary>.prev` next to the binary), installs the new
 binary under a temporary name and renames it into place, restarts the service
 (systemd or launchd), waits for `/health` to report `ok`, verifies `version`, `api_version`,
-`schema_version` and `commit` (not `unknown`; optionally against `EXPECT_*`), and **rolls back
-automatically** if any of that fails. Parameters: `INSTALL_DIR`, `BINARY`, `SERVICE_NAME`,
+`schema_version` and `commit` (not `unknown`; optionally against `EXPECT_*`), and normally
+rolls back automatically if verification fails. If the latest health response still
+reports `starting` with a recognized database `upgrade.phase`, an explicit matching
+`EXPECT_COMMIT`, the new binary's version and matching API/schema conditions, timeout
+instead exits nonzero and retains the new binary, markers and backups without another
+restart. This is failed acceptance, not successful deployment. Check health/logs and use
+the matching CLI's migration inspect/resume/rollback workflow; never interrupt that job
+by swapping an older binary. The exception requires structured JSON extraction by system
+`plutil` or optional existing `python3`; without either reader, or without explicit commit
+identity, ordinary rollback behavior remains. No parser is bundled or installed. Missing
+responses, ordinary startup without upgrade progress, wrong identity and `error` do not
+qualify. Rust in-app auto-update has no post-restart health watchdog; this timeout belongs
+to the external deployment script. Parameters: `INSTALL_DIR`, `BINARY`, `SERVICE_NAME`,
 `DATA_DIR`, `LIBRARY_DB`, `BACKUP_DIR`, `HOST`, `PORT`, `TOKEN`, `SERVICE_MANAGER`, `WAIT_SECS`,
-`EXPECT_API_VERSION`, `EXPECT_SCHEMA_VERSION`, `EXPECT_COMMIT` (documented at the top of the script).
+`LAUNCHD_PLIST`, `LAUNCHD_DOMAIN`, `STOP_TIMEOUT`, `EXPECT_API_VERSION`, `EXPECT_SCHEMA_VERSION`, `EXPECT_COMMIT` (documented at the top of the script).
+
+Sequence: back up the library and binary; stop the service (launchd `bootout`, systemd
+`stop`); poll until the old process has exited and `PORT` is released (fails after
+`STOP_TIMEOUT` seconds without swapping); `install` + `mv` the new binary; start it again
+(launchd `bootstrap` of the existing `LAUNCHD_PLIST`, which must exist and is checked before
+anything changes; systemd `start`); verify `/api/v1/health`. A failed verification rolls back
+along the same path (stop, wait, swap the previous binary back, start). `EXPECT_COMMIT` may be
+a short or full hash: `/health` reports a 7-character short hash, compared by prefix.
 
 Or by hand:
 
 ```sh
 install -m 755 new/audiolib-server /opt/audiolib/audiolib-server.new
+systemctl stop audiolib-server           # macOS: launchctl bootout "gui/$(id -u)/io.github.audiolib.server"
+# wait until the old process has exited and the port is free
 mv -f /opt/audiolib/audiolib-server.new /opt/audiolib/audiolib-server
-systemctl restart audiolib-server        # macOS: launchctl kickstart -k "gui/$(id -u)/io.github.audiolib.server"
+systemctl start audiolib-server          # macOS: launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/io.github.audiolib.server.plist
 ```
 
 Do not `cp` onto the installed binary: writing into a file a running process maps can corrupt

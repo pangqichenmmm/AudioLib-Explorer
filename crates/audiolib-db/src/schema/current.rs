@@ -1,5 +1,5 @@
 // crates/audiolib-db/src/schema/current.rs
-//! Schema 6 entry points, separate from the retained v1..v5 normalization code.
+//! Current shared-album storage entry points, separate from legacy normalization.
 use super::*;
 use crate::{migration, search_storage};
 use audiolib_core::compatibility::LibraryFormat;
@@ -16,12 +16,36 @@ pub(crate) fn readable_format_ready(conn: &Connection) -> Result<bool> {
 }
 
 fn format_ready(conn: &Connection, allow_p0: bool) -> Result<bool> {
+    if !format_ready_at_version(conn, allow_p0, SCHEMA_VERSION)? {
+        return Ok(false);
+    }
+    if !crate::albums::ready(conn)? {
+        return Ok(false);
+    }
+    // A recognized experimental snapshot remains readable without rewriting it.
+    // Current writers require the plain target and its retired policy set to zero.
+    if allow_p0 && feature_version(conn, "metadata_storage")? == Some(1) {
+        return Ok(true);
+    }
+    conn.query_row(
+        "SELECT compression=0 FROM audiolib_album_id_sequence WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
+}
+
+fn format_ready_at_version(
+    conn: &Connection,
+    allow_p0: bool,
+    expected_version: i64,
+) -> Result<bool> {
     ensure_ready(conn)?;
     validate_supported_feature_revisions(conn)?;
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version != SCHEMA_VERSION || !feature_table_exists(conn)? {
+    if version != expected_version || !feature_table_exists(conn)? {
         return Ok(false);
     }
     let features = conn
@@ -34,6 +58,12 @@ fn format_ready(conn: &Connection, allow_p0: bool) -> Result<bool> {
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()
         .map_err(db_error)?;
     let mut expected = LibraryFormat::target().features;
+    if allow_p0
+        && features.get("metadata_storage") == Some(&1)
+        && features.get("play_history_retired") == Some(&2)
+    {
+        expected.insert("metadata_storage".into(), 1);
+    }
     let p0 = allow_p0 && features.get("play_history_retired") == Some(&1);
     if p0 {
         expected.insert("play_history_retired".into(), 1);
@@ -100,6 +130,12 @@ pub(crate) fn mark_current(conn: &Connection) -> Result<()> {
     }
     // Repair only explicitly owned derived objects, preserving ID watermark data.
     definition::repair_owned(conn)?;
+    conn.execute(
+        "DELETE FROM audiolib_schema_features WHERE feature='metadata_storage'",
+        [],
+    )
+    .map_err(db_error)?;
+    crate::albums::configure_compression(conn, false)?;
     for (name, version) in LibraryFormat::target().features {
         conn.execute(
             "INSERT INTO audiolib_schema_features(feature,version) VALUES(?1,?2)
@@ -129,6 +165,7 @@ pub(crate) fn create_current(conn: &mut Connection) -> Result<()> {
     // created, even transiently; old-source normalization is isolated in legacy.rs.
     let seed = template.transaction().map_err(db_error)?;
     seed.execute_batch(BASE_SCHEMA).map_err(db_error)?;
+    crate::albums::initialize(&seed)?;
     for (name, definition) in AUDIO_COLUMNS {
         if !search_storage::is_derived_column(name) {
             ensure_column(&seed, "audio_files", name, definition)?;
@@ -140,7 +177,10 @@ pub(crate) fn create_current(conn: &mut Connection) -> Result<()> {
     seed.execute_batch(BASE_INDEXES).map_err(db_error)?;
     add_management_schema(&seed)?;
     apply_indexes(&seed)?;
+    seed.execute_batch(ALBUM_INDEX).map_err(db_error)?;
+    crate::albums::configure_compression(&seed, false)?;
     add_current_features(&seed)?;
+    set_feature_version(&seed, "album_entities", 1)?;
     seed.execute_batch(MARK_SOURCE_SEARCH).map_err(db_error)?;
     seed.commit().map_err(db_error)?;
     let blueprint = search_storage::blueprint_with(&template, &migration::schema_changes())?;
@@ -188,6 +228,7 @@ pub(crate) fn create_current(conn: &mut Connection) -> Result<()> {
     }
     search_storage::create_index(&tx)?;
     search_storage::install_triggers(&tx)?;
+    crate::albums::install_triggers(&tx)?;
     if !source_tags_ready(&tx)? {
         tx.execute(
             "UPDATE audio_files SET source_tags_text=audiolib_source_tags_key(metadata_json)",

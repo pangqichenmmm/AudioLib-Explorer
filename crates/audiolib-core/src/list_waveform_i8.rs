@@ -66,7 +66,12 @@ impl ListWaveformI8 {
         for value in &mut values {
             *value = (*value).max(-127);
         }
-        if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] > pair[1]) {
+        if let Some(index) = values
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .position(|pair| pair[0] > pair[1])
+        {
             return Err(Error::Validation(format!(
                 "i8 list Waveform column {index} has min > max"
             )));

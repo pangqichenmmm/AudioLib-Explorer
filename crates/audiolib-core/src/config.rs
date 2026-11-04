@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[path = "local_libraries.rs"]
+mod local_libraries;
+pub use local_libraries::{DEFAULT_LOCAL_LIBRARY_ID, LocalLibrary};
+
 pub use crate::profiles::{
     ACTIVE_LOCAL, ActiveSource, DEFAULT_PROFILE_ID, ProfileKind, ProfileMigration, ServerProfile,
     TestSummary, default_transcode,
@@ -103,6 +107,12 @@ pub struct DataSourceSettings {
     /// Saved server connections (LAN and external addresses are separate profiles).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<ServerProfile>,
+    /// Registered local databases. Removing an entry never removes its database or WAVs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_libraries: Vec<LocalLibrary>,
+    /// Last selected local database, retained while a server source is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_local_library: Option<String>,
 }
 
 impl Default for DataSourceSettings {
@@ -117,6 +127,8 @@ impl Default for DataSourceSettings {
             audition_original: false,
             active: None,
             profiles: Vec::new(),
+            local_libraries: Vec::new(),
+            active_local_library: None,
         }
     }
 }
@@ -156,6 +168,7 @@ impl DataSourceSettings {
             return Err(Error::Validation("WebDAV username is invalid".into()));
         }
         self.validate_profiles()?;
+        self.validate_local_libraries()?;
         Ok(())
     }
 
@@ -433,6 +446,9 @@ pub struct AppConfig {
     /// History lives under the user data root, independently of libraries and caches.
     #[serde(default = "default_play_history_limit")]
     pub play_history_limit: u32,
+    /// Show embedded album artwork in local and server mode. Images stay outside libraries.
+    #[serde(default = "default_true")]
+    pub show_album_artwork: bool,
     /// Local mode: pre-generate list thumbnail Waveforms in the background after scans
     /// (doc/api/README.md §9.3). New installs default on; an existing settings.json that
     /// omits the key stays off (`#[serde(default)]` on the saved field is false).
@@ -442,7 +458,7 @@ pub struct AppConfig {
     /// audition start (deferred, not dropped). Off by default.
     #[serde(default)]
     pub hold_list_waveform_batches_after_audition: bool,
-    /// Maximum open search tasks, set in Appearance and bounded to 1..=6.
+    /// Maximum open search tasks, set in Appearance and bounded to 1..=30.
     #[serde(default = "default_max_search_tasks")]
     pub max_search_tasks: u32,
     /// Interface scale in percent: 100-200 in steps of 25, or 0 to follow the system.
@@ -499,6 +515,8 @@ struct SavedPreferences {
     audition_play_on_single_click: bool,
     #[serde(default = "default_play_history_limit")]
     play_history_limit: u32,
+    #[serde(default = "default_true")]
+    show_album_artwork: bool,
     #[serde(default)]
     pregenerate_list_waveforms: bool,
     #[serde(default)]
@@ -527,7 +545,7 @@ struct SavedPreferences {
     #[serde(default)]
     data_source: DataSourceSettings,
 }
-/// Default open-task capacity; the hard limit remains six.
+/// Default open-task capacity, matching the hard workspace limit.
 pub const DEFAULT_MAX_SEARCH_TASKS: u32 = crate::search_workspace::MAX_SEARCH_TASKS as u32;
 
 /// Clamp a task capacity without deleting any already persisted tasks.
@@ -570,8 +588,56 @@ pub fn normalize_ui_scale_percent(percent: u32) -> u32 {
 
 /// Identifier of the built-in default theme (the original palette).
 pub const DEFAULT_THEME: &str = "default";
+/// Identifier of the opt-in Studio theme, with the redesigned audition controls.
+pub const STUDIO_THEME: &str = "studio";
+
+/// Audition presentation selected by a theme; playback state remains shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerStyle {
+    /// Original beta audition layout and controls.
+    Classic,
+    /// Redesigned audition controls, overview and motion.
+    Studio,
+}
+
+/// Built-in appearance definition shared by settings validation and the desktop.
+pub struct BuiltinTheme {
+    /// Stable settings identifier; existing identifiers must retain their appearance.
+    pub id: &'static str,
+    /// English name offered in Appearance settings.
+    pub name: &'static str,
+    /// Chinese name offered in Appearance settings.
+    pub name_cn: &'static str,
+    /// Audition controls and layout belonging to this theme.
+    pub player_style: PlayerStyle,
+}
+
+/// Single registry of shipped themes, with the original default first.
+pub const BUILTIN_THEMES: [BuiltinTheme; 2] = [
+    BuiltinTheme {
+        id: DEFAULT_THEME,
+        name: "Default",
+        name_cn: "默认",
+        player_style: PlayerStyle::Classic,
+    },
+    BuiltinTheme {
+        id: STUDIO_THEME,
+        name: "Studio",
+        name_cn: "工作室",
+        player_style: PlayerStyle::Studio,
+    },
+];
+
 /// Theme identifiers offered in the Appearance settings, in display order.
-pub const THEME_IDS: [&str; 1] = [DEFAULT_THEME];
+pub const THEME_IDS: [&str; BUILTIN_THEMES.len()] = {
+    let mut ids = [""; BUILTIN_THEMES.len()];
+    let mut index = 0;
+    while index < BUILTIN_THEMES.len() {
+        ids[index] = BUILTIN_THEMES[index].id;
+        index += 1;
+    }
+    ids
+};
 
 /// Keep a known theme identifier; anything else uses the default theme.
 pub fn normalize_theme(theme: &str) -> String {
@@ -648,16 +714,31 @@ impl AppConfig {
         Self::load_in(Self::default_root()?)
     }
 
-    /// The user data root: `AUDIOLIB_DATA_DIR`, else `%LOCALAPPDATA%/AudioLibExplorer/v1`.
+    /// Resolve the per-user root, preserving an explicit `AUDIOLIB_DATA_DIR`.
+    /// macOS uses `~/Library/Application Support/AudioLibExplorer/v1`, or the
+    /// sibling `beta` directory for a validated beta/rc package. A beta package
+    /// also respects `AUDIOLIB_BETA_DATA_DIR`. Windows retains
+    /// `%LOCALAPPDATA%/AudioLibExplorer/v1`. Unpublished macOS development
+    /// data under `.audiolib-user` is never moved or deleted; select it explicitly
+    /// with `AUDIOLIB_DATA_DIR` to continue using that directory.
     pub fn default_root() -> Result<PathBuf> {
-        Ok(
-            if let Some(override_path) = std::env::var_os("AUDIOLIB_DATA_DIR") {
-                PathBuf::from(override_path)
-            } else if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-                PathBuf::from(local).join("AudioLibExplorer").join("v1")
-            } else {
-                std::env::current_dir()?.join(".audiolib-user")
-            },
+        let override_root = std::env::var_os("AUDIOLIB_DATA_DIR").map(PathBuf::from);
+        #[cfg(target_os = "macos")]
+        if override_root.is_none() {
+            let executable = std::env::current_exe()?;
+            return macos_root_for_executable(
+                std::env::var_os("HOME").map(PathBuf::from),
+                std::env::var_os("AUDIOLIB_BETA_DATA_DIR").map(PathBuf::from),
+                &executable,
+                env!("CARGO_PKG_VERSION"),
+            );
+        }
+        default_root_with_paths(
+            override_root,
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+            cfg!(target_os = "macos"),
+            || Ok(std::env::current_dir()?),
         )
     }
 
@@ -701,6 +782,7 @@ impl AppConfig {
             playback: default_playback(),
             audition_play_on_single_click: true,
             play_history_limit: PLAY_HISTORY_LIMIT_PER_LIBRARY,
+            show_album_artwork: true,
             pregenerate_list_waveforms: true,
             hold_list_waveform_batches_after_audition: false,
             max_search_tasks: DEFAULT_MAX_SEARCH_TASKS,
@@ -759,6 +841,7 @@ impl AppConfig {
             config.playback = saved.playback;
             config.audition_play_on_single_click = saved.audition_play_on_single_click;
             config.play_history_limit = saved.play_history_limit;
+            config.show_album_artwork = saved.show_album_artwork;
             config.pregenerate_list_waveforms = saved.pregenerate_list_waveforms;
             config.hold_list_waveform_batches_after_audition =
                 saved.hold_list_waveform_batches_after_audition;
@@ -788,8 +871,12 @@ impl AppConfig {
                     root.join(path)
                 };
                 config.paths.legacy_database = None;
+            } else if let Some(library) = config.selected_local_library().cloned() {
+                config.paths.database = library.database;
+                config.pregenerate_list_waveforms = library.pregenerate_list_waveforms;
             }
         }
+        config.reconcile_local_libraries()?;
         if config.language != "cn" && config.language != "en" {
             config.language = english();
         }
@@ -811,6 +898,7 @@ impl AppConfig {
             playback: self.playback.clone(),
             audition_play_on_single_click: self.audition_play_on_single_click,
             play_history_limit: self.play_history_limit,
+            show_album_artwork: self.show_album_artwork,
             pregenerate_list_waveforms: self.pregenerate_list_waveforms,
             hold_list_waveform_batches_after_audition: self
                 .hold_list_waveform_batches_after_audition,
@@ -828,6 +916,10 @@ impl AppConfig {
                 // profiles follow those fields before they are written.
                 let mut data_source = self.persisted_data_source();
                 data_source.migrate_profiles();
+                data_source.reconcile_local_libraries(
+                    &self.paths.database,
+                    self.pregenerate_list_waveforms,
+                )?;
                 data_source
             },
         };
@@ -882,9 +974,167 @@ impl AppConfig {
                 path.display()
             )));
         }
-        self.paths.database = path.canonicalize()?;
-        self.paths.legacy_database = None;
+        let database = path.canonicalize()?;
+        let mut updated = self.clone();
+        updated.reconcile_local_libraries()?;
+        if let Some(id) = updated
+            .data_source
+            .local_libraries
+            .iter()
+            .find(|entry| {
+                entry
+                    .database
+                    .canonicalize()
+                    .unwrap_or_else(|_| entry.database.clone())
+                    == database
+            })
+            .map(|entry| entry.id.clone())
+        {
+            updated.select_local_library(&id)?;
+        } else {
+            updated.paths.database = database;
+            updated.paths.legacy_database = None;
+            updated.reconcile_local_libraries()?;
+        }
+        *self = updated;
         Ok(())
+    }
+}
+
+fn default_root_with_paths(
+    override_root: Option<PathBuf>,
+    local_root: Option<PathBuf>,
+    home: Option<PathBuf>,
+    macos: bool,
+    current_dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(root) = override_root {
+        return Ok(root);
+    }
+    if macos {
+        return Ok(macos_user_root(home)?.join("v1"));
+    }
+    if let Some(root) = local_root {
+        return Ok(root.join("AudioLibExplorer").join("v1"));
+    }
+    Ok(current_dir()?.join(".audiolib-user"))
+}
+
+fn macos_user_root(home: Option<PathBuf>) -> Result<PathBuf> {
+    let home = home.filter(|path| path.is_absolute()).ok_or_else(|| {
+        Error::Validation("macOS requires an absolute HOME or AUDIOLIB_DATA_DIR".into())
+    })?;
+    Ok(home
+        .join("Library")
+        .join("Application Support")
+        .join("AudioLibExplorer"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_macos_package_marker(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_root_for_executable(
+    home: Option<PathBuf>,
+    beta_override: Option<PathBuf>,
+    executable: &Path,
+    binary_version: &str,
+) -> Result<PathBuf> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| Error::Validation("Cannot locate macOS package metadata".into()))?;
+    let contents = directory.parent().filter(|contents| {
+        directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("MacOS"))
+            && contents
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("Contents"))
+            && contents
+                .parent()
+                .and_then(Path::extension)
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    });
+    // Only executable code belongs in Contents/MacOS. Resources holds the
+    // signed bundle's paired data markers; adjacent stray files cannot select
+    // its channel. Standalone CLI/development binaries retain adjacent markers.
+    let marker_directory =
+        contents.map_or_else(|| directory.to_path_buf(), |p| p.join("Resources"));
+    let channel = read_macos_package_marker(&marker_directory.join("update-channel.txt"))?;
+    let version = read_macos_package_marker(&marker_directory.join("update-version.txt"))?;
+    if contents.is_some() && channel.is_none() && version.is_none() {
+        return Err(Error::Validation(
+            "macOS application bundle is missing channel/version metadata".into(),
+        ));
+    }
+    macos_root_with_metadata(
+        home,
+        beta_override,
+        channel.as_deref(),
+        version.as_deref(),
+        binary_version,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_root_with_metadata(
+    home: Option<PathBuf>,
+    beta_override: Option<PathBuf>,
+    channel: Option<&str>,
+    installed_version: Option<&str>,
+    binary_version: &str,
+) -> Result<PathBuf> {
+    let beta = macos_package_uses_beta(channel, installed_version, binary_version)?;
+    if beta && let Some(root) = beta_override {
+        return Ok(root);
+    }
+    Ok(macos_user_root(home)?.join(if beta { "beta" } else { "v1" }))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_package_uses_beta(
+    channel: Option<&str>,
+    installed_version: Option<&str>,
+    binary_version: &str,
+) -> Result<bool> {
+    let invalid =
+        || Error::Validation("Invalid or mismatched macOS package channel/version metadata".into());
+    let (channel, installed_version) = match (channel, installed_version) {
+        (None, None) => return Ok(false),
+        (Some(channel), Some(version)) => (channel.trim(), version.trim()),
+        _ => return Err(invalid()),
+    };
+    let installed = semver::Version::parse(installed_version).map_err(|_| invalid())?;
+    let binary = semver::Version::parse(binary_version).map_err(|_| invalid())?;
+    if (installed.major, installed.minor, installed.patch)
+        != (binary.major, binary.minor, binary.patch)
+        || !installed.build.is_empty()
+    {
+        return Err(invalid());
+    }
+    let prerelease = installed.pre.as_str();
+    let candidate_number = prerelease
+        .strip_prefix("beta.")
+        .or_else(|| prerelease.strip_prefix("rc."));
+    match channel {
+        "stable" if prerelease.is_empty() => Ok(false),
+        "beta"
+            if candidate_number.is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            Ok(true)
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -955,6 +1205,266 @@ mod tests {
             assert_eq!(loaded.spectral_peaks, expected);
             assert_eq!(loaded.language, "cn");
             assert_eq!(loaded.playback["volume"], serde_json::json!(0.35));
+        }
+    }
+
+    #[test]
+    fn explicit_data_root_wins_without_resolving_home_or_working_directory() {
+        let explicit = PathBuf::from("existing data ");
+        for macos in [false, true] {
+            assert_eq!(
+                default_root_with_paths(
+                    Some(explicit.clone()),
+                    Some(PathBuf::from("other")),
+                    None,
+                    macos,
+                    || panic!("explicit data root must not resolve cwd"),
+                )
+                .unwrap(),
+                explicit
+            );
+        }
+    }
+
+    #[test]
+    fn macos_data_root_is_per_user_and_independent_of_windows_or_working_directory() {
+        let home = std::env::temp_dir().join("owned-home");
+        let resolved = default_root_with_paths(
+            None,
+            Some(home.join("windows-local")),
+            Some(home.clone()),
+            true,
+            || panic!("macOS data must not depend on cwd"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            home.join("Library/Application Support/AudioLibExplorer/v1")
+        );
+        for invalid_home in [None, Some(PathBuf::from("relative-home"))] {
+            assert!(
+                default_root_with_paths(None, None, invalid_home, true, || {
+                    panic!("missing HOME must not select cwd")
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn other_platform_data_roots_retain_localappdata_and_cwd_fallback() {
+        let root = PathBuf::from("existing-local");
+        assert_eq!(
+            default_root_with_paths(None, Some(root.clone()), None, false, || {
+                panic!("LOCALAPPDATA must not resolve cwd")
+            })
+            .unwrap(),
+            root.join("AudioLibExplorer/v1")
+        );
+        assert_eq!(
+            default_root_with_paths(None, None, None, false, || Ok(root.clone())).unwrap(),
+            root.join(".audiolib-user")
+        );
+    }
+
+    #[test]
+    fn macos_package_metadata_selects_only_matching_stable_beta_or_rc_channels() {
+        for (channel, version, beta) in [
+            (None, None, false),
+            (Some("stable\n"), Some("0.8.3\n"), false),
+            (Some("beta\r\n"), Some("0.8.3-beta.1\r\n"), true),
+            (Some("beta"), Some("0.8.3-beta.0"), true),
+            (Some("beta"), Some("0.8.3-rc.12"), true),
+        ] {
+            assert_eq!(
+                macos_package_uses_beta(channel, version, "0.8.3").unwrap(),
+                beta
+            );
+        }
+    }
+
+    #[test]
+    fn macos_package_metadata_rejects_partial_malformed_and_mismatched_markers() {
+        for (channel, version) in [
+            (Some("beta"), None),
+            (None, Some("0.8.3-beta.1")),
+            (Some(""), Some("0.8.3")),
+            (Some("beta"), Some("")),
+            (Some("Beta"), Some("0.8.3-beta.1")),
+            (Some("stable"), Some("0.8.3-beta.1")),
+            (Some("stable"), Some("0.8.3-rc.1")),
+            (Some("beta"), Some("0.8.3")),
+            (Some("beta"), Some("0.8.3-0")),
+            (Some("beta"), Some("0.8.3-alpha.1")),
+            (Some("beta"), Some("0.8.3-beta.01")),
+            (Some("beta"), Some("0.8.3-rc.1.extra")),
+            (Some("beta"), Some("0.8.3-beta.1+other")),
+            (Some("stable"), Some("0.8.3+other")),
+            (Some("beta"), Some("v0.8.3-beta.1")),
+            (Some("beta"), Some("0.8.2-beta.1")),
+            (Some("stable"), Some("0.8.4")),
+            (Some("beta\nstable"), Some("0.8.3-beta.1")),
+            (Some("stable"), Some("not-a-version")),
+        ] {
+            assert!(
+                macos_package_uses_beta(channel, version, "0.8.3").is_err(),
+                "accepted {channel:?} / {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_beta_and_rc_data_roots_are_isolated_from_stable() {
+        let home = std::env::temp_dir().join("owned-home");
+        let application = home.join("Library/Application Support/AudioLibExplorer");
+        for version in ["0.8.3-beta.1", "0.8.3-rc.2"] {
+            assert_eq!(
+                macos_root_with_metadata(
+                    Some(home.clone()),
+                    None,
+                    Some("beta"),
+                    Some(version),
+                    "0.8.3",
+                )
+                .unwrap(),
+                application.join("beta")
+            );
+        }
+        let beta_override = PathBuf::from("existing-beta-data ");
+        assert_eq!(
+            macos_root_with_metadata(
+                None,
+                Some(beta_override.clone()),
+                Some("beta"),
+                Some("0.8.3-rc.2"),
+                "0.8.3",
+            )
+            .unwrap(),
+            beta_override
+        );
+        for (channel, version) in [(None, None), (Some("stable"), Some("0.8.3"))] {
+            assert_eq!(
+                macos_root_with_metadata(
+                    Some(home.clone()),
+                    Some(beta_override.clone()),
+                    channel,
+                    version,
+                    "0.8.3",
+                )
+                .unwrap(),
+                application.join("v1")
+            );
+        }
+    }
+
+    #[test]
+    fn macos_invalid_package_metadata_cannot_select_even_an_explicit_beta_root() {
+        assert!(
+            macos_root_with_metadata(
+                None,
+                Some(PathBuf::from("existing-beta-data")),
+                Some("beta"),
+                Some("0.8.2-beta.1"),
+                "0.8.3",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn macos_bundle_reads_resource_markers_and_ignores_adjacent_strays() {
+        let temporary = tempfile::tempdir().unwrap();
+        let contents = temporary.path().join("AudioLib Explorer.APP/Contents");
+        let executable = contents.join("MacOS/AudioLibCli");
+        let resources = contents.join("Resources");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("update-channel.txt"), "beta\n").unwrap();
+        std::fs::write(resources.join("update-version.txt"), "0.8.3-beta.1\n").unwrap();
+        std::fs::write(
+            executable.parent().unwrap().join("update-channel.txt"),
+            "stable\n",
+        )
+        .unwrap();
+        std::fs::write(
+            executable.parent().unwrap().join("update-version.txt"),
+            "0.8.3\n",
+        )
+        .unwrap();
+        let home = temporary.path().join("home");
+        assert_eq!(
+            macos_root_for_executable(Some(home.clone()), None, &executable, "0.8.3").unwrap(),
+            home.join("Library/Application Support/AudioLibExplorer/beta")
+        );
+        std::fs::write(resources.join("update-version.txt"), "0.8.2-beta.1\n").unwrap();
+        assert!(macos_root_for_executable(Some(home), None, &executable, "0.8.3").is_err());
+    }
+
+    #[test]
+    fn macos_bundle_cannot_fall_back_to_stable_when_resource_markers_are_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let contents = temporary.path().join("AudioLib Explorer.app/Contents");
+        let executable = contents.join("MacOS/AudioLibExplorer");
+        let resources = contents.join("Resources");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            executable.parent().unwrap().join("update-channel.txt"),
+            "stable\n",
+        )
+        .unwrap();
+        std::fs::write(
+            executable.parent().unwrap().join("update-version.txt"),
+            "0.8.3\n",
+        )
+        .unwrap();
+        let home = temporary.path().join("home");
+        assert!(macos_root_for_executable(Some(home.clone()), None, &executable, "0.8.3").is_err());
+        std::fs::write(resources.join("update-channel.txt"), "beta\n").unwrap();
+        assert!(macos_root_for_executable(Some(home), None, &executable, "0.8.3").is_err());
+    }
+
+    #[test]
+    fn macos_unbundled_development_uses_optional_adjacent_markers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("standalone");
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("AudioLibCli");
+        let home = temporary.path().join("home");
+        assert_eq!(
+            macos_root_for_executable(Some(home.clone()), None, &executable, "0.8.3").unwrap(),
+            home.join("Library/Application Support/AudioLibExplorer/v1")
+        );
+        std::fs::write(directory.join("update-channel.txt"), "beta\n").unwrap();
+        std::fs::write(directory.join("update-version.txt"), "0.8.3-rc.2\n").unwrap();
+        assert_eq!(
+            macos_root_for_executable(Some(home), None, &executable, "0.8.3").unwrap(),
+            temporary
+                .path()
+                .join("home/Library/Application Support/AudioLibExplorer/beta")
+        );
+    }
+
+    #[test]
+    fn artwork_preference_defaults_for_old_settings_and_round_trips_explicit_choices() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("preferences");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"language":"cn","playback":{"volume":0.35},"allowed_scan_roots":[]}"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+        assert!(config.show_album_artwork);
+        for enabled in [false, true] {
+            config.show_album_artwork = enabled;
+            config.save().unwrap();
+            let loaded = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+            assert_eq!(loaded.show_album_artwork, enabled);
+            assert_eq!(loaded.language, "cn");
+            assert_eq!(loaded.playback["volume"], serde_json::json!(0.35));
+            assert_eq!(loaded.data_root(), root);
         }
     }
 
@@ -1075,7 +1585,9 @@ mod tests {
         assert!(loaded.pregenerate_list_waveforms);
         assert!(loaded.hold_list_waveform_batches_after_audition);
         assert_eq!(loaded.allowed_scan_roots, config.allowed_scan_roots);
-        assert_eq!(loaded.data_source, config.data_source);
+        let mut expected_sources = config.clone();
+        expected_sources.reconcile_local_libraries().unwrap();
+        assert_eq!(loaded.data_source, expected_sources.data_source);
     }
 
     #[test]
@@ -1083,8 +1595,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("userdata");
         let mut config = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
-        assert_eq!(config.max_search_tasks, 6);
-        for value in 1..=6 {
+        assert_eq!(config.max_search_tasks, 30);
+        for value in [1, 6, 7, 29, 30] {
             config.max_search_tasks = value;
             config.save().unwrap();
             assert_eq!(
@@ -1097,9 +1609,11 @@ mod tests {
         for (stored, expected) in [
             (serde_json::json!(0), 1),
             (serde_json::json!(-9), 1),
-            (serde_json::json!(99), 6),
-            (serde_json::json!("bad"), 6),
-            (serde_json::Value::Null, 6),
+            (serde_json::json!(31), 30),
+            (serde_json::json!(u32::MAX), 30),
+            (serde_json::json!(29.6), 30),
+            (serde_json::json!("bad"), 30),
+            (serde_json::Value::Null, 30),
         ] {
             std::fs::write(
                 &config.paths.settings,
@@ -1115,8 +1629,11 @@ mod tests {
             AppConfig::load_with_roots(root, &[])
                 .unwrap()
                 .max_search_tasks,
-            6
+            30
         );
+        for (value, expected) in [(0, 1), (6, 6), (7, 7), (30, 30), (31, 30), (u32::MAX, 30)] {
+            assert_eq!(normalize_max_search_tasks(value), expected);
+        }
     }
 
     #[test]
@@ -1166,6 +1683,9 @@ mod tests {
             inspector_width: Some(380.0),
             inspector_visible: Some(false),
             filters_visible: Some(true),
+            folders_section_expanded: Some(false),
+            libraries_section_expanded: Some(true),
+            folders_section_ratio: Some(0.7),
         };
         config.save().unwrap();
         let loaded = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
@@ -1199,6 +1719,40 @@ mod tests {
             (Some(3), Some(4))
         );
         assert!(!loaded.window_layout.maximized);
+    }
+
+    #[test]
+    fn builtin_themes_round_trip_without_changing_other_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("userdata");
+        let mut config = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+        config.language = "cn".into();
+        config.ui_font_size = 17;
+        config.list_font_size = 19;
+        config.ui_scale_percent = 125;
+        assert_eq!(BUILTIN_THEMES[0].id, DEFAULT_THEME);
+        for (index, entry) in BUILTIN_THEMES.iter().enumerate() {
+            assert!(!entry.id.is_empty());
+            assert!(!entry.name.is_empty() && !entry.name_cn.is_empty());
+            assert!(
+                BUILTIN_THEMES[..index]
+                    .iter()
+                    .all(|other| other.id != entry.id)
+            );
+            config.theme = entry.id.into();
+            config.save().unwrap();
+            let loaded = AppConfig::load_with_roots(root.clone(), &[]).unwrap();
+            assert_eq!(loaded.theme, entry.id);
+            assert_eq!(loaded.language, "cn");
+            assert_eq!(loaded.ui_font_size, 17);
+            assert_eq!(loaded.list_font_size, 19);
+            assert_eq!(loaded.ui_scale_percent, 125);
+        }
+        config.theme = "missing-theme".into();
+        config.save().unwrap();
+        let loaded = AppConfig::load_with_roots(root, &[]).unwrap();
+        assert_eq!(loaded.theme, DEFAULT_THEME);
+        assert_eq!(loaded.ui_font_size, 17);
     }
 
     #[test]
@@ -1425,7 +1979,10 @@ mod tests {
         )
         .unwrap();
         let mut config = AppConfig::load_in(directory.path().to_owned()).unwrap();
-        assert_eq!(config.data_source, DataSourceSettings::default());
+        let mut server_settings = config.data_source.clone();
+        server_settings.local_libraries.clear();
+        server_settings.active_local_library = None;
+        assert_eq!(server_settings, DataSourceSettings::default());
         assert_eq!(config.data_source.mode, DataSourceMode::Local);
         assert_eq!(
             config.data_source.poll_interval_secs,

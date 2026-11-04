@@ -10,7 +10,11 @@ mod runtime;
 mod stage;
 pub use diagnose::{DiagnosticCode, DiagnosticFinding, LibraryDiagnosis, diagnose};
 pub use inspect::{BusinessDigest, LibraryInspection, TableDigest, inspect};
-pub use job::{MigrationJob, MigrationPhase, MigrationProgress, apply, resume, rollback, verify};
+pub(crate) use job::admit_import_identity;
+pub use job::{
+    ImportIdentityAdmission, MigrationJob, MigrationPhase, MigrationProgress, apply, resume,
+    rollback, verify,
+};
 pub use plan::{LocalHistoryMigration, MigrationPlan, SpaceBudget, plan, plan_local};
 pub use recipe::SchemaChange;
 pub(crate) use recipe::changes as schema_changes;
@@ -49,6 +53,26 @@ pub(crate) fn digest_business(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> audiolib_core::Result<BusinessDigest> {
     inspect::business_digest(conn, cancel)
+}
+
+/// Explicit new-library import may replace its local identity and preference alias.
+/// Every other value, including unknown extension rows and implicit identities,
+/// remains subject to the ordinary lossless business projection.
+pub(crate) fn digest_import_admission(
+    conn: &rusqlite::Connection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> audiolib_core::Result<BusinessDigest> {
+    let mut projection = inspect::business_digest(conn, cancel)?;
+    if let Some(table) = projection
+        .tables
+        .iter_mut()
+        .find(|table| table.table == "audiolib_album_id_sequence")
+    {
+        table
+            .columns
+            .retain(|column| column != "namespace" && column != "legacy_scope");
+    }
+    inspect::business_digest_matching(conn, Some(&projection), cancel)
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ pub(crate) use current::{
 pub(crate) use search_upgrade::{migrate_resumable, pending};
 
 /// Writable target format; legacy normalization remains pinned to v5 below.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 pub const LEGACY_SCHEMA_VERSION: i64 = 5;
 /// Read-only source snapshots remain compatible across schemas 3..=5. Obsolete
 /// derived search state is repaired only in an owned staging or temporary copy.
@@ -42,7 +42,7 @@ pub(crate) fn ensure_ready(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn feature_version(conn: &Connection, feature: &str) -> Result<Option<i64>> {
+pub(crate) fn feature_version(conn: &Connection, feature: &str) -> Result<Option<i64>> {
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='audiolib_schema_features')",
@@ -79,6 +79,8 @@ fn validate_feature_revisions(conn: &Connection, tokenization: i64) -> Result<()
             .map_err(db_error)?;
         for name in names {
             if ![
+                "album_entities",
+                "metadata_storage",
                 "stable_audio_ids",
                 "foreign_key_indexes",
                 "tokenization",
@@ -95,6 +97,8 @@ fn validate_feature_revisions(conn: &Connection, tokenization: i64) -> Result<()
         }
     }
     for (feature, supported) in [
+        ("album_entities", 1),
+        ("metadata_storage", 1),
         ("stable_audio_ids", 1),
         ("foreign_key_indexes", 1),
         ("tokenization", tokenization),
@@ -556,10 +560,37 @@ pub(crate) fn source_search_marked(conn: &Connection) -> Result<bool> {
     Ok(meta_value(conn, SOURCE_SEARCH_REV_KEY)?.as_deref() == Some(SOURCE_SEARCH_REV))
 }
 
-/// Register deterministic Unicode folding and tag-query functions without rewriting
-/// the stored annotations or original Metadata.
-pub(crate) fn register_casefold(conn: &Connection) -> Result<()> {
+fn register_metadata_storage(conn: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("audiolib_metadata_json", 1, flags, |context| {
+        crate::metadata_storage::decode_value(context.get_raw(0))
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))
+    })
+    .map_err(db_error)?;
+    conn.create_scalar_function("audiolib_metadata_store", 2, flags, |context| {
+        let raw = crate::metadata_storage::decode_value(context.get_raw(0))
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
+        crate::metadata_storage::encode(&raw, context.get::<bool>(1)?)
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))
+    })
+    .map_err(db_error)
+}
+
+/// Register deterministic folding, tag-query and source-path identity functions
+/// without rewriting the stored annotations or original Metadata.
+pub(crate) fn register_casefold(conn: &Connection) -> Result<()> {
+    // Search-only readers register this subset, so codec functions must be available
+    // before either a reader projection or a writer trigger can reference Metadata.
+    register_metadata_storage(conn)?;
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    // Directory queries run on the lightweight read pool as well as on writers.
+    // This identity is query-only, never persisted in a schema/index or feature map.
+    conn.create_scalar_function("audiolib_path_identity", 1, flags, |context| {
+        Ok(crate::path_identity::comparison_key(
+            &context.get::<String>(0)?,
+        ))
+    })
+    .map_err(db_error)?;
     let tags_mapper = icu_casemap::CaseMapper::new();
     conn.create_scalar_function("audiolib_user_tags_key", 1, flags, move |context| {
         let mut value = context.get::<Option<String>>(0)?.unwrap_or_default();
@@ -587,22 +618,36 @@ pub(crate) fn register_casefold(conn: &Connection) -> Result<()> {
     })
     .map_err(db_error)?;
     conn.create_scalar_function("audiolib_has_source_tags", 1, flags, |context| {
-        let json = context.get::<Option<String>>(0)?.unwrap_or_default();
+        let json = crate::metadata_storage::decode_value(context.get_raw(0))
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
         Ok(i64::from(json_has_source_tags(&json)))
     })
     .map_err(db_error)?;
     conn.create_scalar_function("audiolib_source_tags_key", 1, flags, |context| {
-        let json = context.get::<Option<String>>(0)?.unwrap_or_default();
+        let json = crate::metadata_storage::decode_value(context.get_raw(0))
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
         Ok(source_tags_key(&json))
     })
     .map_err(db_error)?;
     conn.create_scalar_function("audiolib_source_tags", 1, flags, |context| {
-        let json = context.get::<Option<String>>(0)?.unwrap_or_default();
+        let json = crate::metadata_storage::decode_value(context.get_raw(0))
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
         if !json_has_source_tags(&json) {
             return Ok(String::new());
         }
         let value = serde_json::from_str(&json).unwrap_or_default();
         Ok(audiolib_core::source_tags(&value).join(", "))
+    })
+    .map_err(db_error)?;
+    // Library/album name exactly as the file declares it; empty when it declares none.
+    conn.create_scalar_function("audiolib_album_key", 1, flags, |context| {
+        let json = crate::metadata_storage::decode_value(context.get_raw(0))
+            .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
+        if !json.contains("library") && !json.contains("\\u") {
+            return Ok(String::new());
+        }
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+        Ok(audiolib_core::album(&value))
     })
     .map_err(db_error)?;
     // Include/exclude tag terms in one call per row: the library tags are folded once and
@@ -662,6 +707,138 @@ pub(crate) fn register_casefold(conn: &Connection) -> Result<()> {
     .map_err(db_error)
 }
 
+#[cfg(test)]
+mod metadata_sql_tests {
+    use super::*;
+
+    #[test]
+    fn text_and_compressed_metadata_share_sql_projections_and_lossless_storage() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_tokenizer(&conn, crate::load_tokenizer()).unwrap();
+        let raw = serde_json::json!({
+            "wav_metadata": {
+                "version": 2,
+                "fields": {"library": "Library", "keywords": ["Metal", "门"]},
+                "ixml": {"SCENE": "scene"},
+            },
+            "unknown": "exact whitespace 🦉 ".repeat(400),
+        })
+        .to_string();
+        let compressed = crate::metadata_storage::encode_legacy_fixture(&raw).unwrap();
+        assert!(matches!(&compressed, rusqlite::types::Value::Blob(_)));
+        let read = |value: &dyn rusqlite::ToSql| {
+            conn.query_row(
+                "SELECT audiolib_metadata_json(?1),audiolib_source_tags_key(?1),
+                 audiolib_source_tags(?1),audiolib_has_source_tags(?1),
+                 audiolib_album_key(?1),audiolib_source_text('',?1)",
+                [value],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(read(&raw), read(&compressed));
+        let stored: (String, String, String) = conn
+            .query_row(
+                "SELECT typeof(audiolib_metadata_store(?1,1)),
+                 typeof(audiolib_metadata_store(?1,0)),
+                 audiolib_metadata_json(audiolib_metadata_store(?1,1))",
+                [&raw],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("text".into(), "text".into(), raw.clone()));
+        let restored: (String, String) = conn
+            .query_row(
+                "SELECT typeof(audiolib_metadata_store(?1,1)),audiolib_metadata_store(?1,1)",
+                [&compressed],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(restored, ("text".into(), raw));
+    }
+
+    #[test]
+    fn corrupt_metadata_fails_all_sql_consumers_instead_of_becoming_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_tokenizer(&conn, crate::load_tokenizer()).unwrap();
+        for projection in [
+            "audiolib_metadata_json(?1)",
+            "audiolib_metadata_store(?1,1)",
+            "audiolib_source_tags_key(?1)",
+            "audiolib_source_tags(?1)",
+            "audiolib_has_source_tags(?1)",
+            "audiolib_album_key(?1)",
+            "audiolib_source_text('',?1)",
+        ] {
+            assert!(
+                conn.query_row(
+                    &format!("SELECT {projection}"),
+                    [b"invalid".as_slice()],
+                    |row| { row.get::<_, rusqlite::types::Value>(0) }
+                )
+                .is_err(),
+                "{projection}"
+            );
+        }
+        let legacy: String = conn
+            .query_row("SELECT audiolib_source_tags_key('not-json')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(legacy.is_empty());
+    }
+
+    #[test]
+    fn search_only_readers_register_the_lossless_codec() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_casefold(&conn).unwrap();
+        let raw = "original raw text ".repeat(100);
+        let restored: String = conn
+            .query_row(
+                "SELECT audiolib_metadata_json(audiolib_metadata_store(?1,1))",
+                [&raw],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn search_only_readers_register_source_path_identity_without_writes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA query_only=ON;").unwrap();
+        register_casefold(&conn).unwrap();
+        for path in [
+            r"C:\FX\Designed\one.wav",
+            r"\\NAS\SHARE\Designed\one.wav",
+            r"/FX/Back\Slash/one.wav",
+            "relative.wav",
+        ] {
+            let actual: String = conn
+                .query_row("SELECT audiolib_path_identity(?1)", [path], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(actual, crate::normalize_source_path_identity(path));
+        }
+        assert_eq!(conn.total_changes(), 0);
+        assert_eq!(
+            conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
 /// Whether ASCII `haystack`, folded to lowercase, contains the folded `needle`. Exactly
 /// `haystack.to_ascii_lowercase().contains(needle)`: a folded term has no uppercase
 /// ASCII, and its non-ASCII bytes never equal a folded ASCII byte.
@@ -683,7 +860,8 @@ pub fn register_tokenizer(conn: &Connection, jieba: Arc<Jieba>) -> Result<()> {
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| {
             let description = context.get::<Option<String>>(0)?.unwrap_or_default();
-            let json = context.get::<Option<String>>(1)?.unwrap_or_default();
+            let json = crate::metadata_storage::decode_value(context.get_raw(1))
+                .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
             let attributes = serde_json::from_str(&json).unwrap_or_default();
             Ok(audiolib_core::source_metadata_search_text(
                 &description,
@@ -707,19 +885,6 @@ pub fn register_tokenizer(conn: &Connection, jieba: Arc<Jieba>) -> Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| Ok(path_key(&context.get::<String>(0)?)),
-    )
-    .map_err(db_error)?;
-    // Query-only path identity: never persisted in a schema/index or feature map.
-    // Legacy folded keys remain unchanged and only select candidate buckets.
-    conn.create_scalar_function(
-        "audiolib_path_identity",
-        1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |context| {
-            Ok(crate::path_identity::comparison_key(
-                &context.get::<String>(0)?,
-            ))
-        },
     )
     .map_err(db_error)
 }
@@ -786,6 +951,9 @@ pub(crate) fn migrate_with_progress(
     tx.execute_batch(BASE_SCHEMA).map_err(db_error)?;
     // Legacy prototypes have slightly different columns. Preserve every original column.
     for (name, definition) in AUDIO_COLUMNS {
+        if *name == "album_id" {
+            continue;
+        }
         ensure_column(&tx, "audio_files", name, definition)?;
     }
     for (name, definition) in FOLDER_COLUMNS {
@@ -924,6 +1092,9 @@ pub(crate) fn triggers_match(conn: &Connection) -> Result<bool> {
     let expected = Connection::open_in_memory().map_err(db_error)?;
     expected.execute_batch(BASE_SCHEMA).map_err(db_error)?;
     for (name, definition) in AUDIO_COLUMNS {
+        if *name == "album_id" {
+            continue;
+        }
         ensure_column(&expected, "audio_files", name, definition)?;
     }
     expected.execute_batch(FTS_SCHEMA).map_err(db_error)?;
@@ -1000,6 +1171,8 @@ fn apply_indexes(conn: &Connection) -> Result<()> {
         "source_tags_text",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    // v7 album column; the album index in PERFORMANCE_INDEXES depends on it.
+    ensure_column(conn, "audio_files", "album", "TEXT NOT NULL DEFAULT ''")?;
     conn.execute_batch(DROP_RATING_INDEXES).map_err(db_error)?;
     conn.execute_batch(PERFORMANCE_INDEXES).map_err(db_error)
 }
@@ -1021,6 +1194,9 @@ const PERFORMANCE_INDEXES:&str="
  CREATE INDEX IF NOT EXISTS idx_audio_visible_format_name ON audio_files(bit_depth,filename COLLATE NOCASE,id) WHERE missing=0;
  CREATE INDEX IF NOT EXISTS idx_audio_visible_tagged_any ON audio_files(filename COLLATE NOCASE,id,user_tags,source_tags_text) WHERE missing=0 AND (COALESCE(trim(user_tags),'')<>'' OR source_tags_text<>'');
  CREATE INDEX IF NOT EXISTS idx_audio_visible_color ON audio_files(user_color COLLATE NOCASE,id) WHERE missing=0 AND user_color IS NOT NULL;";
+
+/// Shared-entity indexes for visible facets and all-member preference migration.
+pub(crate) const ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_audio_visible_album ON audio_files(album_id,id) WHERE missing=0; CREATE INDEX IF NOT EXISTS idx_audio_album_members ON audio_files(album_id,id)";
 
 const AUDIO_COLUMNS: &[(&str, &str)] = &[
     ("file_path", "TEXT"),
@@ -1051,6 +1227,8 @@ const AUDIO_COLUMNS: &[(&str, &str)] = &[
     ("zero_crossing_rate", "REAL"),
     ("user_tags", "TEXT"),
     ("source_tags_text", "TEXT NOT NULL DEFAULT ''"),
+    // v8: shared album identity; the declared name remains in authoritative Metadata.
+    ("album_id", "INTEGER REFERENCES albums(id)"),
     ("user_rating", "INTEGER"),
     ("user_color", "TEXT"),
     ("user_notes", "TEXT"),

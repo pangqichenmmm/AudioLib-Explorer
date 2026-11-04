@@ -295,13 +295,39 @@ impl Controller {
             };
             let c2 = c.clone();
             post(c.ui.clone(), move |ui| {
-                let current = c2.config.lock().unwrap().data_source.server_url.clone();
-                if current == settings.server_url {
-                    c2.remote.lock().unwrap().manage = manage;
-                    c2.publish_server_manage(&ui);
-                }
+                c2.apply_server_manage(&ui, &settings.server_url, manage);
             });
         });
+    }
+
+    /// Apply the active server's asynchronous capability reply. A selection made
+    /// before the optional artwork marker arrived needs one fresh cover job.
+    fn apply_server_manage(&self, ui: &AppWindow, expected_url: &str, manage: ServerManage) {
+        let current = self.config.lock().unwrap().data_source.server_url.clone();
+        if current != expected_url {
+            return;
+        }
+        let artwork_became_available = {
+            let mut remote = self.remote.lock().unwrap();
+            let usable = |manage: &ServerManage| {
+                manage
+                    .capabilities_for(&current)
+                    .is_some_and(|capabilities| {
+                        capabilities.album_artwork_usable()
+                            || capabilities.album_entity_artwork_usable()
+                    })
+            };
+            let became_available = !usable(&remote.manage) && usable(&manage);
+            remote.manage = manage;
+            became_available && !remote.library_changed
+        };
+        self.publish_server_manage(ui);
+        if artwork_became_available && self.remote_read_only() && self.available() {
+            let selected = self.selected.lock().unwrap().clone();
+            if let Some(file) = selected {
+                self.queue_artwork(&file);
+            }
+        }
     }
 
     /// The menu gate of the server that is active now.
@@ -458,6 +484,132 @@ mod tests {
         );
         let other = manage.for_server("http://server.example.lan:8790");
         assert!(!other.can_manage && other.note.is_empty());
+    }
+
+    #[test]
+    fn artwork_capability_arrival_requeues_the_current_selection_only_once() {
+        for marker in ["album_artwork", "album_entity_artwork"] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "controller::remote_mode::server_removal::tests::child_artwork_capability_arrival",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("AUDIOLIB_ARTWORK_GATE_TEST_ROOT", directory.path())
+            .env("AUDIOLIB_ARTWORK_GATE_MARKER", marker)
+            .env("AUDIOLIB_DATA_DIR", directory.path())
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "Artwork capability regression ({marker}) failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated artwork capability regression"]
+    fn child_artwork_capability_arrival() {
+        use audiolib_audio::{AudioEngine, PlaybackConfig};
+        use audiolib_core::config::AppConfig;
+        use audiolib_db::SqliteProvider;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("AUDIOLIB_ARTWORK_GATE_TEST_ROOT").unwrap());
+        // Explicit preferences prevent discovery of any working/legacy library.
+        std::fs::write(directory.join("settings.json"), b"{}").unwrap();
+        let config = AppConfig::load_in(directory).unwrap();
+        let provider = Arc::new(SqliteProvider::open(&config.paths.database).unwrap());
+        let playback = PlaybackConfig::default();
+        let engine = AudioEngine::new(playback.clone()).unwrap();
+        let ui = AppWindow::new().unwrap();
+        let controller = Controller::new(&ui, provider, engine.handle(), config, playback);
+        let url = "http://127.0.0.1:9";
+        controller.config.lock().unwrap().data_source.server_url = url.into();
+        controller.remote_mode.store(true, Ordering::Release);
+        controller.remote.lock().unwrap().state = Some(state("artwork-library", 1));
+        let mut selected = file(42, None);
+        selected.album_id = Some(7);
+        selected.album_entity = Some(audiolib_core::albums::Album {
+            id: 7,
+            name: "Shared library".into(),
+            kind: audiolib_core::albums::AlbumKind::Metadata,
+            metadata_key: Some("Shared library".into()),
+            folder_id: None,
+            folder_path: None,
+            representative_audio_id: Some(42),
+        });
+        *controller.selected.lock().unwrap() = Some(selected);
+
+        let marker = std::env::var("AUDIOLIB_ARTWORK_GATE_MARKER").unwrap();
+        let reply = |url: &str, artwork: bool| {
+            let mut manifest = audiolib_core::compatibility::compatibility_manifest();
+            // A modern server may advertise only shared-entity artwork. Its
+            // capability arrival must admit the same coalesced album request.
+            manifest.features.remove(if marker == "album_artwork" {
+                "album_entity_artwork"
+            } else {
+                "album_artwork"
+            });
+            if !artwork {
+                manifest.features.remove(marker.as_str());
+            }
+            ServerManage {
+                url: url.into(),
+                capabilities: Some(Capabilities {
+                    compatibility: Some(manifest),
+                    ..Capabilities::default()
+                }),
+                ..ServerManage::default()
+            }
+        };
+        // Keep the independent worker before disk/HTTP while observing real queue
+        // admission via its cancellation token. No server or audio device is used.
+        let cache_guard = controller.artwork_cache_lock.lock().unwrap();
+        let initial = controller.artwork_cancel.lock().unwrap().clone();
+        controller.apply_server_manage(&ui, url, reply(url, false));
+        assert!(!initial.load(Ordering::Acquire));
+        controller.apply_server_manage(&ui, "http://127.0.0.1:8", reply(url, true));
+        assert!(
+            !initial.load(Ordering::Acquire),
+            "a stale server cannot queue artwork"
+        );
+
+        controller.apply_server_manage(&ui, url, reply(url, true));
+        assert!(
+            initial.load(Ordering::Acquire),
+            "new capability must retry the selected cover"
+        );
+        let queued = controller.artwork_cancel.lock().unwrap().clone();
+        controller.apply_server_manage(&ui, url, reply(url, true));
+        assert!(
+            !queued.load(Ordering::Acquire),
+            "repeated capability does not restart the request"
+        );
+        controller.apply_server_manage(&ui, url, reply(url, false));
+        assert!(
+            !queued.load(Ordering::Acquire),
+            "a legacy reply does not queue artwork"
+        );
+
+        controller.closing.store(true, Ordering::Release);
+        controller.apply_server_manage(&ui, url, reply(url, true));
+        assert!(
+            !queued.load(Ordering::Acquire),
+            "closing cannot admit a new cover request"
+        );
+        controller.shutdown();
+        drop(cache_guard);
+        drop(controller);
+        drop(ui);
+        drop(engine);
     }
 
     #[test]

@@ -525,7 +525,7 @@ pub(crate) mod tests {
                         (_, None) => (
                             401,
                             "WWW-Authenticate: Bearer realm=\"audiolib\"\r\n",
-                            r#"{"error_code":"UNAUTHORIZED","message":"A bearer token is required for access from outside the LAN"}"#
+                            r#"{"error_code":"UNAUTHORIZED","message":"A bearer token is required: this request is not from a trusted direct LAN peer"}"#
                                 .to_owned(),
                         ),
                         (_, Some(value)) if value != "Bearer tok" => (

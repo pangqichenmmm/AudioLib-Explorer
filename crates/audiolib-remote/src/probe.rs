@@ -954,12 +954,17 @@ mod tests {
                     .unwrap();
                 assert_eq!(step.ok, supported);
                 assert!(step.message.contains(&format!("schema {version}")));
-                if !(3..=6).contains(&version) {
+                if version == 2 {
                     assert!(step.message.contains(if chinese {
                         "本客户端支持"
                     } else {
                         "this client"
                     }));
+                    assert!(!step.skipped && !step.optional);
+                } else if version >= 6 {
+                    // Schema 6/7 must declare a modern format; without one the
+                    // library step fails on the format-missing message.
+                    assert!(step.message.contains("format"), "{0}", step.message);
                     assert!(!step.skipped && !step.optional);
                 }
                 assert!(report.steps.iter().all(|step| {

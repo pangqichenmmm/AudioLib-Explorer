@@ -1,20 +1,36 @@
 // app/audiolib-desktop/src/main.rs
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod album_override_migration;
+mod artwork;
 #[cfg(test)]
 mod close_tests;
 mod controller;
+mod detail_presentation;
 mod diagnostics;
 mod dialogs;
+mod directory_artwork_choices;
 mod gui_search_benchmark;
 mod list_waveforms;
 #[cfg(test)]
+mod mode_switch_scroll_tests;
+#[cfg(test)]
 mod pane_review_tests;
+#[cfg(test)]
+mod playback_repaint_tests;
 mod progressive_waveform;
 #[cfg(test)]
 mod responsive_layout_tests;
 #[cfg(test)]
 mod search_task_ui_tests;
+#[cfg(test)]
+mod sidebar_section_tests;
 mod startup;
+#[cfg(test)]
+mod studio_review_tests;
+#[cfg(test)]
+mod studio_switch_review_tests;
+#[cfg(test)]
+mod studio_theme_tests;
 mod tag_chips;
 mod theme;
 #[cfg(test)]
@@ -30,7 +46,7 @@ mod window_repaint;
 use anyhow::{Context, Result};
 use audiolib_audio::{AudioEngine, PlaybackConfig};
 use audiolib_core::{DataProvider, config::AppConfig};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use audiolib_db::SqliteProvider;
 use slint::ComponentHandle;
 use std::{
@@ -74,6 +90,13 @@ impl DesktopInstanceGuard {
 }
 
 fn main() {
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("AudioLibExplorer {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = run() {
         report_fatal_error(&error);
         std::process::exit(1);
@@ -90,17 +113,15 @@ fn report_fatal_error(error: &anyhow::Error) {
     }
     // The asynchronous tracing guard may already have been dropped by run(), and
     // invalid preferences can fail before tracing starts. Persist this synchronously.
-    let root = std::env::var_os("AUDIOLIB_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map(|path| PathBuf::from(path).join("AudioLibExplorer/v1"))
-        })
-        .unwrap_or_else(|| {
+    let root = AppConfig::default_root().unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            std::env::temp_dir().join("AudioLibExplorer-startup")
+        } else {
             std::env::current_dir()
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join(".audiolib-user")
-        });
+        }
+    });
     let logs = root.join("logs");
     let log_path = logs.join("AudioLibExplorer-startup-error.log");
     let result = (|| -> std::io::Result<()> {
@@ -235,10 +256,49 @@ fn run() -> Result<()> {
         );
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    let native_quit_fixture = if arguments
+        .iter()
+        .any(|argument| argument == "--smoke-native-quit")
+    {
+        anyhow::ensure!(
+            arguments.iter().any(|argument| argument == "--smoke-ui")
+                && !arguments.iter().any(|argument| matches!(
+                    argument.as_str(),
+                    "--smoke-view" | "--smoke-duration-ms"
+                )),
+            "Native Quit acceptance requires an unmodified --smoke-ui run"
+        );
+        Some(NativeQuitFixture::load(
+            &config,
+            std::env::var_os("AUDIOLIB_DATA_DIR").map(PathBuf::from),
+        )?)
+    } else {
+        None
+    };
     let ui = AppWindow::new().context("Create desktop window")?;
+    #[cfg(target_os = "macos")]
+    let _native_quit_guard = {
+        let close_ui = ui.as_weak();
+        audiolib_windows::macos_lifecycle::install_native_quit_handler(move || {
+            if let Some(ui) = close_ui.upgrade() {
+                // Startup installs its cancellable close handler first; the
+                // controller replaces it after opening. Both keep the loop alive
+                // until the owned work has safely drained.
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::CloseRequested);
+            }
+        })
+        .map_err(anyhow::Error::msg)
+        .context("Install native desktop Quit handling")?
+    };
     window_repaint::install(ui.window());
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_chinese(config.language == "cn");
+    // Apply the saved workbench before the startup window opens. Opening or
+    // upgrading a large library must not temporarily show the default theme.
+    theme::apply_theme(&ui, &config.theme);
+    theme::apply_font_sizes(&ui, config.ui_font_size, config.list_font_size);
     // Smoke runs keep the design layout so screenshots stay deterministic.
     let restore_layout = !arguments.iter().any(|argument| argument == "--smoke-ui");
     if restore_layout {
@@ -247,11 +307,24 @@ fn run() -> Result<()> {
     let Some((sqlite, remote)) = startup::show_while_opening(&ui, config.clone())? else {
         return Ok(());
     };
+    #[cfg(target_os = "macos")]
+    if let Some(fixture) = &native_quit_fixture {
+        let page = sqlite.search(&audiolib_core::SearchRequest::default())?;
+        anyhow::ensure!(
+            page.total_count == 1
+                && page.results.len() == 1
+                && PathBuf::from(&page.results[0].file_path).canonicalize()?
+                    == fixture.fixture_path
+                && page.results[0].notes.is_empty(),
+            "Native Quit acceptance requires exactly one untouched synthetic record"
+        );
+    }
     if restore_layout {
         window_layout::keep_on_screen(&ui);
     }
-    let playback =
-        serde_json::from_value::<PlaybackConfig>(config.playback.clone()).unwrap_or_default();
+    let playback = controller::platform_playback_config(
+        serde_json::from_value::<PlaybackConfig>(config.playback.clone()).unwrap_or_default(),
+    );
     let engine = AudioEngine::new(playback.clone()).context("Initialize audio engine")?;
     let _diagnostics = diagnostics::install(&ui, config.paths.logs.clone(), engine.handle());
     let controller = controller::Controller::new_with_source(
@@ -304,6 +377,18 @@ fn run() -> Result<()> {
             .unwrap_or_default();
         {
             match smoke_view.as_str() {
+                "library-progress" => {
+                    ui.invoke_open_library(0);
+                    ui.set_library_busy(true);
+                    ui.set_library_operation_stage(
+                        if ui.get_chinese() {
+                            "正在等待扫描安全结束…"
+                        } else {
+                            "Waiting for scans to finish safely…"
+                        }
+                        .into(),
+                    );
+                }
                 "output" => {
                     ui.set_settings_visible(true);
                     ui.invoke_devices_requested(ui.get_backend_index());
@@ -342,7 +427,18 @@ fn run() -> Result<()> {
                     ui.set_peak_mode(0);
                     ui.invoke_peak_style_requested();
                 }
-                "database" | "library" => ui.invoke_open_library(0),
+                "database" | "library" | "artwork" => {
+                    ui.invoke_open_library(0);
+                    ui.set_artwork_management_expanded(smoke_view == "artwork");
+                }
+                "local-source" | "add-source" => {
+                    ui.invoke_open_library(0);
+                    if smoke_view == "local-source" {
+                        ui.invoke_sm_local_add_requested();
+                    } else {
+                        ui.set_sm_add_choice(true);
+                    }
+                }
                 "maintenance" => {
                     ui.invoke_open_library(0);
                     ui.set_advanced_maintenance_visible(true);
@@ -358,7 +454,7 @@ fn run() -> Result<()> {
                     ui.invoke_open_data_source();
                     ui.invoke_sm_select_row(-1);
                 }
-                "cache-export" | "server-cache" => {
+                "cache-export" | "server-cache" | "server-artwork" => {
                     // Synthetic presentation-only fixture of 缓存与导出; never connects to a
                     // server or changes a working library. Smoke runs use an isolated data dir.
                     ui.set_library_visible(true);
@@ -378,6 +474,7 @@ fn run() -> Result<()> {
                     ])));
                     ui.set_sm_selected(1);
                     ui.set_sm_page(2);
+                    ui.set_artwork_management_expanded(smoke_view == "server-artwork");
                     ui.set_sm_cache_available(true);
                     ui.set_sm_cache_summary(
                         if ui.get_chinese() {
@@ -648,6 +745,15 @@ fn run() -> Result<()> {
                 if (close_after_screenshot || failure.load(Ordering::Acquire))
                     && let Some(ui) = weak.upgrade()
                 {
+                    #[cfg(target_os = "macos")]
+                    if let Some(fixture) = &native_quit_fixture {
+                        if let Err(error) = fixture.request_native_quit(&ui) {
+                            failure.store(true, Ordering::Release);
+                            eprintln!("Native Quit smoke failed: {error:#}");
+                            screenshot_control.request_close(&ui);
+                        }
+                        return;
+                    }
                     screenshot_control.request_close(&ui);
                 }
             },
@@ -673,6 +779,81 @@ fn run() -> Result<()> {
         updates.deploy_after_shutdown()?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct NativeQuitFixture {
+    fixture_path: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl NativeQuitFixture {
+    fn load(config: &AppConfig, explicit_root: Option<PathBuf>) -> Result<Self> {
+        anyhow::ensure!(
+            config.data_source.mode == audiolib_core::config::DataSourceMode::Local,
+            "Native Quit acceptance requires local synthetic data"
+        );
+        let data = explicit_root
+            .context("Native Quit acceptance requires explicit AUDIOLIB_DATA_DIR")?
+            .canonicalize()?;
+        let evidence = data
+            .parent()
+            .context("Native Quit fixture root is missing")?;
+        let owned_name = evidence
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let nonce = owned_name
+            .strip_prefix("AudioLibMacAcceptance-")
+            .unwrap_or("");
+        anyhow::ensure!(
+            data.file_name().is_some_and(|name| name == "userdata")
+                && nonce.len() == 32
+                && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && config.paths.settings.canonicalize()? == data.join("settings.json")
+                && config.paths.database.canonicalize()? == data.join("library.db"),
+            "Native Quit acceptance refuses an unowned settings or library path"
+        );
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data.join(".native-quit-fixture.json"))?)?;
+        anyhow::ensure!(
+            marker.as_object().is_some_and(|fields| fields.len() == 2)
+                && marker["schema_version"].as_u64() == Some(1),
+            "Invalid native Quit fixture marker"
+        );
+        let declared = PathBuf::from(
+            marker["fixture_path"]
+                .as_str()
+                .context("Native Quit fixture path is missing")?,
+        );
+        anyhow::ensure!(
+            declared.is_absolute(),
+            "Native Quit fixture path must be absolute"
+        );
+        let fixture_path = declared.canonicalize()?;
+        anyhow::ensure!(
+            fixture_path == evidence.join("fixtures/synthetic tone.wav"),
+            "Native Quit acceptance refuses a source outside its owned fixture"
+        );
+        Ok(Self { fixture_path })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn request_native_quit(&self, ui: &AppWindow) -> Result<()> {
+        use slint::Model;
+        anyhow::ensure!(
+            !ui.get_remote_mode()
+                && ui.get_has_selection()
+                && ui.get_rows().row_count() == 1
+                && PathBuf::from(ui.get_selected_path().as_str()).canonicalize()?
+                    == self.fixture_path,
+            "Native Quit acceptance did not select its owned synthetic record"
+        );
+        ui.set_edit_notes("AudioLib native Quit drain acceptance".into());
+        ui.set_metadata_dirty(true);
+        ui.invoke_metadata_edited();
+        audiolib_windows::macos_lifecycle::request_native_termination().map_err(anyhow::Error::msg)
+    }
 }
 
 #[cfg(test)]
@@ -765,5 +946,72 @@ mod instance_tests {
         let _guard = DesktopInstanceGuard::acquire(&settings).unwrap();
         std::fs::write(ready, []).unwrap();
         std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
+#[cfg(test)]
+mod native_quit_fixture_tests {
+    use super::{AppConfig, NativeQuitFixture};
+    use std::path::PathBuf;
+
+    fn fixture() -> (tempfile::TempDir, AppConfig, PathBuf, PathBuf) {
+        let temporary = tempfile::tempdir().unwrap();
+        let evidence = temporary
+            .path()
+            .join("AudioLibMacAcceptance-00000000000000000000000000000001");
+        let data = evidence.join("userdata");
+        let audio = evidence.join("fixtures/synthetic tone.wav");
+        std::fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        std::fs::write(&audio, b"owned path-validation fixture").unwrap();
+        let config = AppConfig::load_in(data.clone()).unwrap();
+        std::fs::write(&config.paths.settings, b"{}").unwrap();
+        std::fs::write(&config.paths.database, b"owned path-validation library").unwrap();
+        let audio = audio.canonicalize().unwrap();
+        let data = data.canonicalize().unwrap();
+        std::fs::write(
+            data.join(".native-quit-fixture.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1, "fixture_path": audio,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (temporary, config, data, audio)
+    }
+
+    #[test]
+    fn native_quit_probe_requires_explicit_owned_fixture_and_library_paths() {
+        let (_temporary, mut config, data, audio) = fixture();
+        assert_eq!(
+            NativeQuitFixture::load(&config, Some(data.clone()))
+                .unwrap()
+                .fixture_path,
+            audio
+        );
+        assert!(NativeQuitFixture::load(&config, None).is_err());
+        let outside = data.parent().unwrap().join("other-library.db");
+        std::fs::write(&outside, b"another owned test file").unwrap();
+        config.paths.database = outside;
+        assert!(NativeQuitFixture::load(&config, Some(data.clone())).is_err());
+        config.paths.database = data.join("library.db");
+        config.data_source.mode = audiolib_core::config::DataSourceMode::Server;
+        assert!(NativeQuitFixture::load(&config, Some(data)).is_err());
+    }
+
+    #[test]
+    fn native_quit_probe_refuses_missing_malformed_and_outside_fixture_markers() {
+        let (_temporary, config, data, audio) = fixture();
+        let marker = data.join(".native-quit-fixture.json");
+        for invalid in [
+            serde_json::json!({"schema_version":2, "fixture_path":audio}),
+            serde_json::json!({"schema_version":1, "fixture_path":audio, "extra":true}),
+            serde_json::json!({"schema_version":1, "fixture_path":"relative.wav"}),
+            serde_json::json!({"schema_version":1, "fixture_path":data.join("library.db")}),
+        ] {
+            std::fs::write(&marker, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(NativeQuitFixture::load(&config, Some(data.clone())).is_err());
+        }
+        std::fs::remove_file(marker).unwrap();
+        assert!(NativeQuitFixture::load(&config, Some(data)).is_err());
     }
 }

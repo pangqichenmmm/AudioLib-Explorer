@@ -35,10 +35,23 @@ pub fn legacy_copy(source: &Path, destination: &Path) {
             .map(|c| quote(c))
             .collect::<Vec<_>>()
             .join(",");
+        // Historical schemas contain ordinary JSON TEXT, not the schema-8 codec.
+        // Decode only that known logical column; all other SQLite values copy as-is.
+        let source_names = columns
+            .iter()
+            .map(|column| {
+                if table == "audio_files" && column == "metadata_json" {
+                    format!("audiolib_metadata_json({})", quote(column))
+                } else {
+                    quote(column)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let table = quote(&table);
-        tx.execute_batch(&format!("DELETE FROM main.{table}; INSERT INTO main.{table}({names}) SELECT {names} FROM input.{table};")).unwrap();
+        tx.execute_batch(&format!("DELETE FROM main.{table}; INSERT INTO main.{table}({names}) SELECT {source_names} FROM input.{table};")).unwrap();
     }
-    tx.execute_batch("DELETE FROM audiolib_schema_features WHERE feature IN ('search_storage','play_history_retired');").unwrap();
+    tx.execute_batch("DELETE FROM audiolib_schema_features WHERE feature IN ('search_storage','play_history_retired','album_entities','metadata_storage');").unwrap();
     tx.commit().unwrap();
     assert!(
         !conn

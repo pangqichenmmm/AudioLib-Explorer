@@ -18,6 +18,7 @@ use super::{
     unix_now, without_status,
 };
 use crate::{AppWindow, ServerRootRow, SourceRow};
+use audiolib_core::config::DEFAULT_LOCAL_LIBRARY_ID;
 use audiolib_core::config::{ActiveSource, DataSourceMode, DataSourceSettings, TestSummary};
 use audiolib_core::profiles::{MAX_PROFILE_NAME_CHARS, ServerProfile, same_server_url};
 use audiolib_core::{ScanSession, ScanState};
@@ -51,6 +52,10 @@ const FOCUS_HISTORY: i32 = 2;
 mod source_roots;
 pub(in crate::controller) use source_roots::RootOperation;
 
+#[path = "local_sources.rs"]
+mod local_sources;
+pub(in crate::controller) use local_sources::LocalSourceRequest;
+
 #[path = "detail_waveform_cache.rs"]
 mod detail_waveform_cache;
 
@@ -65,9 +70,18 @@ use waveform_cache_page::{
 pub(super) enum Selection {
     #[default]
     Local,
+    LocalLibrary(String),
     Profile(String),
     /// A new server that is not saved yet.
     New,
+}
+
+fn local_selection(id: &str) -> Selection {
+    if id == DEFAULT_LOCAL_LIBRARY_ID || id == "local" {
+        Selection::Local
+    } else {
+        Selection::LocalLibrary(id.into())
+    }
 }
 
 /// What to do after a successful save from the connection page.
@@ -204,6 +218,7 @@ impl Controller {
     pub(super) fn bind_source_manager(self: &Arc<Self>, ui: &AppWindow) {
         self.bind_source_roots(ui);
         self.bind_detail_waveform_cache(ui);
+        self.bind_local_sources(ui);
         let c = self.clone();
         ui.on_sm_open_requested(move |focus| c.open_source_manager(focus));
         let c = self.clone();
@@ -295,6 +310,7 @@ impl Controller {
                 ui.set_sm_fs_visible(false);
                 ui.set_sm_fs_busy(false);
                 ui.set_sm_root_form(false);
+                ui.set_sm_local_form(false);
                 ui.set_ds_token("".into());
                 c.publish_manage_busy(&ui);
             }
@@ -309,14 +325,21 @@ impl Controller {
     /// (音效库管理) or its history (local content, or the snapshot's on 缓存与导出).
     fn open_source_manager(self: &Arc<Self>, focus: i32) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let active = self.config.lock().unwrap().data_source.active_source();
+        let config = self.config.lock().unwrap();
+        let active = config.data_source.active_source();
+        let local = config
+            .selected_local_library()
+            .map(|library| library.id.clone());
+        drop(config);
         let page = match (&active, focus) {
             (ActiveSource::Profile(_), FOCUS_LIBRARY) => PAGE_LIBRARY,
             (ActiveSource::Profile(_), FOCUS_HISTORY) => PAGE_CACHE,
             _ => PAGE_CONNECTION,
         };
         self.set_selection(match active {
-            ActiveSource::Local => Selection::Local,
+            ActiveSource::Local => {
+                local_selection(local.as_deref().unwrap_or(DEFAULT_LOCAL_LIBRARY_ID))
+            }
             ActiveSource::Profile(id) => Selection::Profile(id),
         });
         ui.set_sm_page(page);
@@ -328,14 +351,22 @@ impl Controller {
     }
 
     fn select_source(self: &Arc<Self>, index: i32) {
-        let settings = self.config.lock().unwrap().data_source.clone();
-        let selection = match index {
-            0 => Selection::Local,
-            index => match settings.profiles.get(index as usize - 1) {
-                Some(profile) => Selection::Profile(profile.id.clone()),
-                None => Selection::Local,
-            },
-        };
+        let selection = self
+            .ui
+            .upgrade()
+            .and_then(|ui| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| ui.get_sm_sources().row_data(index))
+            })
+            .map(|row| {
+                if row.kind == 0 {
+                    local_selection(row.id.as_str())
+                } else {
+                    Selection::Profile(row.id.to_string())
+                }
+            })
+            .unwrap_or(Selection::Local);
         self.set_selection(selection);
         if let Some(ui) = self.ui.upgrade() {
             ui.set_sm_page(PAGE_CONNECTION);
@@ -352,6 +383,7 @@ impl Controller {
         remote.manager.invalidate_library();
         drop(remote);
         if let Some(ui) = self.ui.upgrade() {
+            ui.set_sm_local_form(false);
             self.publish_manage_busy(&ui);
         }
     }
@@ -449,6 +481,7 @@ impl Controller {
     fn reload_selection(self: &Arc<Self>) {
         let Some(ui) = self.ui.upgrade() else { return };
         self.publish_sources(&ui);
+        self.publish_local_selection(&ui);
         self.load_form(&ui);
         let page = ui.get_sm_page();
         self.show_page(page);
@@ -457,19 +490,27 @@ impl Controller {
     /// The source list (row 0 = local) with the active marker and latest test verdicts.
     pub(super) fn publish_sources(&self, ui: &AppWindow) {
         let chinese = self.chinese.load(Ordering::Acquire);
-        let config = self.config.lock().unwrap();
+        let mut config = self.config.lock().unwrap().clone();
+        if config.data_source.local_libraries.is_empty() {
+            let _ = config.reconcile_local_libraries();
+        }
         let settings = &config.data_source;
         let active = settings.active_source();
-        let local_path = config.paths.database.display().to_string();
-        let mut rows = vec![SourceRow {
-            id: "local".into(),
-            name: cn_or(chinese, "本地素材库", "Local library").into(),
-            subtitle: local_path.clone().into(),
-            kind: 0,
-            active: active == ActiveSource::Local,
-            status: SharedString::new(),
-            status_kind: 0,
-        }];
+        let selected_local = config.selected_local_library();
+        let mut rows = settings
+            .local_libraries
+            .iter()
+            .map(|library| SourceRow {
+                id: library.id.clone().into(),
+                name: library.name.clone().into(),
+                subtitle: library.database.display().to_string().into(),
+                kind: 0,
+                active: active == ActiveSource::Local
+                    && selected_local.is_some_and(|selected| selected.id == library.id),
+                status: SharedString::new(),
+                status_kind: 0,
+            })
+            .collect::<Vec<_>>();
         for profile in &settings.profiles {
             let (status, status_kind) = test_status(profile.last_test.as_ref(), chinese);
             rows.push(SourceRow {
@@ -483,16 +524,30 @@ impl Controller {
             });
         }
         let selected = match &self.remote.lock().unwrap().manager.selected {
-            Selection::Local => 0,
-            Selection::New => -1,
-            Selection::Profile(id) => settings
-                .profiles
+            Selection::Local => rows
                 .iter()
-                .position(|profile| &profile.id == id)
-                .map(|index| index as i32 + 1)
-                .unwrap_or(0),
+                .position(|row| row.kind == 0 && row.id == DEFAULT_LOCAL_LIBRARY_ID)
+                .map_or(0, |index| index as i32),
+            Selection::LocalLibrary(id) => rows
+                .iter()
+                .position(|row| row.kind == 0 && row.id.as_str() == id)
+                .map_or(0, |index| index as i32),
+            Selection::New => -1,
+            Selection::Profile(id) => rows
+                .iter()
+                .position(|row| row.kind == 1 && row.id.as_str() == id)
+                .map_or(0, |index| index as i32),
         };
+        let local_path = config
+            .local_library(match &self.remote.lock().unwrap().manager.selected {
+                Selection::LocalLibrary(id) => id.as_str(),
+                _ => DEFAULT_LOCAL_LIBRARY_ID,
+            })
+            .map(|library| library.database.display().to_string())
+            .unwrap_or_default();
+        let local_count = settings.local_libraries.len();
         drop(config);
+        ui.set_sm_local_count(local_count as i32);
         ui.set_sm_sources(ModelRc::new(VecModel::from(rows)));
         ui.set_sm_selected(selected);
         ui.set_sm_local_path(
@@ -835,7 +890,7 @@ impl Controller {
         }
         let chinese = self.chinese.load(Ordering::Acquire);
         let id = match self.selection() {
-            Selection::Local => return,
+            Selection::Local | Selection::LocalLibrary(_) => return,
             Selection::New => None,
             Selection::Profile(id) => Some(id),
         };
@@ -938,9 +993,11 @@ impl Controller {
                         ui.set_sm_confirm_delete(false);
                         ui.set_sm_confirm(0);
                         ui.set_sm_scan_form(false);
-                        ui.set_sm_selected(index);
                         ui.set_sm_page(PAGE_CONNECTION);
-                        if index < 0 {
+                        if index == -4 {
+                            ui.invoke_sm_local_add_requested();
+                        } else if index < 0 {
+                            ui.set_sm_selected(index);
                             c2.set_selection(Selection::New);
                             c2.reload_selection();
                         } else {
@@ -1016,11 +1073,18 @@ impl Controller {
         let chinese = self.chinese.load(Ordering::Acquire);
         match self.selection() {
             Selection::New => {}
-            Selection::Local => {
+            Selection::Local | Selection::LocalLibrary(_) => {
                 let (path, default_database) = {
                     let config = self.config.lock().unwrap();
                     (
-                        config.paths.database.clone(),
+                        config
+                            .local_library(
+                                self.selected_local_id()
+                                    .as_deref()
+                                    .unwrap_or(DEFAULT_LOCAL_LIBRARY_ID),
+                            )
+                            .map(|library| library.database.clone())
+                            .unwrap_or_else(|| config.paths.database.clone()),
                         config.data_root().join("library.db"),
                     )
                 };
@@ -1038,7 +1102,31 @@ impl Controller {
                     )
                     .into(),
                 );
-                self.activate_data_source(ActiveSource::Local);
+                // An explicit server activation can still be using the original
+                // local provider while its sync waits. Cancelling that choice must
+                // retain the provider and search context, rather than reopen it.
+                let current = self.provider();
+                #[cfg(windows)]
+                let current_path = crate::controller::same_path(&path, current.database_path());
+                #[cfg(not(windows))]
+                let current_path = path == current.database_path();
+                if !self.remote_read_only() && current_path {
+                    self.activate_data_source(ActiveSource::Local);
+                    return;
+                }
+                // Startup and ordinary server syncs need immediate cancellation
+                // too, even when they did not establish a source-changing gate.
+                if let Err(error) = self.begin_local_library_change(&ui) {
+                    ui.set_ds_message(error.into());
+                    return;
+                }
+                self.run_library_operation(LibraryOperation::LocalSource(Box::new(
+                    LocalSourceRequest::Switch {
+                        id: self
+                            .selected_local_id()
+                            .unwrap_or_else(|| DEFAULT_LOCAL_LIBRARY_ID.into()),
+                    },
+                )));
             }
             Selection::Profile(id) => {
                 if ui.get_ds_dirty() {
@@ -1057,6 +1145,10 @@ impl Controller {
     /// directories are never deleted with it.
     fn delete_selected(self: &Arc<Self>) {
         let Some(ui) = self.ui.upgrade() else { return };
+        if self.selected_local_id().is_some() {
+            self.delete_local_selected(&ui);
+            return;
+        }
         let Selection::Profile(id) = self.selection() else {
             return;
         };

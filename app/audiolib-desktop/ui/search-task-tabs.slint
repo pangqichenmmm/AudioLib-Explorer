@@ -70,13 +70,23 @@ export component SearchTaskTab inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-action-default => { if root.enabled { root.selected(); } }
     forward-focus: task-focus;
-    background: root.active ? Theme.panel : (task-hit.has-hover ? Theme.raised : Theme.trough);
-    border-top-left-radius: 7px * Theme.ui-scale;
-    border-top-right-radius: 7px * Theme.ui-scale;
+    background: Theme.modern-style
+        ? (root.active ? Theme.tab-surface : (task-hit.has-hover ? Theme.control-surface : Theme.trough))
+        : (root.active ? Theme.panel : (task-hit.has-hover ? Theme.raised : Theme.trough));
+    border-top-left-radius: (Theme.modern-style ? 5px : 7px) * Theme.ui-scale;
+    border-top-right-radius: (Theme.modern-style ? 5px : 7px) * Theme.ui-scale;
     border-width: task-focus.has-focus ? 1px : 0px;
     border-color: Theme.accent;
     opacity: root.enabled ? 1 : 0.45;
-    Rectangle { height: 2px * Theme.ui-scale; y: parent.height - self.height; background: root.active ? Theme.accent : Theme.border; }
+    Rectangle {
+        height: Theme.modern-style ? (root.active ? 3px * Theme.ui-scale : 1px) : 2px * Theme.ui-scale;
+        y: parent.height - self.height;
+        background: Theme.modern-style ? (root.active ? transparent : Theme.border) : (root.active ? Theme.accent : Theme.border);
+        if Theme.modern-style && root.active: Image {
+            width: parent.width; height: parent.height; source: Theme.tab-indicator;
+            image-fit: fill; accessible-role: none;
+        }
+    }
     if !root.searched: Text {
         x: 12px * Theme.ui-scale; width: max(0px, parent.width - 52px * Theme.ui-scale); height: parent.height;
         text: root.name; color: root.active ? Theme.ink : Theme.dim; font-size: Theme.font(12);

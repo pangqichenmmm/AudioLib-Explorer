@@ -489,7 +489,7 @@ async fn old_client_is_refused_before_preparation_and_modern_client_syncs_actual
         let outcome =
             sync_library(&client, &cache, &mut |_| {}, &AtomicBool::new(false), false).unwrap();
         assert!(outcome.downloaded);
-        assert_eq!(outcome.state.schema_version, 6);
+        assert_eq!(outcome.state.schema_version, audiolib_db::SCHEMA_VERSION);
         let format = outcome.state.format.as_ref().unwrap();
         assert_eq!(format.source.as_ref(), Some(&format.local));
         assert_eq!(format.generation, 0);

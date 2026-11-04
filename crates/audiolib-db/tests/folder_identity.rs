@@ -1,7 +1,7 @@
 // crates/audiolib-db/tests/folder_identity.rs
 //! Stored folder lookup keeps source path identity independent of the reader's OS.
 mod support;
-use audiolib_core::DataProvider;
+use audiolib_core::{AlbumKind, DataProvider, Error};
 use audiolib_db::{SqliteProvider, indexed_paths_equal};
 use std::path::Path;
 
@@ -26,6 +26,63 @@ fn indexed_comparison_preserves_source_case_and_posix_backslashes() {
     ] {
         assert!(!indexed_paths_equal(left, right), "{left} == {right}");
     }
+}
+
+#[test]
+fn snapshot_album_semantic_lookup_uses_stored_paths_without_scanner() {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("albums.db");
+    let local = SqliteProvider::open(&database).unwrap();
+    let conn = support::connection(&database).unwrap();
+    for (id, path) in [
+        (1, "/offline/SFX/Wind"),
+        (2, "/offline/SFX/wind"),
+        (3, "C:/Offline/Sounds/Boom"),
+        (4, "C:/Offline/Duplicate/Wind"),
+        (5, r"c:\Offline\Duplicate\Wind"),
+    ] {
+        conn.execute(
+            "INSERT INTO folders(id,folder_path,folder_name) VALUES(?1,?2,'sounds')",
+            rusqlite::params![id, path],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO folder_closure VALUES(?1,?1,0)", [id])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO audio_files(id,file_path,filename,folder_id) VALUES(?1,?2,'sound.wav',?1)",
+            rusqlite::params![id, format!("{path}/sound.wav")],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    drop(local);
+    let original = std::fs::read(&database).unwrap();
+    let snapshot = SqliteProvider::open_read_only(&database).unwrap();
+    let provider: &dyn DataProvider = &snapshot;
+    for (path, id) in [
+        ("/offline/SFX/Wind", 1),
+        ("/offline/SFX/wind", 2),
+        (r"c:\offline\sounds\BOOM", 3),
+    ] {
+        let album = provider
+            .find_album_by_semantic(AlbumKind::Folder, None, Some(path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(album.folder_id, Some(id));
+        assert_eq!(provider.get_audio(id).unwrap().album_id, Some(album.id));
+    }
+    assert!(
+        provider
+            .find_album_by_semantic(AlbumKind::Folder, None, Some("/offline/sfx/wind"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        provider.find_album_by_semantic(AlbumKind::Folder, None, Some("C:/Offline/Duplicate/Wind")),
+        Err(Error::Validation(_))
+    ));
+    drop(snapshot);
+    assert_eq!(std::fs::read(&database).unwrap(), original);
 }
 
 #[test]

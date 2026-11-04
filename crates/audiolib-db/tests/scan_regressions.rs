@@ -287,7 +287,7 @@ fn successful_probe_removes_absent_bwf_ixml_and_fts_but_preserves_user_data() {
     audiolib_db::register_library_functions(&conn).unwrap();
     conn.execute("UPDATE audio_files SET user_rating=5 WHERE id=?1", [id])
         .unwrap();
-    conn.execute("UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.plugin_private','keep','$.bwf_plugin_private','independent') WHERE id=?1",[id]).unwrap();
+    conn.execute("UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.plugin_private','keep','$.bwf_plugin_private','independent') WHERE id=?1",[id]).unwrap();
     fs::write(&file, b"damaged file").unwrap();
     let failed = service
         .scan(

@@ -6,21 +6,19 @@
 #   docker build -f server/deploy/docker/Dockerfile -t audiolib-server .
 #   docker build -f server/deploy/docker/Dockerfile --build-arg WITH_FFMPEG=false -t audiolib-server:slim .
 #
-# Build requirements (installed below): build-essential, pkg-config, clang + libclang-dev,
-# libasound2-dev. The ALSA headers are only needed because audiolib-audio currently always
-# pulls in cpal; the server never opens an audio device. Once audiolib-audio has a
-# `playback` cargo feature that the server builds without, libasound2-dev (and pkg-config)
-# can be dropped from the builder stage.
+# This is the local source-build example. Official release images use
+# Dockerfile.release with an accepted public Linux package, including licenses.
+# .dockerignore excludes Git metadata and local runtime data; source-image health
+# therefore reports commit "unknown". Use the release packaging tool for provenance.
 ARG RUST_VERSION=1.97.1
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential pkg-config clang libclang-dev libasound2-dev git \
+      build-essential pkg-config clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-# Keep .git in the build context so /health reports the real commit (else "unknown").
 COPY . .
 # The repository's .cargo/config.toml pins a Windows default target, so pass the host
 # target explicitly (also makes the output path predictable).
@@ -34,7 +32,7 @@ FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 # distribution's ffmpeg is usually a GPL build; set WITH_FFMPEG=false for a slim image.
 ARG WITH_FFMPEG=true
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl libasound2 \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && if [ "$WITH_FFMPEG" = "true" ]; then apt-get install -y --no-install-recommends ffmpeg; fi \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin audiolib \
@@ -45,7 +43,8 @@ USER audiolib
 WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 8790
-ENV AUDIOLIB_SERVER_CONFIG=/config/config.toml
+ENV AUDIOLIB_SERVER_CONFIG=/config/config.toml \
+    AUDIOLIB_UPDATE_DISABLE=1
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8790/api/v1/health | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' || exit 1
 ENTRYPOINT ["audiolib-server"]

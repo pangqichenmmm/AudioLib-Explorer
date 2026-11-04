@@ -147,7 +147,7 @@ pub fn decode_base64(text: &str) -> Result<Vec<u8>> {
         return Err(invalid());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == bytes.len() / 4;
         let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
         if padding > 2 || (padding > 0 && !last) {
@@ -170,7 +170,9 @@ pub fn decode_base64(text: &str) -> Result<Vec<u8>> {
 
 fn int16_le(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
         .collect()
 }

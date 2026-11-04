@@ -1,8 +1,15 @@
 # AudioLib 远程 API（v1，讨论稿）
 
-> 状态：讨论稿。里程碑 1（`/health`、`/library`、`/library/snapshot`、`/roots`）和里程碑 2（`/audio/{id}`、`/audio/{id}/stream`，以及启动期 `/health` 状态 + 503 `UNAVAILABLE`）、里程碑 3（metadata 写入：`PATCH /audio/{id}/metadata`、`POST /audio/metadata/batch`、`POST /audio/{id}/plays`，§6.3）以及波形（§9）、试听预览 `/audio/{id}/preview`（§8.1）、远程扫描 `/scans`（§6.6）、历史列表 `/history/...`（§6.7）、从库中移除记录/文件夹 `POST /audio/remove`、`DELETE /folders/{id}`（§6.8）以及库管理权限 `manage_mode` + `GET /capabilities`（§6.9）及客户端远程目录浏览与根目录新增/改路径/删除（§6.10）已在 `server/audiolib-server` 实现；其余端点仍为计划，等服务端确认、用户拍板后再定稿。改任何路由或字段先在「AudioLib 开发组」群里通知对方。
+> 状态：讨论稿。里程碑 1（`/health`、`/library`、`/library/snapshot`、`/roots`）和里程碑 2（`/audio/{id}`、`/audio/{id}/stream`，以及启动期 `/health` 状态 + 503 `UNAVAILABLE`）、里程碑 3（metadata 写入：`PATCH /audio/{id}/metadata`、`POST /audio/metadata/batch`、`POST /audio/{id}/plays`，§6.3）以及波形（§9）、试听预览 `/audio/{id}/preview`（§8.1）、内嵌封面 `/audio/{id}/artwork`（§8.2）、远程扫描 `/scans`（§6.6）、历史列表 `/history/...`（§6.7）、从库中移除记录/文件夹 `POST /audio/remove`、`DELETE /folders/{id}`（§6.8）以及库管理权限 `manage_mode` + `GET /capabilities`（§6.9）及客户端远程目录浏览与根目录新增/改路径/删除（§6.10）已在 `server/audiolib-server` 实现；其余端点仍为计划，等服务端确认、用户拍板后再定稿。改任何路由或字段先在「AudioLib 开发组」群里通知对方。
 
 ## 1. 目标与边界
+
+当前 0.8.1 候选使用 schema 8 / `ale-s8-cld1-t3-m2-p1-a1`（`album_entities: 1`），
+专辑封面接口见 §8.2。新库、迁移输出及新服务端快照的 Metadata 物理列保持原始
+JSON TEXT，压缩暂缓；外层快照 zstd 传输保留。客户端与服务器须配套升级。
+旧实验 `a1-z1` 仅保留严格只读兼容，不作为可写目标。旧快照只在客户端自有副本迁移，
+源格式与投影格式分别保存。详见[共享专辑与存储](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md)。
+下段是此前续传迭代的历史身份和验收范围。
 
 当前续传迭代基于 main `d64c0a7`，程序版本为 `0.6.0`，保留 schema 6 / p1、共享格式协商和受保护迁移。固定快照及 Range 协议见 §6.1；本轮验证见 [Rust 验证报告](../Rust_Validation.md)。生产服务器不在本轮部署范围内，工作库没有被验收脚本打开。以下链接保留此前数据库迭代的设计与历史证据：
 [方案 B 存储设计](Search_Storage_B.md)、
@@ -61,7 +68,7 @@ CR、修复及历次隔离证据见 [方案 B CR](Search_Storage_B_CR.md)；p1�
 | `codec=pcm` 预览遇到不支持的文件（非 WAV、ADPCM 等，文件头损坏或截断，或采样率无法按 `sr` 整数倍抽取，§8.1） | 415 | `PREVIEW_UNSUPPORTED_FORMAT` |
 | 远程不支持的操作 | 501 | `UNSUPPORTED` |
 | 库尚未打开（启动中）或打开失败、正在重试（§6.2） | 503 | `UNAVAILABLE`（附 `Retry-After: 5`）；**只用于这一种情况** |
-| 音频流/预览/波形所在的库根目录、或 `POST /scans` 要扫描的根离线或暂时无响应（§6.4、§6.6） | 503 | `ROOT_OFFLINE`（附 `Retry-After: 5`，`message` 为 `Library root "<根名>" is offline: <原因>`） |
+| 音频流/预览/波形/封面对应文件所在的库根目录、或 `POST /scans` 要扫描的根离线或暂时无响应（§6.4、§6.6、§8.2） | 503 | `ROOT_OFFLINE`（附 `Retry-After: 5`，`message` 为 `Library root "<根名>" is offline: <原因>`） |
 | 音频流并发达到上限 `max_streams`（§8），预览（`pcm`/`flac`）并发达到独立的上限 `max_previews`，或 `flac` 预览等待 0.5 秒仍无转码名额 `max_transcodes`（§8.1）；`POST /waveforms` 同时处理的请求超过 4 个（§9.1） | 503 | `BUSY`（附 `Retry-After: 1`，几种情况形状完全相同；快照并发仍为 409 `BUSY`） |
 | 快照还在准备、等待超过 `snapshot_wait_secs`（§6.1） | 503 | `BUSY`（附 `Retry-After: 5`；准备在后台继续，重试即可拿到；与音频流 `BUSY` 同码，靠 `Retry-After` 和端点区分） |
 | `flac` 预览所需的 ffmpeg 不存在或无法启动（§8.1） | 503 | `TRANSCODER_UNAVAILABLE`（不带 `Retry-After`） |
@@ -74,11 +81,11 @@ remote 端把 `error_code` 还原成对应的 `Error` 变体，保证 GUI 现有
 - `BUSY`（503）：音频流/预览名额已满，按 `Retry-After` 稍后重试（§8、§8.1）。
 - `TRANSCODER_UNAVAILABLE`：只出现在 `/audio/{id}/preview?codec=flac` 上，服务端没有可用的 ffmpeg；重试无用，改用 `codec=pcm` 或 `/stream`。
 - `UNAVAILABLE`：**整个库**暂不可用（服务端启动中或开库失败正在重试，§6.2），任何需鉴权的端点都可能返回；按“服务器暂不可用、稍后重试”处理（类似连接失败，可沿用离线缓存）。
-- `ROOT_OFFLINE`：只出现在 `/audio/{id}/stream`、`/audio/{id}/preview`、`/audio/{id}/waveform` 和 `POST /scans`（§6.6）上（`POST /waveforms` 不整体返回它，而是逐项 `status: "root_offline"`，§9.1），表示**该文件所在（或要扫描）的库根**离线或暂时无响应；库本身可用（元数据、快照、写入照常），客户端可显示 `message` 中的原因、查看 `/roots` 的 `status`，或用 `POST /roots/{name}/check` 立即重查（§6.4）。
+- `ROOT_OFFLINE`：只出现在 `/audio/{id}/stream`、`/audio/{id}/preview`、`/audio/{id}/waveform`、`/audio/{id}/artwork`（§8.2）和 `POST /scans`（§6.6）上（`POST /waveforms` 不整体返回它，而是逐项 `status: "root_offline"`，§9.1），表示**该文件所在（或要扫描）的库根**离线或暂时无响应；库本身可用（元数据、快照、写入照常），客户端可显示 `message` 中的原因、查看 `/roots` 的 `status`，或用 `POST /roots/{name}/check` 立即重查（§6.4）。
 
 500 与 507 的 `message` 使用概括文字，原始路径和内部诊断只写服务端日志；503 的 `message` 和 `/health` 不含路径（`UNAVAILABLE` 为固定文字，`ROOT_OFFLINE` 为根名 + 原因）。
 
-连接与超时：服务端只说 HTTP/1.1；连接须在 10 秒内发完请求头（空闲的 keep-alive 连接同样在 10 秒后关闭），除 `/library`、`/library/snapshot`、`/audio/{id}/stream`、`/audio/{id}/preview`、`/audio/{id}/waveform` 、`POST /scans`、`PATCH /roots/{name}`、`DELETE /roots/{name}` 外的端点 30 秒内未完成返回 408 `TIMEOUT`（这些端点不受通用 30 秒上限，见 §6.4、§6.6、§6.10；`/library` 通常毫秒级返回，仅在百万级库且无统计缓存时的第一次请求可能等待统计计算；`POST /waveforms` 受 30 秒上限，自身有 2 秒 Metadata 预算，§9.1）；响应还有数据要发但客户端连续 60 秒一个字节都不收（休眠、断网，或拿着响应不读）时，服务端断开该连接并释放它占用的名额；服务端停止时最多等 10 秒让进行中的请求结束，之后断开剩余连接（客户端看到连接中断或响应体不完整，按可重试错误处理）。
+连接与超时：服务端只说 HTTP/1.1；连接须在 10 秒内发完请求头（空闲的 keep-alive 连接同样在 10 秒后关闭），除 `/library`、`/library/snapshot`、`/audio/{id}/stream`、`/audio/{id}/preview`、`/audio/{id}/waveform`、`/audio/{id}/artwork`、`POST /scans`、`PATCH /roots/{name}`、`DELETE /roots/{name}` 外的端点 30 秒内未完成返回 408 `TIMEOUT`（这些端点不受通用 30 秒上限，见 §6.4、§6.6、§6.10；`/library` 通常毫秒级返回，仅在百万级库且无统计缓存时的第一次请求可能等待统计计算；`POST /waveforms` 受 30 秒上限，自身有 2 秒 Metadata 预算，§9.1）；响应还有数据要发但客户端连续 60 秒一个字节都不收（休眠、断网，或拿着响应不读）时，服务端断开该连接并释放它占用的名额；服务端停止时最多等 10 秒让进行中的请求结束，之后断开剩余连接（客户端看到连接中断或响应体不完整，按可重试错误处理）。
 
 ### 2.2 鉴权模式与 token
 
@@ -95,7 +102,7 @@ remote 端把 `error_code` 还原成对应的 `Error` 变体，保证 GUI 现有
 - **同机规则**：只有**其他机器**上的局域网对端才算局域网直连。以下对端一律按外部请求处理（需要 token，`/admin` 返回 403 `ADMIN_LAN_ONLY`）：回环地址 `127.0.0.0/8`、`::1` 及 IPv4 映射的回环地址（`::ffff:127.x.x.x`）；以及 TCP 对端 IP 等于该连接本地 socket 地址 IP 的连接（即本机通过自己的局域网 IP 访问自己，如对端与本地都是服务端的局域网 IP）。原因：与服务端同机运行的反向代理（如 Lucky）把公网流量转发到 8790 时，连接来自回环或本机局域网 IP；即使反代没有加转发头，这些请求也不能免 token。因此在服务端所在的 Mac 上用 `localhost` / `127.0.0.1` / 本机 IP 访问 API 时需要带 token（`GET /health` 仍然免 token），管理页 `/admin` 需从局域网内的另一台设备打开。
 - 有效 token：管理页生成的 token（未撤销），或环境变量 `AUDIOLIB_SERVER_TOKEN`（`token_env` 可改名；部署时通常由 systemd `EnvironmentFile` 或启动脚本导出它，所以它也一直有效）。生成的 token 形如 `al_` + 64 个十六进制字符；服务端只保存 SHA-256 哈希（常量时间比较），明文只在生成时显示一次。撤销立即生效。
 - 认证头格式：`Authorization: Bearer <token>`（`Bearer` 不区分大小写）。`Basic` 等其他方案视为没有 token。
-- 错误：需要 token 而缺失 → 401 `UNAUTHORIZED`（`message`：`A bearer token is required for access from outside the LAN`；`all` 模式为 `A valid bearer token is required`）；token 错误或已撤销 → 401 `UNAUTHORIZED`（`message`：`The bearer token is invalid or has been revoked`）。都带 `WWW-Authenticate: Bearer realm="audiolib"`。客户端按状态码和 `error_code` 判断，不要匹配 `message`。没有新增错误码（`TOKEN_REQUIRED` / `TOKEN_INVALID` 不存在）。
+- 错误：需要 token 而缺失 → 401 `UNAUTHORIZED`（`message`：`A bearer token is required: this request is not from a trusted direct LAN peer`；`all` 模式为 `A valid bearer token is required`）；token 错误或已撤销 → 401 `UNAUTHORIZED`（`message`：`The bearer token is invalid or has been revoked`）。都带 `WWW-Authenticate: Bearer realm="audiolib"`。客户端按状态码和 `error_code` 判断，不要匹配 `message`。没有新增错误码（`TOKEN_REQUIRED` / `TOKEN_INVALID` 不存在）。
 - token 的“最近使用时间”最多每分钟记一次（避免频繁写盘），在管理页显示。
 - **Host 防护**：`trust_lan_peers = true`（默认）时，来自局域网直连对端（socket 对端 IP 为私有或链路本地地址且不是本机，含 IPv4 映射的 IPv6，且请求不带任何转发头）的免 token 请求一律放行（回环和同机对端除外，见“同机规则”），不检查 `Host`——局域网客户端可以用 IP、`<服务器主机名>.local` 等 LAN 名称，或经 NAT 回环 / split DNS 用公网域名访问。其他免 token 请求（`auth_mode = "off"` 下的非局域网对端）必须携带单一合法 `Host`，主机为 IP、LAN 名称，或已配置 `public_url` / `lan_url` 的主机名；否则 403 `HOST_FORBIDDEN`。`external` 模式下非局域网或带转发头的请求仍需 token（401）。有效 bearer 可访问其他合法主机名。注意：局域网内浏览器因此不再受 API 层 DNS rebinding 防护（`/admin` 仍单独校验 Host）；若局域网不可信，请使用 `auth_mode = "all"` 或 `trust_lan_peers = false`。
 - **隐藏来源的部署**：`trust_lan_peers = false` 将全部对端按外部请求处理，并关闭免密码 `/admin`；同时使用 `auth_mode = "all"`。Docker Desktop、rootless 容器、SNAT 和未可靠保留来源的反代必须使用此配置，通过 TOML 管理。示例容器采用此策略，仅映射宿主机 `127.0.0.1:8790`。
@@ -279,7 +286,7 @@ audiolib.example.com:8443 {
 
 ### 3.1 历史：快照 schema 3 → 5
 
-以下记录已发布 v5 的演进与兼容行为。当前开发分支为 schema 6 / `ale-s6-cld1-t3-m2-p1`，读取边界为 3..=6，并核对全部 feature；v6 的备份、分批断点恢复、授权退役及部署顺序以[升级契约](Schema_V6_Iteration.md)和[兼容矩阵](Library_Migration_Compatibility.md)为准。下列旧索引、单事务升级与旧客户端写入描述不覆盖 v6 的实际格式准入。
+以下记录已发布 v5 的演进与兼容行为。当前源码为 schema 7 / `ale-s7-cld1-t3-m2-p1`，读取边界为 3..=7，并核对全部 feature；v6 的备份、分批断点恢复、授权退役及部署顺序以[升级契约](Schema_V6_Iteration.md)和[兼容矩阵](Library_Migration_Compatibility.md)为准，v7 的派生专辑和封面边界见[封面契约](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Artwork.md)。下列旧索引、单事务升级与旧客户端写入描述不覆盖 v6/v7 的实际格式准入。
 
 - `SCHEMA_VERSION` = **5**（`crates/audiolib-db/src/schema.rs`，由 `audiolib_db::SCHEMA_VERSION` 导出）。`MIN_SNAPSHOT_SCHEMA_VERSION` = **3**（同文件，客户端的 `MIN_SNAPSHOT_SCHEMA` 直接引用它，不重复定义）。`GET /library` 的 `schema_version` 与快照响应头 `X-Schema-Version` 现在都是 `5`。
 - v4 **只新增索引**：不改任何表、列、触发器、FTS，不改行数据，所以 v3 与 v4 用同一套查询；`/library` 的 `stats` 条件由 `COALESCE(missing,0)=0` 改为 `missing=0`（`missing` 列是 `NOT NULL DEFAULT 0`），可命中部分索引。
@@ -370,6 +377,7 @@ audiolib.example.com:8443 {
 | ✅ | POST | `/waveforms/pregeneration/pause` · `/resume` | 手动暂停 / 继续预生成（受 `manage_mode` 限制） | 无请求体 | 同 `/waveforms/status`，见 §9.2 |
 | ✅ | GET / PATCH | `/settings` | 客户端可读写的服务端设置（PATCH 受 `manage_mode` 限制） | PATCH `{ "pregenerate_list_waveforms": bool \| null }` | `{ "pregenerate_list_waveforms", "pregenerate_list_waveforms_source", "can_change" }`，见 §9.2 |
 | ✅ | GET / HEAD | `/audio/{id}/preview?codec=pcm\|flac&sr=&bits=&ch=[&t=]` | 低带宽试听预览 | 见 §8.1 | `pcm`：进程内生成的 WAV（有长度，可 Range）；`flac`：ffmpeg 实时转码的分块 FLAC 流 |
+| ✅ | GET / HEAD | `/audio/{id}/artwork[?side=]` | 内嵌封面（按需读文件，不入库） | `side` 可省略，1..=512 | `image/jpeg` 或 `image/png`；无封面 / 文件缺失 / 提取失败 404，见 §8.2 |
 
 管理页 `/admin` 和 `/admin/api/...` 不在 `/api/v1` 下，只供局域网浏览器使用，见 §2.3。
 
@@ -505,7 +513,7 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 
 库根目录通常在 NAS 上，NAS 硬盘休眠后唤醒要 20–30 秒甚至更久。服务端因此遵守：
 
-1. **只有 `/audio/{id}/stream`（GET/HEAD，含 `download=1`）、`/audio/{id}/preview`（GET/HEAD）和 `/audio/{id}/waveform` 会访问根目录下的文件**，而且没有任何时间上限：不受 30 秒 408 限制，打开/stat/首次读取等多久都行（≥ 90 秒没问题）；唯一的超时是 10 秒的请求头读取，只针对客户端发送请求头。打开文件在 tokio 的阻塞线程池里进行，不占用异步运行时；客户端在等待期间断开时，处理函数连同它占用的并发名额（`max_streams` / `max_previews` / 波形名额）立即释放，即使阻塞的 `open()` 本身还卡着（例如 macOS 的“网络宗卷”授权弹窗未处理时）。这些卡住的打开会在服务端登记：每个根最多同时存在 4 × (`max_streams` + `max_previews`) 个未结束的打开（流和预览的打开共用这个上限），超出时新请求直接返回 503 `ROOT_OFFLINE`（`…earlier file opens have not finished yet`），所以卡住的线程有上限。打开超过 10 秒时服务端日志记一条 WARN（含根名和文件路径），结束时若总共超过 10 秒再记一条。§9.1–§9.2：`POST /waveforms` 只对文件做 `stat`（有 2 秒预算，不读音频数据，根缓存为 `offline` 时完全不访问）；列表缩略波形的后台工作线程会读取音频数据，同样没有时间上限。
+1. **只有 `/audio/{id}/stream`（GET/HEAD，含 `download=1`）、`/audio/{id}/preview`（GET/HEAD）、`/audio/{id}/waveform` 和 `/audio/{id}/artwork`（GET/HEAD，§8.2）会访问根目录下的文件**，而且没有任何时间上限：不受 30 秒 408 限制，打开/stat/首次读取等多久都行（≥ 90 秒没问题）；唯一的超时是 10 秒的请求头读取，只针对客户端发送请求头。打开文件在 tokio 的阻塞线程池里进行，不占用异步运行时；客户端在等待期间断开时，处理函数连同它占用的并发名额（`max_streams` / `max_previews` / 波形名额）立即释放，即使阻塞的 `open()` 本身还卡着（例如 macOS 的“网络宗卷”授权弹窗未处理时）。这些卡住的打开会在服务端登记：每个根最多同时存在 4 × (`max_streams` + `max_previews`) 个未结束的打开（流和预览的打开共用这个上限），超出时新请求直接返回 503 `ROOT_OFFLINE`（`…earlier file opens have not finished yet`），所以卡住的线程有上限。打开超过 10 秒时服务端日志记一条 WARN（含根名和文件路径），结束时若总共超过 10 秒再记一条。§9.1–§9.2：`POST /waveforms` 只对文件做 `stat`（有 2 秒预算，不读音频数据，根缓存为 `offline` 时完全不访问）；列表缩略波形的后台工作线程会读取音频数据，同样没有时间上限。
 2. **`/health`、`/library`、`/library/snapshot`、`/roots`、`/audio/{id}`、`/history/...`、`/scans/...` 的查询和控制端点以及 metadata 写入端点从不访问根目录**（只读写本机磁盘上的库文件和内存缓存），NAS 休眠或离线时照常快速响应。`POST /scans`（§6.6）是例外：扫描本身就要读根目录，它在独立后台线程里进行，没有时间上限。服务端启动时也不访问根目录；根检查线程在库打开成功之后才启动。
 3. **根状态由后台线程检查并缓存**，`/roots` 只读缓存。每个根一个检查线程：启动时、每 `root_check_secs` 秒（默认 300）、以及有请求要求重查时（见下）各检查一次。检查只做根目录的 `realpath` + `stat`（不列目录、不读文件），**不会为保持唤醒而轮询**；若连这个也不想要，把 `root_check_secs` 调大（最大 86400）。进行中的文件打开与进行中的检查同等对待：自上次成功以来超过 5 秒未完成 → `waking`，超过 `root_offline_secs` → `offline`；在此之后的一次成功（检查或打开）立即恢复 `online`。
 
@@ -520,7 +528,7 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 
 - `checked_at`：最近一次完成的检查（或音频流打开）的 Unix 秒，启动后尚未完成时为 `null`。
 - 离线后无需人工干预：任何一次检查或音频流打开成功都会立刻恢复 `online`。
-- 根缓存为离线时：`/audio/{id}/stream`（**GET 和 HEAD 都一样**，所以客户端可以用一个 `HEAD` 触发重查）和 `/audio/{id}/waveform` 先做一次**有界的即时重查**（最多等约 2 秒，由检查线程执行）：卷已恢复就直接正常响应（不会先收到一次 503）；仍离线或 2 秒内没有结论则返回 503 `ROOT_OFFLINE` + `Retry-After: 5`，`message` 如 `Library root "SFX_Main" is offline: Root directory not found (volume not mounted?)`，未完成的检查在后台继续。重查请求会合并：每个根同一时间只有一个检查在跑，并发请求等同一个结果，不会形成检查风暴。
+- 根缓存为离线时：`/audio/{id}/stream`（**GET 和 HEAD 都一样**，所以客户端可以用一个 `HEAD` 触发重查）、`/audio/{id}/waveform` 和 `/audio/{id}/artwork` 先做一次**有界的即时重查**（最多等约 2 秒，由检查线程执行）：卷已恢复就直接正常响应（不会先收到一次 503）；仍离线或 2 秒内没有结论则返回 503 `ROOT_OFFLINE` + `Retry-After: 5`，`message` 如 `Library root "SFX_Main" is offline: Root directory not found (volume not mounted?)`，未完成的检查在后台继续。重查请求会合并：每个根同一时间只有一个检查在跑，并发请求等同一个结果，不会形成检查风暴。
 - **`POST /roots/{name}/check`**：同样的有界即时重查（约 2 秒），返回该根更新后的 `/roots` 条目。2 秒内没有结论时返回当时的状态，检查在后台继续：之前在线的根显示 `waking`，之前离线的根保持 `offline`（直到某次检查成功），首次检查未完成为 `checking`。未知根名返回 404 `NOT_FOUND`。适合客户端“重试”按钮。
 - 文件打开失败时，服务端会顺带检查该根：根本身不可达则标记离线并返回 503 `ROOT_OFFLINE`；根可达但文件访问遇到超时/连接断开/网络文件句柄失效（`ETIMEDOUT`、`ENOTCONN`、`ECONNRESET`、`ESTALE` 等）时同样返回 503 `ROOT_OFFLINE`（`Root is not answering reliably: …`，可重试，不改根状态）；根可达且文件不存在才按文件缺失返回 404，其余 I/O 错误（如 `EIO`）为 500 `IO`。**根离线或变慢都不会把库里的文件标为 missing**。
 - 扫描器遵守同样的规则：根目录不存在/不可读时扫描直接失败，不改任何记录；扫描途中目录读取出错（例如卷断开）时不做 missing 对账；全量扫描遇到**完全为空**的根目录（只有 `.DS_Store` 等隐藏文件也算空；典型的未挂载挂载点）也不做 missing 对账（代价：用户真的删光了根目录下所有文件和文件夹时，记录不会被标 missing，直到根目录里重新有内容后再全量扫描；这种情况下流端点对这些文件返回 404）；慢只会让扫描变慢，扫描本身没有超时。
@@ -768,6 +776,9 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 | `list_waveforms` | 支持 §9.1 的 `POST /waveforms`：`{ "version": 1, "buckets": [128], "max_ids": 200, "encoding": "i16le-minmax-base64" }`；缺字段 = 不支持 |
 | `pregenerate_list_waveforms` | 当前生效的列表缩略波形预生成开关（只读），修改用 `PATCH /settings`，见 §9.2 |
 | `list_waveform_jobs` | 支持 §9.5 的列表波形缓存管理任务与 `list_waveform_rate` 设置：`{ "version": 1, "modes": ["missing", "rebuild", "failed"], "rate_setting": true }`；缺字段 = 不支持（库已打开但 `waveforms.db` 无法打开时也不声明，§9.5.7） |
+| `compatibility.features.album_artwork` | 可选 feature，修订 ≥ 1 表示支持 §8.2 的 `GET /audio/{id}/artwork`。键名就是 `album_artwork`。旧服务端没有该键（或修订不同）时客户端不要请求封面；缺失只关闭这一功能，不拒绝同步 |
+| `compatibility.features.album_entity_artwork` | 可选 API feature，修订 1 表示支持 §8.2 的 `GET` / `HEAD /albums/{id}/artwork`（共享专辑实体封面，须带 `X-AudioLib-Library-Id` 和 `X-AudioLib-Album-Namespace`）。缺失时客户端保留按音频的 `/audio/{id}/artwork`；缺失只关闭这一功能，不拒绝同步 |
+| `compatibility.features.album_folder_artwork` | 可选 API feature，修订 1 表示 `/albums/{id}/artwork` 支持 `folder_id` 或 `unassigned_directory` 的直属目录过滤及身份回显；不改变数据库格式、schema 或迁移要求 |
 
 - §9.2 的 `PATCH /settings` 和 `POST /waveforms/pregeneration/pause|resume` 同样受 `manage_mode` 限制（`GET /settings`、`GET /waveforms/status`、`POST /waveforms` 不受限制）。
 - 设置随时可能在管理页被改；`can_manage` 只是提示，管理端点仍可能返回 403 `MANAGE_FORBIDDEN`，客户端按错误码处理即可。旧服务端没有该端点（404）时按“只读、不提供管理功能”处理。
@@ -891,6 +902,34 @@ SQLite 事务与根设置使用持久化恢复日志配对：`admin-settings.jso
 
 - 选择文件、根目录限制、404、根离线 503 `ROOT_OFFLINE` + `Retry-After: 5`（先即时重查约 2 秒）、慢速 NAS 唤醒（**无 30 秒时间上限**，不会 408）、文件在阻塞线程池中打开、打开超过 10 秒记 WARN：与 `/stream` 完全相同（§6.4）。文件缺失是 404，不会变成一个坏掉的流。
 - 以后可能的扩展：进程内（纯 Rust）FLAC 编码，替代 ffmpeg 并得到确定、可 Range 的 FLAC；Opus（`kbps=`，客户端需另配解码器）；转码结果缓存。
+
+### 8.2 专辑封面 `GET /albums/{id}/artwork` 与兼容音频端点
+
+schema 8 使用共享专辑实体：优先按 WAV Metadata 的 `library` 归组，缺失时按已登记根下的第一层文件夹归组。图片不进入 SQLite 或快照。详见[共享专辑与 Metadata 存储](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md)。
+
+- 新能力 `compatibility.features.album_entity_artwork >= 1` 表示支持 `GET` / `HEAD /albums/{id}/artwork`。`id` 是当前原生快照的专辑 ID，不能发送旧快照本地投影的 ID。
+- 必须带单个非空 `X-AudioLib-Library-Id` 和 `X-AudioLib-Album-Namespace`。库身份或 namespace 不符、namespace 缺失/空/重复，均在读取源文件前拒绝，返回 409 `LIBRARY_CHANGED`（库身份缺失仍为 `LIBRARY_ID_REQUIRED`）。
+- 从完整专辑按音频 ID 升序选最多 64 个未缺失成员，返回第一个有效内嵌封面，与选中 WAV、搜索条件和列表页无关。
+- 可选 `folder_id` 为已有目录的有符号 64 位 ID，限制为同专辑、该**直属目录**内的未缺失成员；先过滤目录，再按音频 ID 升序取最多 64 个候选，不包含子目录。该目录无图时为 404，不回退专辑其他目录。两种目录参数都省略时仍保持原全专辑语义。整数格式错误/溢出/重复为 400 `VALIDATION`，目录不存在为 404。
+- 对历史 `folder_id=NULL` 成员，可改用 `unassigned_directory=<源父目录 identity>`；只查同专辑、NULL folder、该直属源父目录的未缺失成员，同样在 LIMIT 前过滤。与 `folder_id` 互斥，同时出现或参数重复为 400；原始与规范化字符串均最多 4096 UTF-8 字节。允许空字符串，表示平铺相对文件名的父目录，不能当成全专辑。Windows drive/UNC 路径在所有平台上按其源语法规范化（drive 根 identity 为 `c:`），POSIX 根为 `/`，保留目录 entry 大小写和 POSIX 字面反斜杠；identity 不用于 OS 路径访问，不扫描文件系统寻找目录。
+- 客户端使用目录参数前必须确认 `compatibility.features.album_folder_artwork == 1`（并具备 `album_entity_artwork == 1`）；旧服务端可能忽略未知 query，不能把旧全专辑图片当成目录结果。原生 schema 8 来源缺少此能力时明确提示升级服务端，不能降级到 `/audio` 丢失 namespace 绑定；schema 3–7 来源仍可从自有快照先按直属目录筛候选，再调用兼容 `/audio` 端点，不能发送本地投影的 album ID。
+- 200 / 304 同时返回 `X-Library-Id`、`X-Album-Id`、`X-Album-Namespace`；客户端全部核对。ETag 和缓存绑定 namespace、专辑及候选成员版本。库恢复/替换后同数字 ID 不得串图。
+- 带目录上下文的 200 / 304 必须返回单个 `X-Album-Directory-Identity`：canonical directory 的 UTF-8 字节逐个编码为**小写 hex**（最多 8192 ASCII 字符，空目录对应空值）。`folder_id` 模式取当前 `get_folder.path` 的规范化值，并另回单个 `X-Album-Folder-Id` 的规范十进制 ID；NULL 模式回请求的 canonical parent，不回 folder ID。客户端核对库、namespace、专辑、目录 hex 及存在时的 folder ID；缺失、重复或不匹配时拒绝图片和 304 缓存命中，同 namespace 同 folder ID 路径变更也不得把新图片写入旧目录缓存。ETag 和代表图缓存绑定实际目录 identity；全专辑与目录图片即便字节相同也不共用 ETag。
+- `side`、图片预算、鉴权、并发名额、条件请求和错误处理沿用下面的音频端点规则。无有效图片为 404。
+
+#### 兼容 `GET /audio/{id}/artwork`
+
+此兼容端点保留按音频记录 id 读取内嵌封面的语义（ID3 `APIC`，复用 `audiolib_audio::probe_with_artwork`），不依赖专辑存储结构。客户端连接 schema 3–7 的服务器时只升级自有快照副本，再用固定的共享成员顺序调用此端点，不发送本地 album ID。**图片字节不写入主库或快照。**
+
+- 鉴权同 §2.2。支持 `GET` 和 `HEAD`。不受 30 秒上限；打开文件、根目录限制、根离线 503 `ROOT_OFFLINE`（先即时重查约 2 秒）与 `/stream` 相同（§6.4）。
+- **支持检测**：`GET /capabilities` 的 `compatibility.features.album_artwork` ≥ 1。旧服务端没有这个 feature 时客户端跳过请求，不要改去逐条探测一个不存在的端点。
+- 请求必须带单个非空 `X-AudioLib-Library-Id`，绑定当前快照的库身份；缺失、空值或重复为 409 `LIBRARY_ID_REQUIRED`，与当前服务器库不符为 409 `LIBRARY_CHANGED`，读取文件前即拒绝。200 和 304 返回 `X-Library-Id`，客户端核对一致后才缓存或显示。
+- 封面解码使用独立的两个并发名额，不占试听名额；已满时返回 503 `BUSY`、`Retry-After: 1`。
+- 查询参数 `side` 可省略。省略时返回嵌入的原始 JPEG 或 PNG。`side` 为 1..=512 的十进制整数时，把长边缩到不超过该值（保持比例，不放大）。其他值（含 `0`）为 400 `VALIDATION`。未知参数忽略。
+- 界限与桌面端封面解码相同：编码不超过 8 MiB，解码宽或高不超过 4096，解码分配不超过 64 MiB。只接受 `image/jpeg` 和 `image/png`。
+- 成功：200，`Content-Type: image/jpeg` 或 `image/png`，`Content-Length`，强 `ETag`（形如 `"aa2-<源文件 ETag 内容>-<side 的十六进制>"`，`side` 省略时为 `0`），`Cache-Control: private, no-cache`。确认封面存在后，`If-None-Match` 匹配（弱比较，或 `*`）为 304；无封面时即使发送 `*` 仍为 404。
+- 无封面、文件缺失、文件损坏或提取/解码失败：**404 `NOT_FOUND`**，不是 5xx。
+- 可选磁盘缓存：库文件所在目录下的 `artwork/`，键含库 id、记录 id、规范路径、源文件 ETag、`side` 和算法版本。缓存写失败仍返回图片。超过约 256 MiB 时删掉最旧的缓存文件。
 
 ## 9. 波形（已实现）
 
@@ -1091,8 +1130,8 @@ SQLite 事务与根设置使用持久化恢复日志配对：`admin-settings.jso
 
 **本地模式**：
 
-- 本地模式不走网络，**扫描时不同步计算**（读取每个文件的全部音频数据会明显拖慢扫描）。客户端有自己的设置「预生成列表波形」（本机设置，与服务端的 `pregenerate_list_waveforms` 无关），**默认关闭**：
-  - **开启**：扫描结束后在后台补齐缺失或过期的缩略图，限速，播放/试听时让路；
+- 本地模式不走网络，**扫描时不同步计算**（读取每个文件的全部音频数据会明显拖慢扫描）。客户端有自己的设置「预生成列表波形」（按本地库保存，与服务端的 `pregenerate_list_waveforms` 无关），新登记本地库默认勾选，已有配置保持原选择：
+  - **开启**：扫描结束后以单个最低优先级工作线程连续补齐缺失或过期的缩略图，没有每文件固定等待；每文件前检查可见行请求、扫描及播放/试听，让前台任务优先。摘要读取使用固定 2 MiB 缓冲并跳过完整 Metadata 预读，沿用相同的 128 列峰值与缓存键；
   - **关闭**：只对列表中当前可见的行按需计算。
 - 算法与 §9.1 相同：`waveform_with_cancel`，`include_colors = false`，`samples_per_pixel = ⌈frames / 128⌉`，同样的跨声道 min/max 合成和 int16 量化。结果写入库中已有的 `waveform_cache` 表（**无需改 schema**）：`zoom_level = 'list128-v4-l1'`（列表 128 列 + 算法版本 + 列表编码版本，版本变化后旧行视为无效）、`samples_per_pixel`、`min_values` / `max_values` = 各 `n` 个 int16 小端（`n = 128` 时各 256 字节）、`rms_values` / `color_values` 为 `NULL`、`created_at`。不需要网络，也不使用服务端的 `waveforms/` 目录。
 - 失效：磁盘上文件的大小或 mtime 与库记录不同时重算并覆盖该行。记录移除时库已经删除对应的 `waveform_cache` 行。
@@ -1424,8 +1463,13 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 - HTTPS：所有请求（API、快照、音频流/预览/波形、WebDAV）共用同一 keep-alive 连接池和同一 TLS 配置（见下文「连接复用」）：rustls（ring）+ `rustls-platform-verifier`，用**操作系统信任库**校验证书链和主机名（Windows 证书存储，含企业根证书和按需更新的根）。只接受公共受信任的证书，**不接受自签名证书，也没有跳过校验的选项**。证书错误分类提示：不受信任（提示服务器需使用公共受信任的证书，如 Let's Encrypt）、主机名不匹配（证书未覆盖该域名）、已过期/尚未生效（并提示检查本机时间）、已吊销、握手失败（提示该端口可能只支持 http://）；连接被拒绝、DNS 解析失败、超时也分别提示。
 - 401：缺失和错误的 token 都是 401 `UNAUTHORIZED`（§2.2），客户端按「本次请求是否带了 token」区分「服务器要求访问令牌」与「令牌错误或已被撤销」，不匹配 `message`；两种提示都引导用户在局域网内打开服务器网页管理页面 `http://<服务器局域网地址>:8790/admin` 生成令牌，再填入「数据源设置 → 访问令牌」。客户端从不请求 `/admin`。
 - 连接测试步骤：DNS / TCP 连接（解析结果与耗时）→ TLS 握手 / 证书（https：协议版本、密码套件、证书主体、颁发者、到期时间、信任库；http：注明未加密）→ 服务器在线（`/health`，免鉴权）→ 令牌检查 / 素材库（`/library`）→ 根目录 → 音频流采样 → 试听预览吞吐（`GET /audio/{id}/preview?codec=pcm&sr=48000&bits=16`，`Range: bytes=0-524287`，报告首字节时间与 Mbit/s，可选项）→ 各根 WebDAV。每步给出成功/失败及原因；网络步骤失败时其余步骤跳过。`/health` 带 `public_url` 且与所测地址不同时（如在局域网测试），显示「服务器外网地址：…」，对话框提供「使用服务器外网地址」一键填入。`AudioLibCli remote test --url <地址>` / `remote status --url <地址>` 可临时指定地址（不保存）；`remote test` 的 JSON 含 `server_url`、`tls`（握手详情）和 `public_url`，`remote status` 给出解析后的地址和证书校验策略。
-- 同步：启动（服务器模式）、「切换到此数据源」（或保存当前服务器配置的连接改动）、「立即同步」、F5 刷新时执行。先 `/health`（免鉴权）→ `/library` → `/roots`；`library_id` 与 `revision` 都未变则只更新检查时间，否则以 256 KiB 分块流式下载 `/library/snapshot` 到磁盘临时文件（不在内存中缓冲；首字节前显示「服务器正在准备快照…」，之后显示「正在下载快照 x / y MiB」进度），请求带 `Accept-Encoding: zstd`（服务器压缩时按 `X-Uncompressed-Length` 显示进度并预分配，校验压缩字节数等于 `Content-Length`、解压后字节数等于 `X-Uncompressed-Length`；不压缩时照旧），校验 `Content-Length`、`X-Library-Id`（须与 `/library` 一致）、快照 `user_version` 的兼容范围（读取 `X-Schema-Version` 响应头）、`journal_mode=DELETE`，再对下载文件原地做 `quick_check`、外键、FTS5 integrity-check 和触发器检查（不再整库复制到 %TEMP%；645 MB 快照校验 9.2 秒 → 1.4 秒），必要派生修复只在 owned staging/copy 中执行，通过后原子改名并切换。快照响应超时 240 秒，正文最长 1 小时。`409/503 BUSY` 在首次请求起计的 240 秒窗口内重试，优先使用 `Retry-After`（单次等待最多 10 秒），否则采用指数退避；响应处理完成时判断窗口是否到期，该窗口不是整次同步的绝对期限。`507 INSUFFICIENT_STORAGE` 不重试。
-- 缓存：`<数据目录>/remote/<library_id>/library-r<revision>-<毫秒>.db` + `cache.json`（Windows 无法替换仍被打开的 SQLite 文件，所以不用固定的 `library.db` 文件名；只保留当前打开的一份，旧文件在切换后删除，仍被占用时由轮询重试）。同步本身不删除任何文件：旧快照和被替换的库目录只在提供者切换到新快照之后清理（当前打开的和 `cache.json` 记录的快照永不删除）；超过 1 小时的快照下载暂存文件在启动和切换时清理（试听不再写磁盘，旧版本留下的 `audio-cache/` 目录删除一次）。同一 `server_url` 换成新 `library_id` 后，旧库目录（快照、`cache.json`）在新库安装后删除；其他服务器的缓存保留。拖出下载缓存 `<数据目录>/cache/<library_id>/` 不专门清理，跟随全局 4 GiB LRU 正常淘汰。服务器不可达时用上次缓存离线只读打开；从未同步过则显示空库并提示。
+- 同步与准入：启动（服务器模式）、「切换到此数据源」（或保存当前服务器配置的连接改动）、「立即同步」、F5 刷新时执行。先 `/health`（免鉴权）→ `/capabilities` → `/library` → `/roots`，按[当前兼容目录与标记检查实现](../../crates/audiolib-remote/src/compatibility.rs)检查对端准入，再检查精确快照格式、完整 feature 和实际文件；不能只凭程序版本或 `user_version` 上限判断兼容。schema 6 快照仍可按目录中声明的格式只读使用，不因本机构建的写入 schema 较新就改写服务器原库。已有匹配身份、revision 和格式的可用缓存，且没有待完成的传输时，通常只更新连接信息与检查时间；`--force` 强制同步。
+- 流式传输与双进度：请求 `/library/snapshot` 时带 `Accept-Encoding: zstd`，以 256 KiB 缓冲同时保存实际 HTTP 表示并解码到自有暂存数据库，不把整份快照放入内存。连接页、缓存/导出页分别显示下载和解压文字及进度条：下载累计实际传输字节，压缩时总量取 `Content-Length`；解压累计成功写入数据库的字节，总量取 `X-Uncompressed-Length`，预分配文件长度不算已解压量。两者重叠进行，下载到 100% 后解压仍可继续；任一总量未知时仅对应进度条保持不定，未压缩响应只显示下载。等待响应头时显示服务器准备状态，校验与派生准备阶段另行显示。
+- 持久化续传：`<数据目录>/remote/.transfers/<规范化 API 地址的 SHA256>/` 保存原始传输表示 `payload.part` 和原子 `checkpoint.json`；checkpoint 记录对象身份、编码、长度、已落盘偏移及前缀 SHA256，不含凭据。同端点 OS lease 排除另一个 GUI/CLI 写者。每新增 8 MiB 或距上次提交达到 2 秒时，在读写循环中刷新 checkpoint，正常暂停/中断时也提交。恢复按 checkpoint 偏移截掉未提交尾部并校验前缀 SHA256，再重放该前缀重建解码器，按 §6.1 用同一 `snapshot_id`、`Range: bytes=<偏移>-` 和强 `If-Range` 请求后缀；只有 `206` 的 Content-Range、ETag、库身份、revision、格式、编码和长度均匹配才续接。zstd 后缀不能单独解压，重放不计入网络吞吐；完整 wire 文件可只做本地解码。续传收到完整 `200`、`410`、`416` 或表示变化时丢弃旧传输并安全重下，不能混接；缺少续传头的兼容服务端从零重试。
+- 暂停与恢复：GUI 提供暂停/继续及重新下载；手动暂停意图跨重启保留，启动、轮询和写入后的自动同步不会解除暂停。关闭会取消活动连接、保存 checkpoint 并排空 worker；下次启动可继续未手动暂停的中断任务。`AudioLibCli remote sync` 可复用已保存的前缀，`--restart` 明确丢弃待完成传输并从零开始。暂停或失败时仍可使用匹配的已验证旧缓存；首次同步尚无缓存则显示占位空库，未完成数据库不会被打开为音效库。
+- 校验与发布：检查传输长度、`X-Library-Id`、固定表示的 revision、响应声明格式及实际 SQLite `user_version`/feature；恢复固定旧表示时以其已保存身份和格式核对，而不是混用最新 `/library` 的格式。再在自有暂存文件执行 `quick_check`、外键、FTS5 integrity-check、触发器和只读打开检查，切为 `journal_mode=DELETE`；必要派生修复只发生在自有 staging/copy。通过后持短期发布 lease，拒绝用落后于当前缓存 revision 的快照覆盖新状态，再原子改名、记录缓存并切换 provider；切换前排空 Metadata 写入并失效旧 reader/UI generation。传输文件保留到对应快照已发布且 provider 成功打开后，按精确发布文件回执清理；失败保留原缓存。
+- 超时与重试：快照响应头超时 240 秒，正文每次等待网络数据超过 **90 秒**视为可重试超时；没有正文总计 1 小时的限制，本地前缀重放、解压和磁盘工作不计入网络停滞阈值。断线/超时最多自动重试 3 次，等待 2、5、10 秒，兼容时从 checkpoint 续传。`409/503 BUSY` 在首次请求起计的 240 秒窗口内重试，优先使用 `Retry-After`（单次等待最多 10 秒），否则采用指数退避；响应处理完成时判断窗口是否到期，该窗口不是整次同步的绝对期限。`507 INSUFFICIENT_STORAGE` 不重试。
+- 缓存：`<数据目录>/remote/<library_id>/` 保存唯一命名的 `library-r<revision>-<pid>-<纳秒>.db`（自有准备副本可不带 pid）和 `cache.json`；Windows 不替换仍被打开的固定 SQLite 文件。旧快照和同服务器被替换库的生成文件只在 provider 成功切换后清理，当前打开的及 `cache.json` 记录的快照受保护，仍被占用时稍后重试。启动和切换时清理超过 1 小时的已知顶层暂存文件，需取得 staging/publication lease；未知文件、链接、手动备份、受保护恢复任务和 `.transfers/` 续传文件保留。同端点库身份更换或固定表示失效可丢弃该端点旧传输，其他服务器缓存保留。旧版本生成的 `audio-cache/` 文件按受控命名空间清理；拖出缓存 `<数据目录>/cache/<library_id>/` 跟随全局 4 GiB LRU 淘汰。服务器不可达时打开上次匹配缓存，从未同步过则显示空库并提示。
 - `library_id` 变化：提示警告，清空选择与草稿，重新下载快照。401 提示令牌无效；连接失败、超时（连接 3 秒）、`INTERNAL` 等均有明确中英文提示，不会静默显示空库。服务端 408 `TIMEOUT` 按超时处理（可重试，轮询显示离线并继续用缓存），不当作令牌或协议错误。
 - 版本轮询：服务器模式下后台线程每 `poll_interval_secs` 秒（默认 60，0 = 关闭，设置项 `data_source.poll_interval_secs`）调用 `GET /library`，与已打开快照的 `library_id`/`revision` 比对；有变化时在标题栏下方显示非阻塞提示和「同步」按钮（`auto_sync = true` 时自动同步，但要等 revision 稳定：同一 revision 至少保持一个轮询间隔才同步（「重试」、保存设置等额外检查不算），持续变化时最多推迟 15 分钟，避免分批扫描时每批都整库下载；`library_id` 变化或首次同步立即进行）。轮询能连上服务器时同时取 `GET /roots`（§6.4 状态缓存），标题栏显示「根目录离线：X」「磁盘唤醒中：Y」，数据源对话框按根显示状态；离线根的记录照常列出，不标为缺失。根离线提示上的「重试」对每个离线根调用 `POST /roots/{name}/check`（约 2 秒，不阻塞界面），用返回的条目更新状态，仍离线则保留提示；服务器没有该端点（404）时改为对所选记录发 `HEAD /audio/{id}/stream`。切到本地模式、改用离线缓存或保存设置时丢弃旧的根状态（保存设置后立即重新获取，成功同步会带来新的根状态）；只有快照中保存的根列表时不使用其中过时的状态。离线时继续用缓存并显示「离线」，按间隔翻倍退避（最长 15 分钟）；`503` 视为「服务器启动中，稍后重试」（10/20/40 秒…重试，且不早于 `Retry-After`，不当作令牌错误；`/health` 的 `status: starting|error` 在连接测试中单独显示）；401 提示检查令牌。
 - 标注写入（§6.3）：服务器模式下详情面板的收藏、标签、备注，以及右键/菜单的收藏、批量标注均可用，经 `DataProvider`（`audiolib_remote::RemoteProvider`）发到服务器；颜色含清除可通过 CLI 标注，标签支持替换/追加/移除。单条 `PATCH /audio/{id}/metadata`，批量 `POST /audio/metadata/batch {ids, patch, tag_mode}`；0.4.0 不提供评分编辑。**revision 规则**：成功后若本地快照 revision 等于 `revision_before`，把返回的 `file`/`files` 在一个事务中写入已打开的快照（用户标签/备注、收藏、颜色；按实际快照格式维护派生搜索与 FTS5），并把本地 revision 设为 `revision`（`cache.json` 与标题栏），不做整库同步；否则（期间有其他客户端写入、无缓存状态等）执行一次完整快照同步。错误映射：`400 VALIDATION` → 值无效（附服务器说明；发送前也做本地校验）；`404` → 记录在服务器上已不存在（批量整体回滚）；`409 BUSY` → 服务器正在扫描，稍后重试；`413 PAYLOAD_TOO_LARGE` → 请求过大（8 MiB 上限，客户端发送前也拦截）；`401` 同读取；`408 TIMEOUT`/超时/断线/响应不可读 → 结果不确定，提示错误并请求完整同步。写入不自动重试；保存失败时草稿保留为「未保存」。快照提供者切换必须先排空 Metadata 写入，排空失败则保留当前提供者与草稿，不安装新快照。

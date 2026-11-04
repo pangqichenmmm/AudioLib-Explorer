@@ -7,8 +7,10 @@
     cp io.github.audiolib.server.plist.example ~/Library/LaunchAgents/io.github.audiolib.server.plist
     # edit the paths below (this example uses /usr/local/var/audiolib and /opt/audiolib)
     launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/io.github.audiolib.server.plist
-  Restart after a binary swap:
-    launchctl kickstart -k "gui/$(id -u)/io.github.audiolib.server"
+  Restart after a binary swap (redeploy-server.sh does this and waits in between):
+    launchctl bootout "gui/$(id -u)/io.github.audiolib.server"
+    # wait for the process to exit and the port to be released, then
+    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/io.github.audiolib.server.plist
 
   The token: do NOT put it in this file. /opt/audiolib/run.sh is a tiny wrapper such as
       #!/bin/sh

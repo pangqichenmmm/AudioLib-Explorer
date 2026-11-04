@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "windows-server",
+  "host": "windows",
+  "require_tag": true,
+  "environment_tools": ["rustc", "cargo"],
+  "variables": {"Target": "x86_64-pc-windows-msvc", "Suffix": "win-x64"},
+  "stages": [
+    {"id": "preflight", "script": "tools/check-release.ps1", "parameters": {"Tag": "${Tag}"}},
+    {"id": "build", "needs": ["preflight"], "script": "tools/build-server-release.ps1", "parameters": {"Target": "${Target}"}, "outputs": ["${TargetDirectory}/${Target}/release/audiolib-server.exe"]},
+    {"id": "package", "needs": ["build"], "script": "tools/package-server.ps1", "parameters": {"Tag": "${Tag}", "Target": "${Target}"}, "outputs": ["dist/latest/server-${Suffix}", "dist/latest/AudioLibServer-${Tag}-${Suffix}.zip", "dist/latest/AudioLibServer-${Tag}-${Suffix}.zip.sha256", "dist/latest/AudioLibServer-${Tag}-${Suffix}-report.json"]},
+    {"id": "fixture", "command": "cargo", "arguments": ["build", "-p", "audiolib-db", "--bin", "search-benchmark", "--release", "--locked", "--target", "${Target}"], "outputs": ["${TargetDirectory}/${Target}/release/search-benchmark.exe"]},
+    {"id": "accept", "needs": ["fixture", "package"], "script": "tools/validate-server-package.ps1", "parameters": {"Tag": "${Tag}", "Target": "${Target}"}}
+  ]
+}

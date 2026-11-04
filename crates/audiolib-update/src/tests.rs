@@ -350,6 +350,55 @@ fn installed_beta_marker_is_bound_to_binary_core_version() {
 }
 
 #[test]
+fn installed_development_markers_retain_identity_and_require_matching_binary_version() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("update-channel.txt"), "beta\n").unwrap();
+    for (marker, development) in [
+        ("0.8.6-0", true),
+        ("0.8.6-0+local.0123456789ab", true),
+        ("0.8.6", false),
+        ("0.8.6-beta.2", false),
+        ("0.8.6-rc.1", false),
+        ("0.8.6-0.1", false),
+        ("0.8.6+local.0123456789ab", false),
+    ] {
+        std::fs::write(
+            root.path().join("update-version.txt"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        for product in [Product::Desktop, Product::Server] {
+            let client = UpdateClient::for_install(product, "0.8.6", root.path()).unwrap();
+            assert_eq!(client.current_version(), marker);
+            assert_eq!(client.is_development(), development, "{marker}");
+            assert_eq!(client.channel(), Channel::Beta);
+            assert!(UpdateClient::for_install(product, "0.8.5", root.path()).is_err());
+        }
+    }
+}
+
+#[test]
+fn development_detection_does_not_change_server_release_selection() {
+    let client =
+        UpdateClient::new(Product::Server, Channel::Beta, "0.8.6-0+local.0123456789ab").unwrap();
+    assert!(client.is_development());
+    let selected = client
+        .select_for_platform(
+            vec![release_for_platform(
+                Product::Server,
+                "v0.8.6",
+                false,
+                false,
+                Platform::WindowsX64,
+            )],
+            Platform::WindowsX64,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.version, "0.8.6");
+}
+
+#[test]
 fn zip_rejects_private_and_symlink_entries_before_deployment() {
     for (name, symlink) in [
         ("../LICENSE", false),

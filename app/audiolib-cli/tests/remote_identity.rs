@@ -293,7 +293,7 @@ fn remote_test_reports_incompatible_schema_and_retains_api_and_cache_evidence() 
                 "/api/v1/health" => TestResponse::json(200, r#"{"status":"ok","version":"0.4.0"}"#),
                 "/api/v1/library" => TestResponse::json(
                     200,
-                    &json!({"library_id": LIBRARY, "schema_version":7,"revision":282}).to_string(),
+                    &json!({"library_id": LIBRARY, "schema_version":audiolib_db::SCHEMA_VERSION+1,"revision":282}).to_string(),
                 ),
                 "/api/v1/roots" => TestResponse::json(200, "[]"),
                 _ => TestResponse::json(500, "{}"),
@@ -306,7 +306,10 @@ fn remote_test_reports_incompatible_schema_and_retains_api_and_cache_evidence() 
     let reply = cli(directory.path(), &["remote", "test"]);
     assert_eq!(reply["success"], false, "{reply}");
     assert_eq!(reply["error_code"], "REMOTE_TEST_FAILED");
-    assert_eq!(reply["data"]["library"]["schema_version"], 7);
+    assert_eq!(
+        reply["data"]["library"]["schema_version"],
+        audiolib_db::SCHEMA_VERSION + 1
+    );
     assert_eq!(reply["data"]["server_version"], "0.4.0");
     assert!(reply["data"].get("unauthorized").is_none());
     let steps = reply["data"]["steps"].as_array().unwrap();
@@ -317,13 +320,16 @@ fn remote_test_reports_incompatible_schema_and_retains_api_and_cache_evidence() 
     );
     let library = steps.iter().find(|step| step["step"] == "library").unwrap();
     assert_eq!(library["ok"], false);
-    assert!(library["message"].as_str().unwrap().contains("schema 7"));
     assert!(
         library["message"]
             .as_str()
             .unwrap()
-            .contains("newer than this client supports (6)")
+            .contains(&format!("schema {}", audiolib_db::SCHEMA_VERSION + 1))
     );
+    assert!(library["message"].as_str().unwrap().contains(&format!(
+        "newer than this client supports ({})",
+        audiolib_db::SCHEMA_VERSION
+    )));
     assert_eq!(cache.active().unwrap(), state);
     assert_eq!(std::fs::read(cache.database_path(&state)).unwrap(), before);
     assert_eq!(

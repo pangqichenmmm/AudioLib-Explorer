@@ -109,6 +109,7 @@ fn child_real_pointer_preview_modes() {
         playback: serde_json::to_value(&playback).unwrap(),
         audition_play_on_single_click: false,
         play_history_limit: audiolib_core::config::PLAY_HISTORY_LIMIT_PER_LIBRARY,
+        show_album_artwork: true,
         pregenerate_list_waveforms: false,
         hold_list_waveform_batches_after_audition: false,
         max_search_tasks: 6,

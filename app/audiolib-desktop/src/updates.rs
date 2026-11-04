@@ -29,21 +29,18 @@ impl DesktopUpdates {
         controller: Arc<Controller>,
         arguments: &[String],
     ) -> Option<Self> {
-        if std::env::var("AUDIOLIB_UPDATE_DISABLE").as_deref() == Ok("1") {
+        ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+        ui.set_update_supported(!cfg!(target_os = "macos"));
+        if cfg!(target_os = "macos") {
             ui.set_update_enabled(false);
             ui.set_update_message(
                 text(
                     ui,
-                    "Update checks are disabled for this installation.",
-                    "此安装已关闭更新检查。",
+                    "Download a new Mac client from GitHub Releases, then close the app and replace it.",
+                    "请从 GitHub Releases 下载新版 Mac 客户端，关闭应用后替换。",
                 )
                 .into(),
             );
-            return None;
-        }
-        if arguments.iter().any(|arg| {
-            arg == "--smoke-ui" || arg == "--headless-smoke" || arg.starts_with("--gui-search-")
-        }) {
             return None;
         }
         let executable = match std::env::current_exe() {
@@ -69,7 +66,20 @@ impl DesktopUpdates {
                 return None;
             }
         };
-        ui.set_app_version(client.current_version().into());
+        if !apply_update_policy(
+            ui,
+            &client,
+            std::env::var("AUDIOLIB_UPDATE_DISABLE").as_deref() == Ok("1"),
+        ) {
+            // Leave startup and manual check/install callbacks unbound for local
+            // development builds, including direct EXE launches without a launcher.
+            return None;
+        }
+        if arguments.iter().any(|arg| {
+            arg == "--smoke-ui" || arg == "--headless-smoke" || arg.starts_with("--gui-search-")
+        }) {
+            return None;
+        }
         let state = Arc::new(Mutex::new(State::default()));
         let stopped = Arc::new(AtomicBool::new(false));
         let weak = ui.as_weak();
@@ -198,6 +208,33 @@ fn text<'a>(ui: &AppWindow, english: &'a str, chinese: &'a str) -> &'a str {
     if ui.get_chinese() { chinese } else { english }
 }
 
+/// Show the full installed identity before applying local update restrictions.
+fn apply_update_policy(ui: &AppWindow, client: &UpdateClient, environment_disabled: bool) -> bool {
+    ui.set_app_version(client.current_version().into());
+    let development = client.is_development();
+    ui.set_update_enabled(!development && !environment_disabled);
+    if development {
+        ui.set_update_message(
+            text(
+                ui,
+                "Local development build. Install newer test builds manually; published releases will not replace this build.",
+                "本地开发测试版，请手动安装新的测试构建；已发布版本不会覆盖此构建。",
+            )
+            .into(),
+        );
+    } else if environment_disabled {
+        ui.set_update_message(
+            text(
+                ui,
+                "Update checks are disabled for this installation.",
+                "此安装已关闭更新检查。",
+            )
+            .into(),
+        );
+    }
+    !development && !environment_disabled
+}
+
 fn check(
     ui: &AppWindow,
     client: Arc<UpdateClient>,
@@ -261,4 +298,43 @@ fn check(
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audiolib_update::Channel;
+
+    #[test]
+    fn development_identity_blocks_desktop_updates_without_a_launcher_environment() {
+        i_slint_backend_testing::init_no_event_loop();
+        for chinese in [false, true] {
+            for version in ["0.8.6-0", "0.8.6-0+local.0123456789ab"] {
+                let ui = AppWindow::new().unwrap();
+                ui.set_chinese(chinese);
+                let client = UpdateClient::new(Product::Desktop, Channel::Beta, version).unwrap();
+                assert!(!apply_update_policy(&ui, &client, false));
+                assert_eq!(ui.get_app_version(), version);
+                assert!(!ui.get_update_enabled());
+                assert!(!ui.get_update_message().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn published_desktop_versions_keep_the_normal_update_policy_and_identity() {
+        i_slint_backend_testing::init_no_event_loop();
+        for version in ["0.8.6", "0.8.7-beta.1", "0.8.7-rc.1"] {
+            for environment_disabled in [false, true] {
+                let ui = AppWindow::new().unwrap();
+                let client = UpdateClient::new(Product::Desktop, Channel::Beta, version).unwrap();
+                assert_eq!(
+                    apply_update_policy(&ui, &client, environment_disabled),
+                    !environment_disabled
+                );
+                assert_eq!(ui.get_app_version(), version);
+                assert_eq!(ui.get_update_enabled(), !environment_disabled);
+            }
+        }
+    }
 }

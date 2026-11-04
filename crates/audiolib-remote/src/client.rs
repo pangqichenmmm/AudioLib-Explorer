@@ -1310,7 +1310,7 @@ mod tests {
             &cancel,
             &mut |_| {},
         );
-        assert!(matches!(result, Err(RemoteError::Cancelled)));
+        assert!(matches!(result, Err(RemoteError::Cancelled)), "{result:?}");
         let cancelled_at = cancelled_at.join().unwrap();
         let seen = closed
             .recv_timeout(Duration::from_secs(5))

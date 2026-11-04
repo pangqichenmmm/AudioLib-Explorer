@@ -169,8 +169,9 @@ fn folder_tree_supports_keyboard_selection_and_expansion() {
 #[test]
 fn folder_double_click_expands_and_collapses_without_toggling_leaves_or_arrow_twice() {
     i_slint_backend_testing::init_no_event_loop();
-    for scale in [1.0, 2.0] {
+    for (modern, scale) in [(false, 1.0), (false, 2.0), (true, 1.0), (true, 2.0)] {
         let ui = window();
+        ui.global::<crate::Theme>().set_modern_style(modern);
         ui.global::<crate::Theme>().set_ui_scale(scale);
         ui.window()
             .set_size(slint::LogicalSize::new(1440.0 * scale, 1000.0 * scale));
@@ -239,20 +240,32 @@ fn folder_double_click_expands_and_collapses_without_toggling_leaves_or_arrow_tw
         // The disclosure control handles each click itself. The name's
         // double-click handler must not also receive those same clicks.
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
-        let disclosure = |label: &'static str| {
-            ElementHandle::find_by_accessible_label(&ui, "Folder: Parent")
-                .next()
-                .unwrap()
-                .query_descendants()
-                .match_predicate(move |item| item.accessible_label().as_deref() == Some(label))
-                .find_first()
-                .unwrap()
+        // Studio uses chevron images instead of the classic plus/minus text.
+        // Click the physical disclosure area in both workbenches.
+        let parent = ElementHandle::find_by_accessible_label(&ui, "Folder: Parent")
+            .next()
+            .unwrap();
+        let position = slint::LogicalPosition::new(
+            parent.absolute_position().x + 8.0 * scale,
+            parent.absolute_position().y + parent.size().height / 2.0,
+        );
+        let click_disclosure = || {
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                    position,
+                    button: slint::platform::PointerEventButton::Left,
+                });
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                    position,
+                    button: slint::platform::PointerEventButton::Left,
+                });
         };
-        let plus = disclosure("+");
-        plus.mock_single_click(slint::platform::PointerEventButton::Left);
+        click_disclosure();
         assert!(folders.row_data(0).unwrap().expanded);
-        let minus = disclosure("−");
-        minus.mock_single_click(slint::platform::PointerEventButton::Left);
+        click_disclosure();
         assert!(!folders.row_data(0).unwrap().expanded);
         assert_eq!(&*toggles.borrow(), &[0, 0, 0, 0]);
         assert_eq!(ui.get_query(), "background query");

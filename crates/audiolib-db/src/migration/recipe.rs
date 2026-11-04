@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 /// Reviewable structure operation; only an exact compiled recipe may be executed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SchemaChange {
+    /// Create the compiled shared-album tables and persistent identity allocator.
+    CreateAlbumEntities,
     /// Add a field with its explicit SQLite type/default/constraint declaration.
     AddColumn {
         table: String,
@@ -28,6 +30,17 @@ pub(crate) fn changes() -> Vec<SchemaChange> {
             column: (*column).into(),
         })
         .collect();
+    result.insert(0, SchemaChange::CreateAlbumEntities);
+    result.push(SchemaChange::DropDerivedColumn {
+        table: "audio_files".into(),
+        column: "album".into(),
+    });
+    result.push(SchemaChange::AddColumn {
+        table: "audio_files".into(),
+        column: "album_id".into(),
+        definition: "INTEGER REFERENCES albums(id)".into(),
+    });
+    // Schema 8 replaces v7's duplicated derived album text with an entity binding.
     // Final v6 contract retires only the two playback fields and history table.
     // Client-local history import runs after backup and before this recipe.
     result.push(SchemaChange::RetireColumn {
@@ -46,7 +59,7 @@ pub(crate) fn changes() -> Vec<SchemaChange> {
 
 pub(super) fn identity() -> String {
     let mut hash = Sha256::new();
-    hash.update(b"ale-schema6-storage1-retire-plays2;");
+    hash.update(b"ale-schema8-albums1-text-metadata1-retire-plays2;");
     // Index batches and query compilation must keep one implementation identity,
     // including source Metadata projection and the exact locked dependency graph.
     hash.update(super::plan::tokenizer_identity().as_bytes());
@@ -55,6 +68,8 @@ pub(super) fn identity() -> String {
     hash.update(include_bytes!("checkpoint.rs"));
     hash.update(include_bytes!("job.rs"));
     hash.update(include_bytes!("../search_storage.rs"));
+    hash.update(include_bytes!("../albums.rs"));
+    hash.update(include_bytes!("../metadata_storage.rs"));
     hash.update(include_bytes!("../schema.rs"));
     hash.update(include_bytes!("../schema/current.rs"));
     hash.update(include_bytes!("../schema/legacy.rs"));

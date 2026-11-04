@@ -178,6 +178,9 @@ pub enum OpenError {
         /// Path-free reason.
         reason: String,
     },
+    /// Every cover decode slot stayed in use for [`crate::artwork::ARTWORK_SLOT_WAIT`]
+    /// (answered as 503 `BUSY` with `Retry-After`).
+    ArtworkBusy,
 }
 
 impl From<Error> for OpenError {
@@ -385,7 +388,7 @@ impl OpenProgress {
         }
     }
     /// The open finished; later work (e.g. decoding) is not an open.
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         if let Ok(mut target) = self.target.lock() {
             *target = None;
         }
@@ -594,6 +597,8 @@ struct Inner {
     list: Arc<ListWaveforms>,
     ffmpeg_path: PathBuf,
     transcode_slots: Arc<Semaphore>,
+    /// Cover decode slots ([`crate::artwork::ARTWORK_SLOTS`]); cache hits and 304s skip them.
+    artwork_slots: Arc<Semaphore>,
     transcodes: TranscodeRegistry,
     scans: ScanManager,
     /// Read-only connection for the `/roots` aggregates (missing counts, last scans).
@@ -856,6 +861,7 @@ impl AppState {
                 list,
                 ffmpeg_path: config.ffmpeg_path.clone(),
                 transcode_slots: Arc::new(Semaphore::new(config.max_transcodes)),
+                artwork_slots: Arc::new(Semaphore::new(crate::artwork::ARTWORK_SLOTS)),
                 transcodes: TranscodeRegistry::default(),
                 scans: ScanManager::default(),
                 roots_db: Mutex::new(roots_db),
@@ -908,6 +914,10 @@ impl AppState {
             OpenError::RootOffline { root, .. } => StatFailure::RootOffline { root },
             OpenError::Library(Error::NotFound(_)) => StatFailure::Missing,
             OpenError::Library(error) => StatFailure::Other(error),
+            // Only cover decodes report this; a metadata read never waits for one.
+            OpenError::ArtworkBusy => {
+                StatFailure::Other(Error::Busy("Artwork slots are busy".into()))
+            }
         };
         let unavailable = || Error::NotFound(format!("Audio {id} file is missing on the server"));
         let delay = self.inner.stat_delay_ms.load(Ordering::Relaxed);
@@ -1106,6 +1116,12 @@ impl AppState {
 
     pub(crate) fn transcode_slots(&self) -> Arc<Semaphore> {
         self.inner.transcode_slots.clone()
+    }
+
+    /// Cover decode slots. Public only so tests can hold every slot.
+    #[doc(hidden)]
+    pub fn artwork_slots(&self) -> Arc<Semaphore> {
+        self.inner.artwork_slots.clone()
     }
 
     pub(crate) fn transcodes(&self) -> &TranscodeRegistry {

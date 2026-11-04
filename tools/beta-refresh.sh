@@ -19,10 +19,16 @@
 #   PORT           beta port                                      (default 8791)
 #   WORK_DIR       scratch dir for worktree, target, backups, logs (not the system disk)
 #   ROOT_PROBE_SECS  per-root read timeout                        (default 15)
+#   BETA_WAIT_SECS  startup/health wait, including library migration (default 1800)
 # Never point this at the production instance. Log: $WORK_DIR/beta-refresh-<time>.log
 set -eu
 : "${BETA_APP_DIR:?}" "${BETA_DATA_DIR:?}" "${SERVICE_NAME:?}" "${WORK_DIR:?}"
 PORT="${PORT:-8791}"; PROBE="${ROOT_PROBE_SECS:-15}"
+BETA_WAIT_SECS="${BETA_WAIT_SECS-1800}"
+[[ "$BETA_WAIT_SECS" =~ ^[1-9][0-9]*$ ]] || {
+    echo '[beta-refresh] FAIL: BETA_WAIT_SECS must be a positive integer (seconds)' >&2
+    exit 2
+}
 WITH_DB=0; PREBUILT=""
 while [ $# -gt 0 ]; do case "$1" in
     --with-db) WITH_DB=1 ;;
@@ -75,15 +81,15 @@ if [ "$WITH_DB" = 1 ]; then
     log "db replaced, library_id reset"
 fi
 
-log "swapping binary (launcher untouched)"
+log "swapping binary (launcher untouched; startup wait ${BETA_WAIT_SECS}s)"
 # Keep binary and marker rollback in the same transaction. In particular, the
 # previous markers must be restored before the previous binary is restarted.
 INSTALL_DIR="$BETA_APP_DIR/bin" SERVICE_NAME="$SERVICE_NAME" SERVICE_MANAGER=launchd \
 DATA_DIR="$BETA_DATA_DIR" BACKUP_DIR="$WORK_DIR/beta-backups" PORT="$PORT" \
 UPDATE_CHANNEL=beta UPDATE_VERSION="$UPDATE_VERSION" \
-TOKEN="$(cat "$TOKEN_FILE")" EXPECT_COMMIT="$SHA" WAIT_SECS=600 \
+TOKEN="$(cat "$TOKEN_FILE")" EXPECT_COMMIT="$SHA" WAIT_SECS="$BETA_WAIT_SECS" \
     sh "$REPO/server/deploy/redeploy-server.sh" "$BETA_APP_DIR/bin/audiolib-server.$SHA" \
-    || die "redeploy failed (rolled back by redeploy-server.sh)"
+    || die "redeploy failed; inspect its rollback or retained-migration result above"
 log "update channel beta, installed version $UPDATE_VERSION"
 
 API="http://127.0.0.1:$PORT/api/v1"; AUTH="Authorization: Bearer $(cat "$TOKEN_FILE")"

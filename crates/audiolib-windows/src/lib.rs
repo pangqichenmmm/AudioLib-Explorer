@@ -1,11 +1,20 @@
 // crates/audiolib-windows/src/lib.rs
 //! Windows driver discovery and native diagnostics; no drivers are installed here.
+// The ASIO shim calls SDK functions supplied by asio-sys, including when this
+// crate is linked by an independent native-window test rather than the player.
+#[cfg(all(windows, feature = "asio"))]
+extern crate asio_sys as _;
+
 use audiolib_core::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 mod drag;
 pub use drag::{DragOutcome, drag_files, primary_button_down};
+
+/// Main-thread interception of native macOS Quit through the desktop close drain.
+#[cfg(target_os = "macos")]
+pub mod macos_lifecycle;
 
 /// Explicit diagnostic capture of this process's own GUI completion marker.
 /// Normal application use does not start capture; codec helpers are cross-platform.
@@ -18,6 +27,10 @@ pub mod gui_geometry;
 /// Preserve own-window visibility during native menu redraw suppression.
 #[cfg(windows)]
 pub mod window_redraw;
+
+/// Native exposure record for the desktop window's partial software repaint.
+#[cfg(windows)]
+pub mod paint_exposure;
 
 /// Display a fatal startup diagnostic for a desktop application without a console.
 /// Headless callers should write their diagnostics directly and skip this dialog.
@@ -43,7 +56,30 @@ pub fn show_error_dialog(message: &str) {
         // synchronous call. A null owner is valid for a fatal startup diagnostic.
         unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x10) };
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // The system helper owns its UI thread. Diagnostic text stays in argv,
+        // never AppleScript source or shell commands, and status reaps the child.
+        const SCRIPT: &str = r#"on run argv
+    display alert (item 1 of argv) message (item 2 of argv) as critical buttons {"OK"} default button "OK"
+end run"#;
+        let text = message.replace('\0', " ");
+        match std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(SCRIPT)
+            .args(["AudioLib Explorer", &text])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("AudioLib Explorer: {message}\nmacOS error dialog failed ({status})");
+            }
+            Err(error) => {
+                eprintln!("AudioLib Explorer: {message}\nmacOS error dialog failed: {error}");
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     eprintln!("AudioLib Explorer: {message}");
 }
 
@@ -379,7 +415,7 @@ mod dpapi {
     }
 }
 
-/// Open an existing path in Windows Explorer without interpolating a shell command.
+/// Reveal an existing path in Explorer or Finder without a shell command.
 pub fn reveal_path(path: &std::path::Path) -> Result<()> {
     if !path.exists() {
         return Err(audiolib_core::Error::NotFound(path.display().to_string()));
@@ -390,6 +426,17 @@ pub fn reveal_path(path: &std::path::Path) -> Result<()> {
             .arg("/select,")
             .arg(path)
             .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // An absolute path cannot be interpreted as another command-line option.
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(path.canonicalize()?)
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!("Finder reveal failed ({status})")).into());
+        }
     }
     Ok(())
 }

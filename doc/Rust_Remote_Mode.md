@@ -15,6 +15,30 @@ modified or replaced while in server mode; switching back to local mode reopens 
 
 ## Settings and secrets
 
+Artwork within a shared album is scoped to the selected WAV's immediate parent
+folder. The optional `album_folder_artwork` version 1 capability binds native
+schema-8 requests to the library, album namespace, album and folder; responses
+also bind `X-Album-Folder-Id`. Older servers use bounded, sorted members of that
+same folder through their supported per-audio artwork API. The client does not
+reuse a whole-album result from another subfolder, including when the selected
+folder's members fall beyond the whole album's first 64 records. Files without
+their own embedded picture may reuse another member's picture in the same
+album and immediate folder.
+
+Source schemas 3–7 still use an owned schema-8 projection; source and local
+formats remain separate, so projection does not cause repeated synchronization.
+Unsupported embedded-artwork capabilities skip automatic covers while retaining
+normal sync and playback. The active server's **Cache and export** page offers
+client-local custom images, hiding/restoring, display preferences and thumbnail
+cleanup. Manual choices are isolated by source, shared album and immediate
+folder. Older whole-album choices remain read-only inherited preferences;
+explicit folder choices take precedence. Restoring embedded artwork records a
+folder-local ignore-inherited marker without deleting the retained whole-album
+preference. These choices never write to the server snapshot or WAV files and
+do not sync to other PCs. Shared Album entities, schema 8 and original Metadata
+TEXT remain unchanged; Metadata compression is deferred. See
+[Album artwork](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Artwork.md).
+
 `settings.json` gains a `data_source` section (all fields have serde defaults, so older
 settings files load as local mode):
 
@@ -325,7 +349,7 @@ again before reuse. A transfer lease excludes another desktop/CLI writer for the
 normalized API endpoint. Profiles with different endpoints never append to one
 another's partial file; neither tokens nor WebDAV credentials enter the checkpoint.
 
-After a disconnect or 30 s with no network read progress, the client retries up to
+After a disconnect or 90 s with no network read progress, the client retries up to
 three times after 2, 5 and 10 s. It requests the same immutable snapshot using
 `snapshot_id`, `Range: bytes=<offset>-` and `If-Range`. Only a matching `206` whose
 Content-Range, ETag, encoding, identity and lengths agree can append. A full `200`
@@ -399,7 +423,7 @@ an unchanged prepared snapshot is reused without copying, downloading or rebuild
 
 Timeouts: connect 3 s, ordinary JSON responses 15 s (bodies 30 s), library statistics
 response/body 60 s, root path PATCH and root DELETE responses up to 1 h (bodies 30 s),
-snapshot response 240 s and a 30 s network-read stall limit (no one-hour total
+snapshot response 240 s and a 90 s network-read stall limit (no one-hour total
 transfer deadline), audio stream first byte 100 s (a NAS disk spinning up, see *Playback*). The stall limit excludes local prefix replay, decompression and disk work. Errors map to localized messages for unreachable server, timeout, 401
 (invalid token, or "token required" when none is configured), 404, BUSY, validation and
 server `INTERNAL` errors. Root PATCH/DELETE have no generic server 30 s request limit.
@@ -1125,12 +1149,17 @@ The CLI uses the same settings and secrets file as the desktop and never prints 
 `pwsh -File tools/validate-remote-resume.ps1 -BinaryDirectory <current-binary-directory>`
 builds an owned 32-WAV synthetic library, obtains its valid zstd snapshot from an owned
 loopback server, and injects truncated/silent response bodies with a second loopback
-listener. It checks automatic Range recovery after truncation and after an actual
-30-second silent-read timeout, a new CLI process reusing the saved
-prefix, preservation of an existing validated cache after an interrupted replacement,
+listener. Its intended coverage includes automatic Range recovery after truncation
+and a production silent-read timeout, a new CLI process reusing the saved prefix,
+preservation of an existing validated cache after an interrupted replacement,
 explicit `--restart` beginning at zero, and native desktop WM_CLOSE during a
-silent body followed by desktop restart/resume. Requests must retain the strong ETag
-and snapshot ID. `-ServerBinary <path>` selects a separately built current server;
+silent body followed by desktop restart/resume. The current production snapshot
+read-stall limit is **90 s** (`SNAPSHOT_READ_STALL_TIMEOUT`); the script still labels
+that case as 30 s and requires recovery within 28–60 s. Those assertions and wait
+budgets have not been updated, so this script does not currently establish passing
+acceptance of the 90-second behaviour. Update them before using it for that acceptance;
+this documentation correction does not claim a new script pass.
+Requests must retain the strong ETag and snapshot ID. `-ServerBinary <path>` selects a separately built current server;
 `-SkipDesktop` runs only CLI cases and is reported as such. All settings, snapshots,
 source WAVs and server state live in a checked owned temporary tree, and normal
 environment variables are restored. Failure preserves that fixture for diagnosis.

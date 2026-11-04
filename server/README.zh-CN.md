@@ -15,13 +15,14 @@
 - `/audio/{id}/stream`：单段 `Range`、`ETag`、`If-Range`；`?download=1` 用于下载。
 - `/audio/{id}/preview` 低带宽试听：WAV 在进程内做 PCM 降采样（`codec=pcm`），可选 ffmpeg FLAC 转码（`codec=flac`）。
 - `/audio/{id}/waveform`，带磁盘 LRU 缓存。
+- `/albums/{id}/artwork` 按共享专辑返回内嵌 JPEG/PNG 封面（可选 `?side=`），以 `album_entity_artwork` 能力、库身份和专辑 namespace 绑定。兼容 `/audio/{id}/artwork` 保留原语义；图片不写入数据库，缓存在库目录旁的 `artwork/`。schema 8 升级须配套更新客户端，并保留原库回退备份；见[共享专辑与存储](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md)。
 - 元数据写入（播放历史只在客户端本地记录；`POST /audio/{id}/plays` 已弃用为空操作，`GET /history/plays` 总是空）、远程扫描（开始/暂停/继续/取消）、记录与文件夹移除（可用 `manage_mode` 限制）。
 - Token 鉴权三种模式（`off`、`external`、`all`），token 在管理页生成（只保存哈希）或来自环境变量，可选原生 TLS 监听。
 - 内置管理页（`/admin`，仅局域网）：公网地址、鉴权模式、token、库根目录。
 
 ## 下载预编译服务端
 
-[GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) 的正式发布只包含 Windows 客户端和 macOS arm64 服务端，均附 `.sha256` 文件。核验校验和后解压，使用根目录的程序及自己的配置启动（`--config <path>`）；公共配置示例位于 `server/audiolib-server/`。其他平台请从源码构建（`cargo build --release -p audiolib-server --target <triple>`，见下文）；这类构建没有对应的发布包，因此不会自动更新。升级保留原有资料库、资源路径、配置和凭据，安装与回滚见[部署指南](deploy/README.md)。
+[GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) 提供 Mac arm64 服务端归档；从 0.8.4 起增加 Linux x64 原生包和 Docker amd64/arm64 离线镜像，均附 `.sha256`。校验后再解压原生包或导入镜像。Linux 包以 Debian 12 为 GNU libc 构建基线；原生程序位于归档根目录，配置示例位于 `server/audiolib-server/`。Windows 和独立 Linux arm64 服务端从源码构建。升级保留原资料库、根目录、配置和凭据；Docker 保留数据卷并替换镜像，不在容器内更新二进制。详见 [Linux 与 Docker 交付](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Linux_Docker_Release.md) 和[部署指南](deploy/README.md)。
 
 ## 快速开始：从源码构建
 
@@ -120,7 +121,7 @@ AUDIOLIB_SERVER_TOKEN='<至少 32 个随机可见 ASCII 字符>' audiolib-server
 
 ## API 概览
 
-`/health`、`/library`、`/library/snapshot`、`/roots`、`POST /roots/{name}/check`、`/audio/{id}`、`/audio/{id}/waveform`、`/audio/{id}/preview`、`/audio/{id}/stream`、元数据写入（`PATCH /audio/{id}/metadata`、`POST /audio/metadata/batch`、`POST /audio/{id}/plays`）、远程扫描（`POST /scans`、`GET /scans/current`、`GET /scans/{id}`、`POST /scans/{id}/pause|resume|cancel`）、历史（`GET /history/scans|plays`）、移除（`POST /audio/remove`、`DELETE /folders/{id}`）和 `GET /capabilities`。详情、错误码和示例见 [doc/api/README.md](../doc/api/README.md)。
+`/health`、`/library`、`/library/snapshot`、`/roots`、`POST /roots/{name}/check`、`/audio/{id}`、`/audio/{id}/waveform`、`/audio/{id}/preview`、`/audio/{id}/stream`、`/audio/{id}/artwork`、元数据写入（`PATCH /audio/{id}/metadata`、`POST /audio/metadata/batch`、`POST /audio/{id}/plays`）、远程扫描（`POST /scans`、`GET /scans/current`、`GET /scans/{id}`、`POST /scans/{id}/pause|resume|cancel`）、历史（`GET /history/scans|plays`）、移除（`POST /audio/remove`、`DELETE /folders/{id}`）和 `GET /capabilities`。详情、错误码和示例见 [doc/api/README.md](../doc/api/README.md)。
 
 库根目录可在仅局域网可用的管理页（`http://<局域网地址>:8790/admin`）管理：只读的服务器磁盘浏览、添加/移除根目录（移除只让库忘记记录，不触碰音频文件；扫描期间返回 409 `BUSY`）和扫描控制。修改即时生效，保存在库文件旁的 `admin-settings.json`（其中的 `roots` 此后取代 `config.toml` 的 `[[roots]]`）。`/admin/api/*` 不属于客户端 API。
 

@@ -1,3 +1,4 @@
+// crates/audiolib-windows/src/drag_macos.rs
 //! macOS file drag source: AppKit `beginDraggingSession` with `NSURL` /
 //! `NSPasteboardWriting` (`public.file-url`). Copy-only, real local files.
 //! Blocks on a nested run loop until the session ends (parity with OLE `DoDragDrop`).
@@ -16,7 +17,7 @@ use objc2_foundation::{
     NSRect, NSRunLoop, NSSize, NSString, NSURL,
 };
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct DragSourceIvars {
     outcome: Cell<Option<DragOutcome>>,
@@ -34,7 +35,10 @@ define_class!(
     unsafe impl NSObjectProtocol for FileDragSource {}
 
     // SAFETY: NSDraggingSource methods match the protocol selectors; we only offer Copy.
+    // Rust protocol method names mirror the Objective-C bindings, so retain their
+    // spelling with method-local naming exceptions and unchanged selectors.
     unsafe impl NSDraggingSource for FileDragSource {
+        #[allow(non_snake_case)]
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn draggingSession_sourceOperationMaskForDraggingContext(
             &self,
@@ -45,6 +49,7 @@ define_class!(
             NSDragOperation::Copy
         }
 
+        #[allow(non_snake_case)]
         #[unsafe(method(draggingSession:endedAtPoint:operation:))]
         fn draggingSession_endedAtPoint_operation(
             &self,
@@ -60,6 +65,7 @@ define_class!(
             self.ivars().outcome.set(Some(outcome));
         }
 
+        #[allow(non_snake_case)]
         #[unsafe(method(ignoreModifierKeysForDraggingSession:))]
         fn ignoreModifierKeysForDraggingSession(&self, _session: &NSDraggingSession) -> bool {
             true
@@ -82,7 +88,7 @@ pub(super) fn primary_button_down() -> bool {
     NSEvent::pressedMouseButtons() & 1 != 0
 }
 
-fn path_to_file_url(path: &PathBuf) -> std::io::Result<Retained<NSURL>> {
+fn path_to_file_url(path: &Path) -> std::io::Result<Retained<NSURL>> {
     let text = path.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -114,20 +120,15 @@ fn drag_event(app: &NSApplication, window: &NSWindow) -> std::io::Result<Retaine
         1.0,
     )
     .ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             "could not synthesize a mouse-drag event for file drag-out",
         )
     })
 }
 
 pub(super) fn drag(paths: &[PathBuf]) -> std::io::Result<DragOutcome> {
-    let mtm = MainThreadMarker::new().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "file drag-out must run on the AppKit main thread",
-        )
-    })?;
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| std::io::Error::other("file drag-out must run on the AppKit main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
     let window = app
         .keyWindow()
@@ -148,7 +149,7 @@ pub(super) fn drag(paths: &[PathBuf]) -> std::io::Result<DragOutcome> {
 
     let mut urls = Vec::with_capacity(paths.len());
     for path in paths {
-        urls.push(path_to_file_url(path)?);
+        urls.push(path_to_file_url(path.as_path())?);
     }
 
     let cursor = window.mouseLocationOutsideOfEventStream();

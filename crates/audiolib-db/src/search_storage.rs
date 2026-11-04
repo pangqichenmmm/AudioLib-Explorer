@@ -3,7 +3,7 @@
 //! Writers register the shared tokenizer; triggers keep business and FTS changes atomic.
 use crate::{db_error, schema, sqlite_engine};
 use audiolib_core::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub(crate) const DERIVED_COLUMNS: &[&str] = &[
     "filename_tokenized",
@@ -358,6 +358,29 @@ pub(crate) fn blueprint_with(
         ));
     }
     schema::definition::check_repair_source(source)?;
+    if schema::feature_version(source, "album_entities")? != Some(1) {
+        let collision:bool=source.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name COLLATE NOCASE IN ('albums','audiolib_album_id_sequence','audiolib_album_id_high_water','audiolib_album_audio_insert','audiolib_album_audio_update','audiolib_album_folder_delete','idx_albums_folder','idx_audio_album_members'))",[],|row|row.get(0)).map_err(db_error)?;
+        let old_index: Option<String> = source
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='idx_audio_visible_album' COLLATE NOCASE",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if collision
+            || old_index.is_some_and(|sql| {
+                !schema::definition::equivalent(
+                    &sql,
+                    "CREATE INDEX idx_audio_visible_album ON audio_files(album,id) WHERE missing=0",
+                )
+            })
+        {
+            return Err(Error::Validation(
+                "Shared album object name conflicts with an unknown extension".into(),
+            ));
+        }
+    }
     let unsupported_virtual: bool = source
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_list WHERE schema='main'
@@ -408,6 +431,24 @@ pub(crate) fn blueprint_with(
         execute_schema(&memory, sql)?;
     }
     for (name, sql) in &objects {
+        if name == "idx_audio_visible_album"
+            && schema::definition::equivalent(
+                sql,
+                "CREATE INDEX idx_audio_visible_album ON audio_files(album,id) WHERE missing=0",
+            )
+        {
+            continue;
+        }
+        if [
+            "audiolib_album_id_high_water",
+            "audiolib_album_audio_insert",
+            "audiolib_album_audio_update",
+            "audiolib_album_folder_delete",
+        ]
+        .contains(&name.as_str())
+        {
+            continue;
+        }
         if !schema::definition::needs_owned_repair(name, sql) {
             execute_schema(&memory, sql)?;
         }
@@ -417,15 +458,27 @@ pub(crate) fn blueprint_with(
     for change in changes {
         use crate::migration::SchemaChange;
         let sql = match change {
+            SchemaChange::CreateAlbumEntities => {
+                memory
+                    .execute_batch(crate::albums::SCHEMA)
+                    .map_err(db_error)?;
+                continue;
+            }
             SchemaChange::AddColumn {
                 table,
                 column,
                 definition,
-            } => format!(
-                "ALTER TABLE {} ADD COLUMN {} {definition}",
-                quote_identifier(table),
-                quote_identifier(column),
-            ),
+            } => {
+                let exists:bool=memory.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo(?1) WHERE name=?2 COLLATE NOCASE)",rusqlite::params![table,column],|row|row.get(0)).map_err(db_error)?;
+                if exists {
+                    continue;
+                }
+                format!(
+                    "ALTER TABLE {} ADD COLUMN {} {definition}",
+                    quote_identifier(table),
+                    quote_identifier(column)
+                )
+            }
             SchemaChange::DropDerivedColumn { table, column }
             | SchemaChange::RetireColumn { table, column } => {
                 let exists: bool = memory

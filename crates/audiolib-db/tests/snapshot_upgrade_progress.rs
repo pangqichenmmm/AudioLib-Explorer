@@ -137,7 +137,7 @@ fn assert_original_rows(path: &Path, records: i64) {
         .query_row("SELECT COUNT(*) FROM audio_files", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, records);
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM audio_files WHERE user_notes!='retain notes' OR user_tags!='retain tags' OR json_extract(metadata_json,'$.private')!='keep'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM audio_files WHERE user_notes!='retain notes' OR user_tags!='retain tags' OR json_extract(audiolib_metadata_json(metadata_json),'$.private')!='keep'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM play_history WHERE filename='retained history' AND file_path='retained path'", [], |r| r.get::<_, i64>(0)).unwrap(), i64::from(records > 0));
     assert_eq!(
         conn.query_row(
@@ -411,8 +411,9 @@ fn live_upgrade_resumes_each_committed_phase_without_repeating_rows() {
         let audit =
             Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
+        audiolib_db::register_library_functions(&audit).unwrap();
         assert_eq!(audit.query_row(
-            "SELECT COUNT(*) FROM audio_files WHERE user_notes!='retain notes' OR user_tags!='retain tags' OR json_extract(metadata_json,'$.private')!='keep'",
+            "SELECT COUNT(*) FROM audio_files WHERE user_notes!='retain notes' OR user_tags!='retain tags' OR json_extract(audiolib_metadata_json(metadata_json),'$.private')!='keep'",
             [], |r| r.get::<_, i64>(0),
         ).unwrap(), 0);
         assert!(!audit.table_exists(None, "play_history").unwrap());
@@ -626,7 +627,7 @@ fn uncommitted_copy_and_index_crashes_recover_before_resuming() {
         migration::verify(&job.directory, &cancel).unwrap();
         let audit = support::connection(&database).unwrap();
         assert!(!audit.table_exists(None, "uncommitted_crash_probe").unwrap());
-        assert_eq!(audit.query_row("SELECT COUNT(*) FROM audio_files WHERE user_notes!='retain notes' OR user_tags!='retain tags' OR json_extract(metadata_json,'$.private')!='keep'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(audit.query_row("SELECT COUNT(*) FROM audio_files WHERE user_notes!='retain notes' OR user_tags!='retain tags' OR json_extract(audiolib_metadata_json(metadata_json),'$.private')!='keep'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         drop(audit);
         let provider = SqliteProvider::open_read_only(&database).unwrap();
         assert_eq!(

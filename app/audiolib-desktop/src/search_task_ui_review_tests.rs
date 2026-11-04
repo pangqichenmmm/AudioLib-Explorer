@@ -16,15 +16,16 @@ fn directory_double_click_survives_real_worker_publication_without_all_sounds_fl
 fn child_directory_double_click() {
     let fixture = fixture();
     let ui = &fixture.ui;
-    for scale in [1.0, 2.0] {
+    for (modern, scale) in [(false, 1.0), (false, 2.0), (true, 1.0), (true, 2.0)] {
+        ui.global::<crate::Theme>().set_modern_style(modern);
         ui.global::<crate::Theme>().set_ui_scale(scale);
         ui.window()
             .set_size(slint::LogicalSize::new(1600.0 * scale, 900.0 * scale));
         ui.invoke_all_library_requested();
         let ready = fixture.controller.clone();
-        wait_for(ui, move |ui| !ui.get_searching() && fully_published(&ready));
+        wait_for_same_window(ui, move |ui| !ui.get_searching() && fully_published(&ready));
         let before_pair = Instant::now();
-        wait_for(ui, move |_| {
+        wait_for_same_window(ui, move |_| {
             before_pair.elapsed() >= Duration::from_millis(600)
         });
         let id = fixture.controller.tree.lock().unwrap().visible[0].0.id;
@@ -54,7 +55,7 @@ fn child_directory_double_click() {
         click_folder();
         let scope_was_blank = ui.get_selected_folder_path().is_empty();
         let ready = fixture.controller.clone();
-        wait_for(ui, move |ui| {
+        wait_for_same_window(ui, move |ui| {
             ui.get_selected_folder_path().ends_with("sounds")
                 && !ui.get_searching()
                 && fully_published(&ready)
@@ -70,7 +71,7 @@ fn child_directory_double_click() {
                 .unwrap()
                 .expanded
                 .contains(&id),
-            "Directory double-click was lost after worker publication: scale={scale}, elapsed={:?}, model_retained={}",
+            "Directory double-click was lost after worker publication: modern={modern}, scale={scale}, elapsed={:?}, model_retained={}",
             first_click_started.elapsed(),
             ui.get_folders() == before_model
         );
@@ -78,15 +79,35 @@ fn child_directory_double_click() {
             !scope_was_blank && !ui.get_selected_folder_path().is_empty(),
             "Selecting a directory must not temporarily activate All sounds"
         );
-        wait_for(ui, |ui| ui.get_folders().iter().any(|f| f.name == "gore"));
+        wait_for_same_window(ui, |ui| ui.get_folders().iter().any(|f| f.name == "gore"));
 
         let before_pair = Instant::now();
-        wait_for(ui, move |_| {
+        wait_for_same_window(ui, move |_| {
             before_pair.elapsed() >= Duration::from_millis(600)
         });
+        let search_state_before = {
+            let state = fixture.controller.task_workspace.lock().unwrap();
+            (
+                state.page_complete,
+                state.page_revision,
+                state.folders_revision,
+            )
+        };
         click_folder();
+        let search_state_after = {
+            let state = fixture.controller.task_workspace.lock().unwrap();
+            (
+                state.page_complete,
+                state.page_revision,
+                state.folders_revision,
+            )
+        };
+        assert_eq!(
+            search_state_after, search_state_before,
+            "Clicking the selected directory must not reset the current search"
+        );
         let ready = fixture.controller.clone();
-        wait_for(ui, move |ui| !ui.get_searching() && fully_published(&ready));
+        wait_for_same_window(ui, move |ui| !ui.get_searching() && fully_published(&ready));
         click_folder();
         assert!(
             !fixture
@@ -98,7 +119,7 @@ fn child_directory_double_click() {
                 .contains(&id),
             "Double-click must also collapse an already selected directory"
         );
-        wait_for(ui, |ui| ui.get_folders().row_count() == 1);
+        wait_for_same_window(ui, |ui| ui.get_folders().row_count() == 1);
         assert!(ui.get_selected_folder_path().ends_with("sounds"));
     }
     finish(&fixture);

@@ -64,6 +64,23 @@ pub struct MigrationJob {
     pub target_business: Option<BusinessDigest>,
     /// Target DDL identity prevents rollback from discarding later schema changes.
     pub target_schema_sha256: Option<String>,
+    /// Explicit new-library identity admission after protected publication.
+    #[serde(default)]
+    pub import_identity: Option<ImportIdentityAdmission>,
+}
+
+/// A restricted, recoverable new-library admission. Stored atomically with the
+/// new identity in the library receipt, then mirrored in the owned job record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportIdentityAdmission {
+    protocol: u32,
+    job_id: String,
+    pub(super) before: BusinessDigest,
+    after: BusinessDigest,
+    previous_namespace: String,
+    previous_legacy_scope: Option<String>,
+    namespace: String,
 }
 
 /// Owned progress DTO; observers may request cancellation by returning an error.
@@ -279,7 +296,12 @@ fn marker_matches(source: &Connection, job: &MigrationJob) -> Result<bool> {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(db_error)?;
-    if marker != (job.id.clone(), encode(&job.plan)?, 1, 6) {
+    // A job started by the previous target must stay resumable, and a job started by this
+    // build records the current target.
+    let target = i64::from(marker.3);
+    let current = crate::schema::SCHEMA_VERSION;
+    let accepted_target = (current - 1..=current).contains(&target);
+    if marker.0 != job.id || marker.1 != encode(&job.plan)? || marker.2 != 1 || !accepted_target {
         return Err(invalid(
             "Source belongs to a different or unsupported migration",
         ));
@@ -301,7 +323,12 @@ fn install_guards(source: &mut Connection, job: &MigrationJob, cancel: &AtomicBo
           target INTEGER NOT NULL,job_id TEXT NOT NULL,directory TEXT NOT NULL,plan TEXT NOT NULL);",
     ).map_err(db_error)?;
     tx.execute(
-        "INSERT INTO audiolib_storage_migration VALUES(1,1,6,?1,?2,?3)",
+        // Record the format this build publishes; the compatibility check also accepts the
+        // previous target, so an in-flight job from an older build can still resume.
+        &format!(
+            "INSERT INTO audiolib_storage_migration VALUES(1,1,{},?1,?2,?3)",
+            crate::schema::SCHEMA_VERSION
+        ),
         params![job.id, job.directory.to_string_lossy(), encode(&job.plan)?],
     )
     .map_err(db_error)?;
@@ -344,6 +371,179 @@ fn receipt_matches(source: &Connection, job: &MigrationJob) -> Result<bool> {
         .optional()
         .map_err(db_error)?;
     Ok(saved.as_deref() == Some(encode(&job.plan)?.as_str()))
+}
+
+fn import_receipt_key(job: &MigrationJob) -> String {
+    format!("import-identity:{}", job.id)
+}
+
+/// Finish the crash window between the library transaction and owned job save.
+/// Only the recorded identity substitution may reconstruct the old full digest.
+fn reconcile_import_identity(
+    source: &Connection,
+    job: &mut MigrationJob,
+    cancel: &AtomicBool,
+    allow_later_business: bool,
+) -> Result<Option<String>> {
+    if job.phase != MigrationPhase::Complete {
+        return Ok(None);
+    }
+    let saved: Option<String> = if table_exists(source, "audiolib_migration_receipts")? {
+        source
+            .query_row(
+                "SELECT plan FROM audiolib_migration_receipts WHERE job_id=?1",
+                [import_receipt_key(job)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?
+    } else {
+        None
+    };
+    let Some(saved) = saved else {
+        if job.import_identity.is_some() {
+            return Err(invalid(
+                "Published import identity lost its admission receipt",
+            ));
+        }
+        return Ok(None);
+    };
+    let proof: ImportIdentityAdmission = serde_json::from_str(&saved)
+        .map_err(|error| invalid(format!("Invalid import identity receipt: {error}")))?;
+    if proof.protocol != 1
+        || proof.job_id != job.id
+        || !receipt_matches(source, job)?
+        || uuid::Uuid::parse_str(&proof.namespace).is_err()
+        || uuid::Uuid::parse_str(&proof.previous_namespace).is_err()
+        || crate::albums::namespace(source)? != proof.namespace
+        || crate::albums::legacy_scope(source)?.is_some()
+        || (job.target_business.as_ref() != Some(&proof.before)
+            && job.target_business.as_ref() != Some(&proof.after))
+        || job
+            .import_identity
+            .as_ref()
+            .is_some_and(|saved| saved != &proof)
+    {
+        return Err(invalid(
+            "Import identity admission does not match its bound migration",
+        ));
+    }
+    // An already mirrored proof is idempotent startup admission, not a new
+    // acceptance of later annotations. Verify/rollback still compare the saved
+    // complete digest and refuse to discard those later values.
+    if allow_later_business
+        && job.import_identity.as_ref() == Some(&proof)
+        && job.target_business.as_ref() == Some(&proof.after)
+    {
+        return Ok(Some(proof.namespace.clone()));
+    }
+    if super::inspect::business_digest_before_import(
+        source,
+        &proof.before,
+        &proof.previous_namespace,
+        proof.previous_legacy_scope.as_deref(),
+        cancel,
+    )? != proof.before
+        || business_digest(source, cancel)? != proof.after
+    {
+        return Err(invalid(
+            "Library changed outside the recorded new-library identity admission",
+        ));
+    }
+    let namespace = proof.namespace.clone();
+    if job.import_identity.as_ref() != Some(&proof)
+        || job.target_business.as_ref() != Some(&proof.after)
+    {
+        job.target_business = Some(proof.after.clone());
+        job.import_identity = Some(proof);
+        job.save()?;
+    }
+    Ok(Some(namespace))
+}
+
+/// Called only by explicit import admission while its destination owner is held.
+/// All source writers/read generations are excluded; unknown-trigger side effects
+/// abort the library transaction rather than becoming part of the accepted proof.
+pub(crate) fn admit_import_identity(
+    path: &Path,
+    namespace: &str,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    if uuid::Uuid::parse_str(namespace).is_err() {
+        return Err(invalid("Invalid imported library namespace"));
+    }
+    let _leases = Leases::acquire(path)?;
+    let mut source = open_rw(path)?;
+    crate::register_library_functions(&source)?;
+    let mut completed = super::runtime::discover(path)?;
+    if let Some(job) = &mut completed {
+        validate_plan_identity(&job.plan)?;
+        if job.phase != MigrationPhase::Complete {
+            return Err(invalid(
+                "Complete protected migration before admitting a new library identity",
+            ));
+        }
+        backup_valid(job, cancel)?;
+        if !receipt_matches(&source, job)? {
+            return Err(invalid(
+                "Published migration lost its receipt before import admission",
+            ));
+        }
+        if let Some(namespace) = reconcile_import_identity(&source, job, cancel, true)? {
+            return Ok(namespace);
+        }
+        stage::verify_connection(&source, job, cancel)?;
+    }
+    let tx = source
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let before_projection = super::digest_import_admission(&tx, cancel)?;
+    let before = business_digest(&tx, cancel)?;
+    let previous_namespace = crate::albums::namespace(&tx)?;
+    let previous_legacy_scope = crate::albums::legacy_scope(&tx)?;
+    if previous_namespace == namespace && previous_legacy_scope.is_none() {
+        return Ok(namespace.to_owned());
+    }
+    tx.execute(
+        "UPDATE audiolib_album_id_sequence SET namespace=?1,legacy_scope=NULL WHERE singleton=1",
+        [namespace],
+    )
+    .map_err(db_error)?;
+    if super::digest_import_admission(&tx, cancel)? != before_projection {
+        return Err(invalid(
+            "New-library identity admission changed unrelated business data",
+        ));
+    }
+    let after = business_digest(&tx, cancel)?;
+    let proof = completed.as_ref().map(|job| ImportIdentityAdmission {
+        protocol: 1,
+        job_id: job.id.clone(),
+        before,
+        after: after.clone(),
+        previous_namespace,
+        previous_legacy_scope,
+        namespace: namespace.to_owned(),
+    });
+    if let Some(proof) = &proof {
+        let job = completed.as_ref().expect("proof has a migration");
+        tx.execute(
+            "INSERT INTO audiolib_migration_receipts(job_id,plan) VALUES(?1,?2)",
+            params![import_receipt_key(job), encode(proof)?],
+        )
+        .map_err(db_error)?;
+        if business_digest(&tx, cancel)? != after {
+            return Err(invalid(
+                "Import identity receipt changed unrelated business data",
+            ));
+        }
+    }
+    tx.commit().map_err(db_error)?;
+    if let (Some(job), Some(proof)) = (&mut completed, proof) {
+        job.target_business = Some(proof.after.clone());
+        job.import_identity = Some(proof);
+        job.save()?;
+    }
+    Ok(namespace.to_owned())
 }
 
 /// Create a durable job and execute it. Observer events expose the recovery directory
@@ -393,6 +593,7 @@ pub fn apply(
         backup_sha256: None,
         target_business: None,
         target_schema_sha256: None,
+        import_identity: None,
     };
     let state_path = job.artifact("job.sqlite")?;
     File::options()
@@ -465,6 +666,7 @@ fn run(
     validate_plan_identity(&job.plan)?;
     check_cancel(cancel)?;
     let mut source = open_rw(&job.plan.source.source)?;
+    reconcile_import_identity(&source, &mut job, cancel, false)?;
     if job.phase == MigrationPhase::RolledBack {
         return Ok(job);
     }
@@ -621,10 +823,11 @@ pub(super) fn copy_atomic(
 
 /// Verify a published result or owned candidate without changing the working library.
 pub fn verify(directory: &Path, cancel: &AtomicBool) -> Result<BusinessDigest> {
-    let job = load(directory)?;
+    let mut job = load(directory)?;
     validate_plan_identity(&job.plan)?;
     let _leases = Leases::acquire(&job.plan.source.source)?;
     let source = open_read(&job.plan.source.source)?;
+    reconcile_import_identity(&source, &mut job, cancel, false)?;
     if job.phase == MigrationPhase::RolledBack && job.backup_sha256.is_none() {
         check_source(&source, &job.plan, cancel)?;
         return business_digest(&source, cancel);
@@ -652,10 +855,11 @@ pub fn rollback(
     cancel: &AtomicBool,
     observer: &mut Observer<'_>,
 ) -> Result<MigrationJob> {
-    let job = load(directory)?;
+    let mut job = load(directory)?;
     validate_plan_identity(&job.plan)?;
     let _leases = Leases::acquire(&job.plan.source.source)?;
     let mut source = open_rw(&job.plan.source.source)?;
+    reconcile_import_identity(&source, &mut job, cancel, false)?;
     rollback_locked(job, &mut source, cancel, observer)
 }
 
@@ -704,4 +908,94 @@ fn rollback_locked(
     job.advance(MigrationPhase::RolledBack)?;
     job.notify(observer, job.phase, None, 0)?;
     Ok(job)
+}
+
+#[cfg(test)]
+mod import_identity_tests {
+    use super::*;
+    use audiolib_core::DataProvider;
+
+    #[test]
+    fn local_schema7_import_verifies_recovers_admission_commit_and_rolls_back() {
+        let (root, original) = crate::album_tests::previous_fixture();
+        let destination = root.path().join("imported.db");
+        let data = root.path().join("client");
+        fs::create_dir_all(&data).unwrap();
+        let original_bytes = fs::read(&original).unwrap();
+        crate::import_legacy_local(&original, &destination, &data, 0).unwrap();
+        let cancel = AtomicBool::new(false);
+        let job = super::super::runtime::discover(&destination)
+            .unwrap()
+            .unwrap();
+        let proof = job
+            .import_identity
+            .clone()
+            .expect("explicit admission proof");
+        assert_ne!(proof.previous_namespace, proof.namespace);
+        assert_eq!(verify(&job.directory, &cancel).unwrap(), proof.after);
+        stage::validate(&job, &cancel).unwrap();
+        // Simulate process loss after the atomic library+receipt commit but before
+        // mirroring that proof to job.sqlite. Verification must finish only it.
+        let mut interrupted = job.clone();
+        interrupted.target_business = Some(proof.before.clone());
+        interrupted.import_identity = None;
+        interrupted.save().unwrap();
+        assert_eq!(verify(&job.directory, &cancel).unwrap(), proof.after);
+        let repaired = load(&job.directory).unwrap();
+        assert_eq!(repaired.import_identity.as_ref(), Some(&proof));
+        let provider = crate::SqliteProvider::open_existing_local_with_progress_cancellable(
+            &destination,
+            &data,
+            0,
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(provider.album_namespace(), proof.namespace);
+        assert_eq!(provider.legacy_album_scope(), None);
+        assert_eq!(provider.get_audio(2).unwrap().notes, "second note");
+        drop(provider);
+        let conn = open_rw(&destination).unwrap();
+        crate::register_library_functions(&conn).unwrap();
+        conn.execute(
+            "UPDATE audio_files SET user_notes='later user edit' WHERE id=2",
+            [],
+        )
+        .unwrap();
+        assert!(verify(&job.directory, &cancel).is_err());
+        assert!(rollback(&job.directory, &cancel, &mut |_| Ok(())).is_err());
+        conn.execute(
+            "UPDATE audio_files SET user_notes='second note' WHERE id=2",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(verify(&job.directory, &cancel).unwrap(), proof.after);
+        let reverted = rollback(&job.directory, &cancel, &mut |_| Ok(())).unwrap();
+        assert_eq!(reverted.phase, MigrationPhase::RolledBack);
+        verify(&job.directory, &cancel).unwrap();
+        let conn = open_read(&destination).unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn import_identity_rejects_unknown_trigger_business_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("source.db");
+        let destination = root.path().join("new.db");
+        let source = crate::SqliteProvider::open(&original).unwrap();
+        source.writer().unwrap().execute_batch("CREATE TABLE vendor_audit(value INTEGER); INSERT INTO vendor_audit VALUES(0); CREATE TRIGGER vendor_identity_audit AFTER UPDATE OF namespace ON audiolib_album_id_sequence BEGIN UPDATE vendor_audit SET value=value+1; END;").unwrap();
+        drop(source);
+        let before = fs::read(&original).unwrap();
+        assert!(
+            matches!(crate::import_legacy(&original,&destination),Err(Error::Validation(message)) if message.contains("unrelated business data"))
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&original).unwrap(), before);
+    }
 }

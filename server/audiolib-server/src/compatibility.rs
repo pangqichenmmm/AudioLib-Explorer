@@ -239,6 +239,46 @@ mod tests {
     }
 
     #[test]
+    fn plain_target_headers_keep_experimental_compressed_read_support() {
+        use audiolib_core::compatibility::{METADATA_STORAGE_FEATURE, PLAN_B_V8_COMPRESSED_FORMAT};
+        let (headers, format) = fixture();
+        assert!(
+            !format
+                .format
+                .features
+                .contains_key(METADATA_STORAGE_FEATURE)
+        );
+        let mut response = HeaderMap::new();
+        response_headers(&mut response, &format).unwrap();
+        assert_eq!(response[SNAPSHOT_FORMAT_HEADER], PLAN_B_FORMAT);
+        let catalog: CompatibilityManifest =
+            serde_json::from_str(response[SERVER_COMPATIBILITY_HEADER].to_str().unwrap()).unwrap();
+        assert!(!catalog.features.contains_key(METADATA_STORAGE_FEATURE));
+        let history: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/audiolib-core/tests/fixtures/compatibility/format_fingerprint.json"
+        ))
+        .unwrap();
+        let legacy = SnapshotFormat {
+            id: PLAN_B_V8_COMPRESSED_FORMAT.into(),
+            format: serde_json::from_value(history["legacy_compressed"].clone()).unwrap(),
+        };
+        assert!(legacy.is_readable_by(&catalog));
+        let mut legacy_headers = headers.clone();
+        legacy_headers.insert(
+            ACCEPT_FORMATS_HEADER,
+            HeaderValue::from_static(PLAN_B_V8_COMPRESSED_FORMAT),
+        );
+        admit(&legacy_headers, &legacy).unwrap();
+        // A pre-change client must explicitly learn the new plain format.
+        let mut prior_client = catalog;
+        prior_client
+            .snapshot_read_formats
+            .retain(|id| id != PLAN_B_FORMAT);
+        let error = admit(&with_catalog(&headers, &prior_client), &format).unwrap_err();
+        assert_eq!(error.code(), "SNAPSHOT_FORMAT_UNSUPPORTED");
+    }
+
+    #[test]
     fn exact_format_and_mutual_versions_are_required_independently() {
         let (headers, format) = fixture();
         admit(&headers, &format).unwrap();
@@ -423,11 +463,31 @@ mod tests {
     }
 
     fn legacy_format() -> SnapshotFormat {
-        let mut format = LibraryFormat::target();
-        format.schema_version = 5;
-        format.storage = audiolib_core::compatibility::SearchStorage::ExternalContent;
-        format.features.remove("search_storage");
-        format.features.remove("play_history_retired");
+        // Inspect the retained historical layout instead of subtracting selected
+        // features from a target which can acquire new schema requirements.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schema-v5.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!(
+            "../../../crates/audiolib-db/tests/fixtures/schema-v5.sql"
+        ))
+        .unwrap();
+        drop(conn);
+        let inspection = audiolib_db::migration::inspect(
+            &path,
+            audiolib_core::compatibility::LibraryAccess::Read,
+            false,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(inspection.evidence.identified_library);
+        assert!(inspection.evidence.search_ready);
+        let format = inspection.format;
+        assert_eq!(format.schema_version, 5);
+        assert_eq!(
+            format.snapshot_format_id().as_deref(),
+            Some("ale-s5-ext-t3-m2")
+        );
         SnapshotFormat {
             id: format.snapshot_format_id().unwrap(),
             format,

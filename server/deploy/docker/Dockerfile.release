@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+# server/deploy/docker/Dockerfile.release
+# Runtime-only image. The packaging wrapper validates VERSION/REVISION and supplies
+# a tiny context containing payload/ (an accepted public Linux server package) and
+# config.docker.toml. Never use a working checkout or a runtime data directory here.
+ARG DEBIAN_RELEASE=bookworm
+FROM debian:${DEBIAN_RELEASE}-slim
+
+ARG VERSION
+ARG REVISION
+ARG WITH_FFMPEG=true
+
+LABEL org.opencontainers.image.title="AudioLib Explorer server" \
+      org.opencontainers.image.description="Audio library HTTP server (/api/v1)" \
+      org.opencontainers.image.source="https://github.com/Freedragonlancer/AudioLib-Explorer" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.licenses="GPL-3.0-only"
+
+# FFmpeg is optional and used only for codec=flac previews. Its distribution
+# copyright/license files remain in the image alongside the packaged Rust notices.
+RUN case "$WITH_FFMPEG" in true|false) ;; *) echo 'WITH_FFMPEG must be true or false' >&2; exit 1 ;; esac \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && if [ "$WITH_FFMPEG" = "true" ]; then apt-get install -y --no-install-recommends ffmpeg; fi \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 audiolib \
+ && useradd --system --uid 10001 --gid 10001 --home-dir /data --no-create-home --shell /usr/sbin/nologin audiolib \
+ && install -d -m 755 -o audiolib -g audiolib /data /config /music
+
+# This includes LICENSE, THIRD_PARTY.md, licenses/ and update-version metadata;
+# the wrapper has already rejected private files, links and an unrelated binary.
+COPY payload/ /opt/audiolibserver/
+COPY --chmod=0644 config.docker.toml /config/config.toml
+
+# Execute only --version: no library/config is opened at image-build time. This
+# also rejects a payload that cannot run against this image's architecture/glibc.
+RUN test -n "$VERSION" \
+ && test "${#REVISION}" -eq 40 \
+ && case "$REVISION" in *[!0-9a-f]*) echo 'REVISION must be a full Git commit' >&2; exit 1 ;; esac \
+ && test -r /opt/audiolibserver/LICENSE \
+ && test -r /opt/audiolibserver/THIRD_PARTY.md \
+ && test -r /opt/audiolibserver/licenses/dependencies.json \
+ && chmod 755 /opt/audiolibserver/audiolib-server \
+ && test "$(/opt/audiolibserver/audiolib-server --version)" = "audiolib-server ${VERSION%%-*}" \
+ && test "$(tr -d '\r\n' < /opt/audiolibserver/update-version.txt)" = "$VERSION"
+
+USER 10001:10001
+WORKDIR /data
+VOLUME ["/data"]
+EXPOSE 8790
+ENV AUDIOLIB_SERVER_CONFIG=/config/config.toml \
+    AUDIOLIB_UPDATE_DISABLE=1
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -fsS --max-time 4 http://127.0.0.1:8790/api/v1/health | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' || exit 1
+ENTRYPOINT ["/opt/audiolibserver/audiolib-server"]

@@ -13,6 +13,20 @@ pub fn source_description<'a>(bwf: &'a str, attributes: &'a Value) -> &'a str {
         .unwrap_or(bwf)
 }
 
+/// Library/album name carried by the file's own Metadata (`fields.library`, filled from
+/// Soundminer `<Library>`, ID3 `TALB` or RIFF `IPRD`). Empty means the file declares no
+/// Metadata album. A shared folder fallback is represented separately by `Album`;
+/// it must not overwrite this declared Metadata value.
+pub fn album(attributes: &Value) -> String {
+    let value = &attributes["wav_metadata"]["fields"]["library"];
+    let text = match value {
+        Value::String(text) => text.as_str(),
+        Value::Array(items) => items.iter().filter_map(Value::as_str).next().unwrap_or(""),
+        _ => "",
+    };
+    text.trim().to_owned()
+}
+
 /// `wav_metadata.fields` keys that feed `source_tags` and the derived search text.
 pub const SOURCE_TAG_KEYS: [&str; 5] = [
     "keywords",

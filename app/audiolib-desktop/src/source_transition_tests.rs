@@ -90,6 +90,7 @@ pub(super) fn configuration(preferences: &Path) -> AppConfig {
         .unwrap(),
         audition_play_on_single_click: false,
         play_history_limit: audiolib_core::config::PLAY_HISTORY_LIMIT_PER_LIBRARY,
+        show_album_artwork: true,
         pregenerate_list_waveforms: false,
         hold_list_waveform_batches_after_audition: false,
         max_search_tasks: 6,
@@ -198,15 +199,22 @@ fn legacy_peer_preflight(listener: &std::net::TcpListener) {
 pub(super) fn run_until(ui: &AppWindow, ready: impl Fn() -> bool + 'static) {
     let started = Instant::now();
     let timer = slint::Timer::default();
+    let finished = std::cell::Cell::new(false);
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(10),
         move || {
+            // The testing backend can tick again before consuming Quit. A second
+            // Quit would prematurely end the next transition's event loop.
+            if finished.get() {
+                return;
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(12),
                 "GUI transition timed out"
             );
             if ready() {
+                finished.set(true);
                 slint::quit_event_loop().unwrap();
             }
         },

@@ -6,7 +6,7 @@
 param(
     [Parameter(Mandatory)][string]$Tag,
     [Parameter(Mandatory)]
-    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')]
+    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin')]
     [string]$Target,
     # A directory containing the target binary, or the binary itself.
     [string]$BinaryPath,
@@ -22,14 +22,19 @@ $tagMatch = [regex]::Match($Tag, '^v(\d+\.\d+\.\d+)(?:-(?:rc|beta)\.(?:0|[1-9]\d
 if (!$tagMatch.Success) { throw 'Tag must be vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N / -beta.N.' }
 $version = $tagMatch.Groups[1].Value
 if ($Asio -and ($Target -cne 'x86_64-pc-windows-msvc' -or !$IsWindows)) { throw '-Asio requires the native Windows server target.' }
+$taskProcessArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
 switch ($Target) {
     'x86_64-pc-windows-msvc' {
         if (!$IsWindows) { throw 'The Windows server must be packaged on Windows.' }
         $platformName = 'win-x64'; $binaryName = 'audiolib-server.exe'; $archiveExtension = 'zip'
     }
     'x86_64-unknown-linux-gnu' {
-        if (!$IsLinux) { throw 'The Linux server must be packaged on Linux.' }
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'The Linux x64 server must be packaged on Linux x64.' }
         $platformName = 'linux-x64'; $binaryName = 'audiolib-server'; $archiveExtension = 'tar.gz'
+    }
+    'aarch64-unknown-linux-gnu' {
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) { throw 'The Linux arm64 server must be packaged on Linux arm64.' }
+        $platformName = 'linux-arm64'; $binaryName = 'audiolib-server'; $archiveExtension = 'tar.gz'
     }
     'aarch64-apple-darwin' {
         if (!$IsMacOS) { throw 'The macOS server must be packaged on macOS.' }
@@ -119,7 +124,11 @@ foreach ($relative in $publicFiles) {
     Assert-Within (Join-Path $taskRoot $relative) $taskRoot
     Assert-Unlinked (Join-Path $taskRoot $relative)
 }
-if (!$BinaryPath) { $BinaryPath = Join-Path $taskRoot "target/$Target/release" }
+if (!$BinaryPath) {
+    # Match Cargo and package-portable.ps1: honor CARGO_TARGET_DIR when it is set.
+    $targetRoot = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $taskRoot) } else { Join-Path $taskRoot 'target' }
+    $BinaryPath = Join-Path $targetRoot "$Target/release"
+}
 $binarySource = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($BinaryPath)) { $BinaryPath } else { Join-Path $taskRoot $BinaryPath }))
 Assert-Unlinked $binarySource
 if (Test-Path -LiteralPath $binarySource -PathType Container) { $binarySource = Join-Path $binarySource $binaryName }
@@ -234,6 +243,8 @@ try {
     Assert-UnlinkedTree $payloadRoot
     $payloadFiles = @(Get-ChildItem -LiteralPath $payloadRoot -File -Recurse -Force)
     if ($payloadFiles.Count -ne $plannedFiles.Count) { throw 'Server package file count differs from its allowlist.' }
+    $compatibilityEntries = @($payloadFiles | ForEach-Object { [IO.Path]::GetRelativePath($payloadRoot, $_.FullName).Replace('\', '/') })
+    & (Join-Path $PSScriptRoot 'validate-update-compatibility.ps1') -Product Server -ServerBinaryName $binaryName -Entries $compatibilityEntries
     foreach ($file in $payloadFiles) {
         $relative = [IO.Path]::GetRelativePath($payloadRoot, $file.FullName).Replace('\', '/')
         if (!$plannedFiles.Contains($relative) -or $file.Extension -in @('.db', '.sqlite', '.sqlite3', '.log', '.wav') -or

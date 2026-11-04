@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1916" height="56" viewBox="0 0 1000 100" preserveAspectRatio="none">
+  <defs>
+    <linearGradient id="base"><stop stop-color="#323133"/><stop offset=".25" stop-color="#272729"/><stop offset=".55" stop-color="#222629"/><stop offset=".8" stop-color="#28282a"/><stop offset="1" stop-color="#302e30"/></linearGradient>
+    <radialGradient id="warm-left" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(340 -50) scale(190 280)">
+      <stop stop-color="#8d5a4a" stop-opacity=".28"/><stop offset=".25" stop-color="#8d5a4a" stop-opacity=".218"/><stop offset=".5" stop-color="#8d5a4a" stop-opacity=".103"/><stop offset=".75" stop-color="#8d5a4a" stop-opacity=".029"/><stop offset="1" stop-color="#8d5a4a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="warm-right" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(700 -50) scale(160 280)">
+      <stop stop-color="#9c5841" stop-opacity=".32"/><stop offset=".25" stop-color="#9c5841" stop-opacity=".249"/><stop offset=".5" stop-color="#9c5841" stop-opacity=".118"/><stop offset=".75" stop-color="#9c5841" stop-opacity=".034"/><stop offset="1" stop-color="#9c5841" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shade" x2="0" y2="1"><stop stop-opacity="0"/><stop offset="1" stop-opacity=".08"/></linearGradient>
+  </defs>
+  <path fill="url(#base)" d="M0 0h1000v100H0z"/><path fill="url(#warm-left)" d="M0 0h1000v100H0z"/><path fill="url(#warm-right)" d="M0 0h1000v100H0z"/><path fill="url(#shade)" d="M0 0h1000v100H0z"/>
+</svg>

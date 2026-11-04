@@ -1,0 +1,27 @@
+# server/deploy/docker/docker-compose.release.yml
+# Use an already loaded/pulled release image; the source-build example remains
+# docker-compose.yml. Supply an existing library.db in the data volume first.
+# AUDIOLIB_SERVER_IMAGE selects a version/digest; AUDIOLIB_SERVER_TOKEN is required.
+services:
+  audiolib-server:
+    image: ${AUDIOLIB_SERVER_IMAGE:-audiolib-server:local-release}
+    user: "10001:10001"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AUDIOLIB_SERVER_PORT:-8790}:8790"
+    environment:
+      AUDIOLIB_SERVER_TOKEN: ${AUDIOLIB_SERVER_TOKEN:?set AUDIOLIB_SERVER_TOKEN}
+      AUDIOLIB_SERVER_CONFIG: /config/config.toml
+      AUDIOLIB_UPDATE_DISABLE: "1"
+    volumes:
+      - "${AUDIOLIB_MUSIC_DIR:-/srv/audiolib/music}:/music:ro"
+      - audiolib-data:/data
+      # - ./my-config.toml:/config/config.toml:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  audiolib-data:

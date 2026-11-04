@@ -297,7 +297,7 @@ fn check_connection(conn: &Connection) -> Result<IntegrityReport> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    let current = version == schema::SCHEMA_VERSION;
+    let current = version >= 6;
     match conn.execute(
         if current {
             "INSERT INTO audio_search(audio_search) VALUES('integrity-check')"
@@ -662,6 +662,11 @@ impl SqliteProvider {
                 schema::audio_id_high_water(&writer)?
             };
             schema::retain_audio_id_high_water(&target, high_water)?;
+            let album_high_water = {
+                let writer = self.writer_unlocked()?;
+                crate::albums::high_water(&writer)?
+            };
+            crate::albums::retain_high_water(&target, album_high_water)?;
             let page_size = self
                 .writer_unlocked()?
                 .pragma_query_value(None, "page_size", |row| row.get(0))
@@ -704,6 +709,22 @@ impl SqliteProvider {
                 std::sync::atomic::Ordering::Release,
             );
         }
+        let identity = {
+            let writer = self.writer_unlocked()?;
+            (
+                crate::albums::namespace(&writer)?,
+                crate::albums::legacy_scope(&writer)?,
+            )
+        };
+        *self
+            .album_namespace
+            .write()
+            .map_err(|_| Error::Database("Album namespace lock was poisoned".into()))? = identity.0;
+        *self
+            .legacy_album_scope
+            .write()
+            .map_err(|_| Error::Database("Legacy album scope lock was poisoned".into()))? =
+            identity.1;
         Ok(RestoreReport {
             source: source.to_path_buf(),
             rollback_backup,
@@ -1213,6 +1234,7 @@ impl SqliteProvider {
                 .map_err(db_error)?;
         }
         refresh_folder_statistics(&tx)?;
+        tx.execute("UPDATE albums SET name=COALESCE((SELECT folder_name FROM folders WHERE id=albums.folder_id),name) WHERE kind='folder'",[]).map_err(db_error)?;
         check_cancel()?;
         tx.commit().map_err(db_error)?;
         Ok(moved_files.len() as u64)

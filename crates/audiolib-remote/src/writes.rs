@@ -17,10 +17,10 @@ use audiolib_core::waveform_cache::{
     WaveformCacheSettingsPatch, WaveformCacheStatus, WaveformJobControl, WaveformJobMode,
 };
 use audiolib_core::{
-    AudioFile, BackupReport, BatchMetadataReport, BatchMetadataRequest, DataProvider, Error,
-    Folder, IntegrityReport, LibraryExportFormat, LibraryInfo, LibraryStats, ListWaveformBatch,
-    ListWaveformSource, MaintenanceAction, MaintenanceReport, MetadataPatch, RestoreReport,
-    ScanSession, SearchPage, SearchRequest, TransferReport,
+    Album, AlbumFacet, AudioFile, BackupReport, BatchMetadataReport, BatchMetadataRequest,
+    DataProvider, Error, Folder, IntegrityReport, LibraryExportFormat, LibraryInfo, LibraryStats,
+    ListWaveformBatch, ListWaveformSource, MaintenanceAction, MaintenanceReport, MetadataPatch,
+    RestoreReport, ScanSession, SearchPage, SearchRequest, TransferReport,
 };
 use audiolib_db::SqliteProvider;
 use std::path::Path;
@@ -264,6 +264,33 @@ impl RemoteWriter {
         }
     }
 
+    fn enrich_album_projection(&self, files: &mut [AudioFile]) {
+        if !files.iter().any(|file| file.album_id.is_none()) {
+            return;
+        }
+        let Some(state) = self.cache.state(&self.library_id) else {
+            return;
+        };
+        if !state
+            .format
+            .as_ref()
+            .is_some_and(|format| format.local.schema_version >= 8)
+        {
+            return;
+        }
+        let Ok(snapshot) = SqliteProvider::open_read_only(&self.cache.database_path(&state)) else {
+            return;
+        };
+        for file in files {
+            if file.album_id.is_none()
+                && let Ok(local) = snapshot.get_audio(file.id)
+            {
+                file.album_id = local.album_id;
+                file.album_entity = local.album_entity;
+            }
+        }
+    }
+
     /// `PATCH /audio/{id}/metadata`, then the revision rule.
     pub fn update_metadata(
         &self,
@@ -278,12 +305,16 @@ impl RemoteWriter {
             revision_before,
             revision,
         } = self.client.patch_metadata(id, patch)?;
-        Ok(self.finish(
+        let mut outcome = self.finish(
             file.clone(),
             std::slice::from_ref(&file),
             revision_before,
             revision,
-        ))
+        );
+        if matches!(outcome.cache, CacheUpdate::Applied { .. }) {
+            self.enrich_album_projection(std::slice::from_mut(&mut outcome.value));
+        }
+        Ok(outcome)
     }
 
     /// `POST /audio/metadata/batch`, then the revision rule. The value carries the
@@ -297,11 +328,14 @@ impl RemoteWriter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let BatchWrite {
             report,
-            files,
+            mut files,
             revision_before,
             revision,
         } = self.client.batch_metadata(request)?;
         let outcome = self.finish((), &files, revision_before, revision);
+        if matches!(outcome.cache, CacheUpdate::Applied { .. }) {
+            self.enrich_album_projection(&mut files);
+        }
         Ok(WriteOutcome {
             value: (report, files),
             revision_before: outcome.revision_before,
@@ -479,11 +513,61 @@ impl DataProvider for RemoteProvider {
     fn get_audio(&self, id: i64) -> audiolib_core::Result<AudioFile> {
         self.snapshot.get_audio(id)
     }
+    fn album_facets(&self, request: &SearchRequest) -> audiolib_core::Result<Vec<AlbumFacet>> {
+        self.snapshot.album_facets(request)
+    }
+    fn album_facets_cancellable(
+        &self,
+        request: &SearchRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> audiolib_core::Result<Vec<AlbumFacet>> {
+        self.snapshot.album_facets_cancellable(request, cancel)
+    }
+    fn get_album(&self, id: i64) -> audiolib_core::Result<Album> {
+        self.snapshot.get_album(id)
+    }
+    fn album_members(
+        &self,
+        id: i64,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> audiolib_core::Result<Vec<AudioFile>> {
+        self.snapshot.album_members(id, limit, cancel)
+    }
+    fn album_members_in_folder(
+        &self,
+        id: i64,
+        folder_id: i64,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> audiolib_core::Result<Vec<AudioFile>> {
+        self.snapshot
+            .album_members_in_folder(id, folder_id, limit, cancel)
+    }
+    fn album_members_in_unassigned_directory(
+        &self,
+        id: i64,
+        directory: &str,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> audiolib_core::Result<Vec<AudioFile>> {
+        self.snapshot
+            .album_members_in_unassigned_directory(id, directory, limit, cancel)
+    }
     fn folders(&self, parent_id: Option<i64>) -> audiolib_core::Result<Vec<Folder>> {
         self.snapshot.folders(parent_id)
     }
     fn update_metadata(&self, id: i64, patch: &MetadataPatch) -> audiolib_core::Result<AudioFile> {
-        self.settle(self.writer.update_metadata(id, patch))
+        let mut file = self.settle(self.writer.update_metadata(id, patch))?;
+        // Legacy servers omit shared entities. Return their authoritative annotations
+        // together with the local projection, rather than erasing the UI's binding.
+        if file.album_id.is_none()
+            && let Ok(local) = self.snapshot.get_audio(id)
+        {
+            file.album_id = local.album_id;
+            file.album_entity = local.album_entity;
+        }
+        Ok(file)
     }
     fn stats(&self) -> audiolib_core::Result<LibraryStats> {
         self.snapshot.stats()

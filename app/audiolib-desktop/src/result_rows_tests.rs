@@ -35,7 +35,7 @@ fn click(ui: &AppWindow, position: slint::LogicalPosition) {
 }
 
 #[test]
-fn metadata_refresh_preserves_native_double_click_for_the_same_ordered_ids() {
+fn metadata_refresh_and_append_preserve_native_double_click_for_existing_ids() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
@@ -57,14 +57,14 @@ fn metadata_refresh_preserves_native_double_click_for_the_same_ordered_ids() {
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(40));
     let mut refreshed = first;
     refreshed.tags = "new annotation".into();
-    publish_audio_rows(&ui, vec![refreshed, other]);
+    publish_audio_rows(&ui, vec![refreshed, other, row("44", "Appended.wav")]);
     assert_eq!(ui.get_rows().row_data(0).unwrap().tags, "new annotation");
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(60));
     click(&ui, position);
     assert_eq!(
         &*auditions.borrow(),
         &[0],
-        "Refreshing Metadata between clicks must not discard the double-click"
+        "Refreshing Metadata and appending results must retain the double-click"
     );
     ui.hide().unwrap();
 }

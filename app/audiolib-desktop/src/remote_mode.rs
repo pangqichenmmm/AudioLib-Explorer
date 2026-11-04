@@ -83,7 +83,7 @@ mod server_removal;
 mod source_consistency_tests;
 #[path = "source_manager.rs"]
 mod source_manager;
-pub(super) use source_manager::RootOperation;
+pub(super) use source_manager::{LocalSourceRequest, RootOperation};
 #[cfg(test)]
 #[path = "snapshot_refresh_tests.rs"]
 mod snapshot_refresh_tests;
@@ -684,6 +684,34 @@ impl Controller {
         self.remote_mode.load(Ordering::Acquire)
     }
 
+    /// Capture the active snapshot and an artwork-capable client without holding locks
+    /// during credential loading or HTTP work. Older servers simply have no context.
+    pub(super) fn remote_artwork_context(
+        &self,
+    ) -> Option<(RemoteClient, CacheState, audiolib_remote::Capabilities)> {
+        if !self.remote_read_only() {
+            return None;
+        }
+        let settings = self.config.lock().unwrap().data_source.clone();
+        let (state, capabilities) = {
+            let remote = self.remote.lock().unwrap();
+            let capabilities = remote
+                .manage
+                .capabilities_for(&settings.server_url)?
+                .clone();
+            if remote.library_changed
+                || !(capabilities.album_artwork_usable()
+                    || capabilities.album_entity_artwork_usable())
+            {
+                return None;
+            }
+            (remote.state.clone()?, capabilities)
+        };
+        let secrets = self.secrets();
+        let client = RemoteClient::new(&settings.server_url, &secrets.token).ok()?;
+        Some((client, state, capabilities))
+    }
+
     /// Refuse a structural library write in server mode with a clear message; returns true
     /// if refused. Annotation edits are not refused: they go to the server.
     pub(super) fn refuse_remote_write(&self) -> bool {
@@ -1082,6 +1110,20 @@ impl Controller {
     pub(super) fn playback_display_name(&self, path: &Path) -> String {
         let remote = self.remote.lock().unwrap();
         playback_name(path, remote.audio_names.get(path).map(String::as_str))
+    }
+
+    /// Original resource path for a cached audition, independent of inspector selection.
+    /// Clone only the path; embedded Metadata stays in the cached owned record.
+    pub(super) fn playback_source_path(&self, path: &Path) -> String {
+        self.remote
+            .lock()
+            .unwrap()
+            .audio_files
+            .get(path)
+            .map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |file| file.file_path.clone(),
+            )
     }
 
     /// Wait off the UI thread after source/library/close admission has been closed.
@@ -2353,9 +2395,20 @@ impl Controller {
         self.run_library_operation(LibraryOperation::DataSource(target));
     }
 
-    /// Worker-side provider swap; runs inside `run_library_operation` after the
-    /// Metadata FIFO and scans have drained and readers were invalidated.
-    pub(super) fn switch_data_source(&self, target: &DataSourceSwitch) -> Result<String, String> {
+    #[cfg(test)]
+    fn switch_data_source(&self, target: &DataSourceSwitch) -> Result<String, String> {
+        self.switch_data_source_with_progress(
+            target,
+            &mut super::library_progress::LibraryProgress::new(self),
+        )
+    }
+
+    /// Worker-side provider swap after Metadata and scans drain and readers expire.
+    pub(super) fn switch_data_source_with_progress(
+        &self,
+        target: &DataSourceSwitch,
+        progress: &mut super::library_progress::LibraryProgress,
+    ) -> Result<String, String> {
         let chinese = self.chinese.load(Ordering::Acquire);
         // Playback streams belong to the snapshot being replaced.
         self.stop_remote_stream();
@@ -2370,25 +2423,12 @@ impl Controller {
                         path.display()
                     ));
                 }
-                let next = if path.exists() {
-                    SqliteProvider::open_existing_local_with_progress_cancellable(
-                        &path,
-                        &config.data_root(),
-                        config.play_history_limit,
-                        &AtomicBool::new(false),
-                        |_| {},
-                    )
-                } else {
-                    SqliteProvider::open_local_with_progress_cancellable(
-                        &path,
-                        &config.data_root(),
-                        config.play_history_limit,
-                        &AtomicBool::new(false),
-                        |_| {},
-                    )
-                }
-                .map_err(|error| error.local_display_text(chinese))?;
-                crate::startup::prepare_local_search(&next);
+                let next = self.open_local_for_switch(&path, !path.exists(), false, progress)?;
+                progress.stage(
+                    "applying_local",
+                    "正在应用本地音效库…",
+                    "Applying the local library…",
+                );
                 *self.sqlite.write().unwrap() = Arc::new(next);
                 self.remote_mode.store(false, Ordering::Release);
                 let mut remote = self.remote.lock().unwrap();
@@ -4544,8 +4584,41 @@ mod tests {
         // The player shows the record's name, not its virtual registration name.
         assert_ne!(path.file_name().unwrap().to_string_lossy(), file.filename);
         assert_eq!(controller.playback_display_name(&path), file.filename);
+        assert_eq!(controller.playback_source_path(&path), file.file_path);
+        assert_eq!(
+            controller.playback_source_path(Path::new("C:/Local/Unmapped.wav")),
+            "C:/Local/Unmapped.wav"
+        );
         assert!(audiolib_audio::is_stream_source(&path));
         assert_eq!(audiolib_audio::probe(&path).unwrap().sample_rate, 48000);
+        // Exercise the actual engine Load boundary, not just the HTTP reader: the
+        // virtual registration does not exist on disk and must still become Ready.
+        // Load/Seek/Stop require no output device and never emit sound in this test.
+        let loaded = controller
+            .audio
+            .send_and_wait(
+                audiolib_audio::AudioCommand::Load(path.clone()),
+                Duration::from_secs(4),
+            )
+            .unwrap();
+        assert_eq!(loaded.state, audiolib_audio::PlaybackState::Ready);
+        assert_eq!(loaded.file_path.as_deref(), Some(path.as_path()));
+        assert_eq!(loaded.sample_rate, file.sample_rate);
+        assert_eq!(loaded.channels, file.channels);
+        assert_eq!(loaded.duration, file.duration);
+        let seeked = controller
+            .audio
+            .send_and_wait(
+                audiolib_audio::AudioCommand::Seek(file.duration),
+                Duration::from_secs(4),
+            )
+            .unwrap();
+        assert_eq!(seeked.position, file.duration);
+        assert_eq!(seeked.state, audiolib_audio::PlaybackState::Ready);
+        controller
+            .audio
+            .send_and_wait(audiolib_audio::AudioCommand::Stop, Duration::from_secs(4))
+            .unwrap();
         let original_stream = controller
             .remote_stream
             .lock()

@@ -120,7 +120,7 @@ fn source_metadata_search_rebuild_upgrade_and_rescan_preserve_annotations() {
     // Simulate a pre-upgrade record without changing the source size or timestamp.
     let connection = Connection::open(provider.database_path()).unwrap();
     audiolib_db::register_library_functions(&connection).unwrap();
-    connection.execute("UPDATE audio_files SET metadata_json=json_set(json_remove(metadata_json,'$.wav_metadata'),'$.plugin_private','preserved') WHERE id=?1", [file.id]).unwrap();
+    connection.execute("UPDATE audio_files SET metadata_json=json_set(json_remove(audiolib_metadata_json(metadata_json),'$.wav_metadata'),'$.plugin_private','preserved') WHERE id=?1", [file.id]).unwrap();
     let refreshed = scan();
     assert_eq!(refreshed.updated, 1);
     assert_eq!(refreshed.unchanged, 0);
@@ -200,7 +200,7 @@ fn incremental_scan_refreshes_unsupported_and_old_extraction_versions() {
         // Imported extension Metadata is valid JSON, but need not have our owned types.
         connection
             .execute(
-                "UPDATE audio_files SET metadata_json=json_set(metadata_json,
+                "UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),
                  '$.wav_metadata.version',json(?1),'$.plugin_private','keep') WHERE id=?2",
                 rusqlite::params![marker, id],
             )

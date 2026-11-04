@@ -110,6 +110,12 @@ if ($apiVersions.Count -ne 1) { Fail "Expected exactly one API version in server
 $api = if ($apiVersions.Count -eq 1) { "v$($apiVersions[0])" }
 
 # 5. Schema change vs base tag => at least MINOR bump
+# The withdrawn v0.8.0 Release keeps its tag. Only the 0.8.1
+# series uses the last actually published release; explicit -BaseTag always wins.
+if (!$BaseTag -and $tagCore -ceq '0.8.1') {
+    $BaseTag = 'v0.7.8'
+    Write-Host '0.8.1 release baseline: v0.7.8 (withdrawn v0.8.0 tag remains unchanged).'
+}
 if (!$BaseTag) {
     $candidates = @(git -C $Root tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $Tag -and $_ -match '^v\d+\.\d+\.\d+$' })
     if ($LASTEXITCODE -ne 0) { Fail 'git tag --list failed.' }

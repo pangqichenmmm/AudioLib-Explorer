@@ -498,7 +498,8 @@ enum ProbeOutcome {
 }
 
 const FINGERPRINT_SQL: &str = "SELECT file_path,id,COALESCE(file_size,0),source_mtime_ns,\
-    COALESCE(json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,\
+    COALESCE(json_extract(CASE WHEN json_valid(audiolib_metadata_json(metadata_json)) \
+    THEN audiolib_metadata_json(metadata_json) ELSE '{}' END,\
     '$.wav_metadata.version'),0) FROM audio_files WHERE path_key=?1";
 
 fn probe_entry(

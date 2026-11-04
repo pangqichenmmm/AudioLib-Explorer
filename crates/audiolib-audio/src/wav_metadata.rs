@@ -5,7 +5,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 use serde_json::{Map, Value, json};
 
 /// Increment when extraction changes so an ordinary scan refreshes old records.
-pub const WAV_METADATA_VERSION: i64 = 3;
+pub const WAV_METADATA_VERSION: i64 = 4;
 pub(crate) const MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 // Modern SMED includes UTF-16 base64 artwork (the supplied BOOM files use ~4 MiB).
 pub(crate) const MAX_SMED_BYTES: u64 = 16 * 1024 * 1024;
@@ -13,6 +13,21 @@ pub(crate) const MAX_METADATA_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FIELDS: usize = 16_384;
 const MAX_XML_DEPTH: usize = 32;
 const MAX_FIELD_PATH_BYTES: usize = 4096;
+/// Bounded decoded cover payload; larger pictures are ignored rather than retained.
+pub(crate) const MAX_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
+// An ID3 tag can contain one bounded image plus text/frame overhead. Ordinary
+// Metadata extraction still skips binary frames and caps copied text separately.
+pub(crate) const MAX_ID3_BYTES: u64 = MAX_ARTWORK_BYTES as u64 + MAX_CHUNK_BYTES;
+
+/// Cover artwork embedded in the WAV itself (ID3 or SMED), kept separate from Metadata JSON
+/// so a multi-megabyte image never reaches SQLite or FTS5.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Artwork {
+    /// Original JPEG/PNG bytes, never re-encoded by the extractor.
+    pub bytes: Vec<u8>,
+    /// MIME type detected from the image magic, never trusted from a tag declaration.
+    pub mime: String,
+}
 
 pub(crate) fn text(bytes: &[u8]) -> String {
     let bytes = bytes.split(|b| *b == 0).next().unwrap_or_default();
@@ -81,10 +96,64 @@ pub(crate) struct EmbeddedMetadata {
     groups: Map<String, Value>,
     chunks: Vec<Value>,
     warnings: Vec<String>,
+    artwork: Option<Artwork>,
+    artwork_priority: Option<ArtworkPriority>,
+}
+
+// A valid ID3 picture overrides SMED regardless of RIFF chunk order. Within ID3,
+// prefer an explicitly tagged front cover, retaining the first equal-priority image.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum ArtworkPriority {
+    Smed,
+    Id3,
+    Id3Front,
 }
 
 impl EmbeddedMetadata {
-    pub(crate) fn smed(&mut self, bytes: &[u8], attrs: &mut Map<String, Value>) {
+    fn accepts_artwork(&self, priority: ArtworkPriority) -> bool {
+        self.artwork_priority
+            .is_none_or(|previous| previous < priority)
+    }
+
+    /// Retain a bounded JPEG/PNG only when it improves the source/type priority.
+    fn set_artwork(&mut self, bytes: Vec<u8>, priority: ArtworkPriority) -> bool {
+        if !self.accepts_artwork(priority) || bytes.is_empty() || bytes.len() > MAX_ARTWORK_BYTES {
+            return false;
+        }
+        let Some(mime) = image_mime(&bytes) else {
+            return false;
+        };
+        self.artwork = Some(Artwork {
+            bytes,
+            mime: mime.to_owned(),
+        });
+        self.artwork_priority = Some(priority);
+        true
+    }
+
+    pub(crate) fn take_artwork(&mut self) -> Option<Artwork> {
+        self.artwork.take()
+    }
+}
+
+/// The image consumers support bounded JPEG/PNG; a MIME label alone is insufficient.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else {
+        None
+    }
+}
+
+impl EmbeddedMetadata {
+    pub(crate) fn smed(
+        &mut self,
+        bytes: &[u8],
+        attrs: &mut Map<String, Value>,
+        include_artwork: bool,
+    ) {
         use blowfish::cipher::{Block, BlockDecrypt, KeyInit};
         if bytes.len() < 12 || !(bytes.len() - 4).is_multiple_of(8) {
             self.warning("SMED: unsupported block layout");
@@ -107,7 +176,7 @@ impl EmbeddedMetadata {
             bytes.copy_from_slice(&block);
         }
         xml.truncate(size);
-        self.xml("smed", &xml, attrs);
+        self.xml_with_artwork("smed", &xml, attrs, include_artwork);
     }
 
     pub(crate) fn chunk(&mut self, id: &[u8], size: u64) {
@@ -176,6 +245,16 @@ impl EmbeddedMetadata {
     }
 
     pub(crate) fn xml(&mut self, group: &str, bytes: &[u8], attrs: &mut Map<String, Value>) {
+        self.xml_with_artwork(group, bytes, attrs, false);
+    }
+
+    fn xml_with_artwork(
+        &mut self,
+        group: &str,
+        bytes: &[u8],
+        attrs: &mut Map<String, Value>,
+        include_artwork: bool,
+    ) {
         let xml = xml_text(bytes);
         if group == "ixml" {
             attrs.insert("ixml_raw".into(), json!(xml));
@@ -194,6 +273,11 @@ impl EmbeddedMetadata {
                 return;
             }
         };
+        // Reuse the decrypted text and bounded DOM. Artwork never enters fields,
+        // ixml_raw, or the resulting Metadata JSON, and scans skip this work.
+        if group == "smed" && include_artwork {
+            self.read_smed_artwork(&document);
+        }
         let mut fields = Map::new();
         for node in document.descendants().filter(Node::is_element) {
             // Apply the depth bound before any work that walks ancestor chains.
@@ -413,6 +497,13 @@ fn canonical_field(group: &str, path: &str) -> Option<&'static str> {
 #[path = "wav_id3.rs"]
 mod id3;
 
+#[path = "wav_artwork.rs"]
+mod artwork;
+
 #[cfg(test)]
 #[path = "wav_metadata_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "wav_artwork_tests.rs"]
+mod artwork_tests;

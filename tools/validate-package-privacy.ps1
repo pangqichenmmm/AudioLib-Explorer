@@ -2,8 +2,16 @@
 # Release boundary check: explicit payload files, public report schema and local
 # build-path removal. This is not a scan of historical Git objects or releases.
 [CmdletBinding()]
-param([string]$BinaryDirectory = 'dist/latest/portable', [string]$ReleaseReport)
+param(
+    [string]$BinaryDirectory = 'dist/latest/portable',
+    [string]$ReleaseReport,
+    # Only immediately after package-portable.ps1 has fully scanned this payload.
+    # Recheck names, links, update markers and EXE identity without rereading all
+    # payload contents; the new report still receives its full validation.
+    [switch]$ReportOnly
+)
 $ErrorActionPreference = 'Stop'
+if ($ReportOnly -and !$ReleaseReport) { throw '-ReportOnly requires -ReleaseReport and a payload just validated by package-portable.ps1.' }
 . (Join-Path $PSScriptRoot 'console-utf8.ps1')
 try {
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -60,6 +68,7 @@ foreach ($file in (Get-ChildItem -LiteralPath $payloadRoot -Recurse -Force -File
     $relative = $file.FullName.Substring($payloadRoot.TrimEnd('\', '/').Length).TrimStart('\', '/').Replace('\', '/')
     if ($relative -notin $allowedFiles -and $relative -notin $optionalFiles -and !$relative.StartsWith('licenses/', [StringComparison]::Ordinal)) { throw "File is outside the public payload allowlist: $relative" }
     if ($file.Extension -in @('.db', '.sqlite', '.sqlite3', '.log') -or $file.Name -in @('settings.json', '.env')) { throw "Runtime state found in payload: $relative" }
+    if ($ReportOnly) { continue }
     $bytes = [IO.File]::ReadAllBytes($file.FullName)
     Assert-NoPrivatePath ([Text.Encoding]::UTF8.GetString($bytes)) $relative
     $isLicense = $relative.StartsWith('licenses/', [StringComparison]::Ordinal)
@@ -101,7 +110,11 @@ if ($ReleaseReport) {
         if ($report.binaries.$binary -cne (Get-FileHash -LiteralPath (Join-Path $payloadRoot $binary) -Algorithm SHA256).Hash) { throw "Release report binary identity mismatch: $binary" }
     }
 }
-Write-Host 'Portable publication boundary passed: allowlisted files, no local build/user paths, no private example values, public report schema (when provided).'
+if ($ReportOnly) {
+    Write-Host 'Portable report passed: schema, privacy, update identity and EXE hashes; payload content scan reused from the preceding package step.'
+} else {
+    Write-Host 'Portable publication boundary passed: allowlisted files, no local build/user paths, no private example values, public report schema (when provided).'
+}
 } finally {
     Restore-AudioLibConsoleEncoding
 }

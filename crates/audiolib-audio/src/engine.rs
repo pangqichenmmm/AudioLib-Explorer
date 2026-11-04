@@ -1003,13 +1003,28 @@ where
                 );
                 callback.render(output);
             },
-            move |_| {
-                error_realtime.failed.store(true, Ordering::Release);
+            move |error| {
+                record_stream_error(&error_realtime, error.kind(), cfg!(target_os = "macos"));
             },
             None,
         )
         .map_err(audio_error)
 }
+
+fn record_stream_error(realtime: &Realtime, kind: cpal::ErrorKind, macos: bool) {
+    // CoreAudio reports processor overloads from its real-time listener. CPAL
+    // also documents denied real-time scheduling as nonfatal: audio continues.
+    // Keep this path allocation-, lock- and logging-free, and never clear an
+    // earlier fatal error. Other hosts retain their existing fatal handling.
+    match (macos, kind) {
+        (true, cpal::ErrorKind::Xrun) => {
+            realtime.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, cpal::ErrorKind::RealtimeDenied) => {}
+        _ => realtime.failed.store(true, Ordering::Release),
+    }
+}
+
 struct RenderCallback {
     realtime: Arc<Realtime>,
     channels: usize,
@@ -2103,6 +2118,67 @@ mod transport_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream_error_realtime() -> Realtime {
+        Realtime {
+            ring: Ring::new(8),
+            running: AtomicBool::new(true),
+            gain: AtomicU32::new(0.8_f32.to_bits()),
+            consumed: AtomicU64::new(17),
+            underruns: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+            active: AtomicBool::new(true),
+            callback_latency_nanos: AtomicU64::new(0),
+            source_finished: AtomicBool::new(false),
+            transition: SourceTransition::default(),
+        }
+    }
+
+    #[test]
+    fn coreaudio_recoverable_notifications_preserve_playback_and_count_overloads() {
+        let realtime = stream_error_realtime();
+        record_stream_error(&realtime, cpal::ErrorKind::Xrun, true);
+        record_stream_error(&realtime, cpal::ErrorKind::RealtimeDenied, true);
+        record_stream_error(&realtime, cpal::ErrorKind::Xrun, true);
+        assert_eq!(realtime.underruns.load(Ordering::Relaxed), 2);
+        assert!(!realtime.failed.load(Ordering::Acquire));
+        assert!(realtime.running.load(Ordering::Acquire));
+        assert_eq!(realtime.consumed.load(Ordering::Relaxed), 17);
+    }
+
+    #[test]
+    fn coreaudio_fatal_errors_remain_sticky_after_recoverable_notifications() {
+        for kind in [
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::Other,
+        ] {
+            let realtime = stream_error_realtime();
+            record_stream_error(&realtime, kind, true);
+            assert!(realtime.failed.load(Ordering::Acquire), "{kind:?}");
+            assert_eq!(realtime.underruns.load(Ordering::Relaxed), 0);
+            record_stream_error(&realtime, cpal::ErrorKind::RealtimeDenied, true);
+            record_stream_error(&realtime, cpal::ErrorKind::Xrun, true);
+            assert!(realtime.failed.load(Ordering::Acquire), "{kind:?}");
+            assert_eq!(realtime.underruns.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn other_hosts_retain_fatal_stream_error_handling() {
+        for kind in [
+            cpal::ErrorKind::Xrun,
+            cpal::ErrorKind::RealtimeDenied,
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::Other,
+        ] {
+            let realtime = stream_error_realtime();
+            record_stream_error(&realtime, kind, false);
+            assert!(realtime.failed.load(Ordering::Acquire), "{kind:?}");
+            assert_eq!(realtime.underruns.load(Ordering::Relaxed), 0);
+        }
+    }
 
     #[test]
     fn queued_completion_keeps_load_failure_after_a_later_stop_clears_status() {

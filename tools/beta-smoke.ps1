@@ -282,11 +282,10 @@ if ($ReleaseDir) {
     }
 }
 
-# 5. Manual GUI checklist (not scored).
+# 5. UI acceptance guidance (not scored).
 Log ''
-Log 'Manual GUI checklist (launch through AudioLibExplorer-beta.cmd):'
-Log '  [ ] Drag the volume bar: the dB readout updates live while dragging (and shows -inf dB at 0).'
-Log '  [ ] Connect the desktop app to the beta server: sync completes and list waveforms import without errors.'
+Log 'UI acceptance: select checks for this version''s actual UI changes and risk; no historical fixed checklist is required by default.'
+Log 'If GUI validation is needed, launch through AudioLibExplorer-beta.cmd.'
 
 # 6. Summary.
 Log ''

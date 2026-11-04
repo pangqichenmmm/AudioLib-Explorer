@@ -72,6 +72,8 @@ pub(crate) fn library(library: &RemoteLibrary) -> Result<()> {
         {
             Ok(())
         }
+        // The published format before the current target may still omit its descriptor;
+        // bytes are verified after download. The current target must declare one.
         None if (3..=5).contains(&library.schema_version) => Ok(()),
         _ => Err(invalid(
             "Server library format is missing, inconsistent or unsupported; the existing cache was retained",
@@ -284,7 +286,7 @@ mod tests {
                 SERVER_COMPATIBILITY_HEADER,
                 serde_json::to_string(&compatibility_manifest()).unwrap(),
             ),
-            ("x-schema-version", "6".into()),
+            ("x-schema-version", audiolib_db::SCHEMA_VERSION.to_string()),
             ("x-search-storage-revision", "1".into()),
             ("x-tokenization-revision", "3".into()),
             ("x-source-search-revision", "2".into()),
@@ -293,6 +295,51 @@ mod tests {
             headers.insert(name, HeaderValue::from_str(&value).unwrap());
         }
         headers
+    }
+
+    #[test]
+    fn plain_and_experimental_snapshot_descriptors_cannot_be_interchanged() {
+        use audiolib_core::compatibility::{METADATA_STORAGE_FEATURE, PLAN_B_V8_COMPRESSED_FORMAT};
+        let mut declared = headers();
+        let plain = descriptor();
+        assert!(!plain.format.features.contains_key(METADATA_STORAGE_FEATURE));
+        assert_eq!(response_format(&declared).unwrap(), Some(plain.clone()));
+        let history: serde_json::Value = serde_json::from_str(include_str!(
+            "../../audiolib-core/tests/fixtures/compatibility/format_fingerprint.json"
+        ))
+        .unwrap();
+        let legacy = SnapshotFormat {
+            id: PLAN_B_V8_COMPRESSED_FORMAT.into(),
+            format: serde_json::from_value(history["legacy_compressed"].clone()).unwrap(),
+        };
+        declared.insert(
+            SNAPSHOT_FORMAT_HEADER,
+            HeaderValue::from_static(PLAN_B_V8_COMPRESSED_FORMAT),
+        );
+        assert!(
+            response_format(&declared).is_err(),
+            "a z1 ID cannot describe plain bytes"
+        );
+        declared.insert(
+            LIBRARY_FORMAT_HEADER,
+            HeaderValue::from_str(&serde_json::to_string(&legacy.format).unwrap()).unwrap(),
+        );
+        assert_eq!(response_format(&declared).unwrap(), Some(legacy));
+        declared.insert(
+            SNAPSHOT_FORMAT_HEADER,
+            HeaderValue::from_static(PLAN_B_FORMAT),
+        );
+        assert!(
+            response_format(&declared).is_err(),
+            "a plain ID cannot hide the z1 requirement"
+        );
+        let mut experimental_server = compatibility_manifest();
+        experimental_server
+            .features
+            .insert(METADATA_STORAGE_FEATURE.into(), 1);
+        let enabled = enabled_features(Some(&experimental_server));
+        assert!(!enabled.contains(METADATA_STORAGE_FEATURE));
+        assert!(enabled.contains(audiolib_core::compatibility::ALBUM_ENTITIES_FEATURE));
     }
 
     #[test]
@@ -376,7 +423,7 @@ mod tests {
                             format.format.features.insert("future_feature".into(), 1);
                         }
                         TestResponse::json(200, &serde_json::json!({
-                            "library_id":"stable", "revision":8, "schema_version":6,
+                            "library_id":"stable", "revision":8, "schema_version":audiolib_db::SCHEMA_VERSION,
                             "identity_bound_writes":true, "snapshot_format":format,
                         }).to_string())
                     }
@@ -521,7 +568,7 @@ mod tests {
                         format.format.features.insert("future_required_feature".into(),1);
                     }
                     TestResponse::json(200, &serde_json::json!({
-                        "library_id":"incoming", "revision":8, "schema_version":6, "snapshot_format":format,
+                        "library_id":"incoming", "revision":8, "schema_version":audiolib_db::SCHEMA_VERSION, "snapshot_format":format,
                     }).to_string())
                 }
                 "/api/v1/roots" => TestResponse::json(200, "[]"),
@@ -776,11 +823,11 @@ mod tests {
             }
             let outcome =
                 sync_library(&client, &cache, &mut |_| {}, &AtomicBool::new(false), false).unwrap();
-            assert_eq!(outcome.state.schema_version, if stale { 6 } else { 5 });
+            assert_eq!(outcome.state.schema_version, audiolib_db::SCHEMA_VERSION);
             assert_eq!(outcome.state.revision, 12);
             let format = outcome.state.format.as_ref().unwrap();
             assert_eq!(format.source.as_ref(), Some(&source_format));
-            assert_eq!(format.generation, u64::from(stale));
+            assert_eq!(format.generation, 1);
             assert_eq!(
                 format.local.schema_version as i64,
                 outcome.state.schema_version

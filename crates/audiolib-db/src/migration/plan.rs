@@ -25,6 +25,30 @@ pub struct SpaceBudget {
     pub normalizes_legacy: bool,
 }
 
+/// Legacy z1 inputs can expand far beyond their physical page count. Inspect
+/// only bounded codec headers here; the pinned source business inspection and
+/// candidate copy still validate the complete streams and original UTF-8 bytes.
+fn metadata_expansion_bytes(conn: &Connection, cancel: &AtomicBool) -> Result<u64> {
+    check_cancel(cancel)?;
+    let mut statement = conn
+        .prepare("SELECT length(metadata_json),substr(metadata_json,1,16) FROM audio_files WHERE typeof(metadata_json)='blob'")
+        .map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let mut growth = 0_u64;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        check_cancel(cancel)?;
+        let stored = crate::unsigned(row, 0).map_err(db_error)?;
+        let header: Vec<u8> = row.get(1).map_err(db_error)?;
+        let decoded = crate::metadata_storage::decoded_blob_length(&header)?;
+        growth = growth
+            .checked_add(decoded.saturating_sub(stored))
+            .ok_or_else(|| invalid("Legacy Metadata expansion estimate overflow"))?;
+    }
+    // Filtering can consume an all-TEXT source without yielding a single row.
+    check_cancel(cancel)?;
+    Ok(growth)
+}
+
 /// Explicit client-local legacy history destination; never inferred for server/snapshot jobs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocalHistoryMigration {
@@ -221,8 +245,14 @@ pub fn plan(path: &Path, cancel: &AtomicBool) -> Result<MigrationPlan> {
         [], |row| crate::unsigned(row, 0),
     ).map_err(db_error)?;
     let copies = if normalizes_legacy { 8 } else { 5 };
+    let metadata_growth = if source.format.features.get("metadata_storage") == Some(&1) {
+        metadata_expansion_bytes(&conn, cancel)?
+    } else {
+        0
+    };
     let additional_bytes = source_bytes
-        .checked_mul(copies)
+        .checked_add(metadata_growth)
+        .and_then(|expanded| expanded.checked_mul(copies))
         .and_then(|value| value.checked_add(1 << 30))
         .ok_or_else(|| invalid("Migration space estimate overflow"))?;
     Ok(MigrationPlan {
@@ -270,6 +300,71 @@ pub fn plan_local(
 mod tests {
     use super::*;
     use crate::migration::{MigrationPhase, apply, discover, resume, rollback, verify};
+
+    #[test]
+    fn legacy_metadata_budget_observes_cancellation_when_no_blob_row_is_returned() {
+        use std::sync::{Arc, atomic::Ordering};
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE audio_files(metadata_json); WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<10001) INSERT INTO audio_files SELECT '{}' FROM ids;").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed = cancel.clone();
+        conn.progress_handler(
+            500,
+            Some(move || {
+                observed.store(true, Ordering::Release);
+                false
+            }),
+        )
+        .unwrap();
+        let result = metadata_expansion_bytes(&conn, &cancel);
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM audio_files", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            10001
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_budget_accounts_for_text_expansion_without_mutating_input() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE audio_files(metadata_json)")
+            .unwrap();
+        let raw = format!(" {{\"vendor\":\"{}\"}}\n", "音效 ".repeat(5000));
+        let rusqlite::types::Value::Blob(blob) =
+            crate::metadata_storage::encode_legacy_fixture(&raw).unwrap()
+        else {
+            panic!("legacy fixture must be compressed");
+        };
+        conn.execute(
+            "INSERT INTO audio_files VALUES(?1),(?2)",
+            rusqlite::params![raw, blob],
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            metadata_expansion_bytes(&conn, &cancel).unwrap(),
+            raw.len() as u64 - blob.len() as u64
+        );
+        let retained: Vec<u8> = conn
+            .query_row(
+                "SELECT metadata_json FROM audio_files WHERE rowid=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, blob);
+        assert!(matches!(
+            metadata_expansion_bytes(&conn, &AtomicBool::new(true)),
+            Err(Error::Cancelled)
+        ));
+        conn.execute("INSERT INTO audio_files VALUES(?1)", [vec![0_u8; 16]])
+            .unwrap();
+        assert!(metadata_expansion_bytes(&conn, &cancel).is_err());
+    }
 
     #[test]
     fn old_tokenizer_identity_in_same_version_job_blocks_before_touching_artifacts() {

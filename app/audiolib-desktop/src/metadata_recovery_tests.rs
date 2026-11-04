@@ -438,6 +438,9 @@ fn child_local_switch() {
         .database
         .clone();
     drop(SqliteProvider::open(&local_path).unwrap());
+    // Enter through the real manager so its rows carry the registered source IDs;
+    // the window's pre-open placeholder is not a selectable local registration.
+    fixture.ui.invoke_open_library(0);
     fixture.ui.invoke_sm_source_selected(0);
     fixture.ui.invoke_sm_switch_requested();
     drain_operation(&fixture);
@@ -463,7 +466,15 @@ fn child_local_switch() {
             .drafts
             .is_empty()
     );
-    assert!(artifact(&fixture).0.is_file());
+    let recovery_path = artifact(&fixture).0;
+    assert!(recovery_path.is_file());
+    assert!(
+        fixture
+            .ui
+            .get_ds_message()
+            .contains(recovery_path.to_string_lossy().as_ref()),
+        "the completed local switch must retain the recovery file's location"
+    );
     assert_no_mutations(&fixture);
     fixture.controller.shutdown();
     fixture.ui.hide().unwrap();

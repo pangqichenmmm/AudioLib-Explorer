@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "release-assets",
+  "host": "any",
+  "require_tag": true,
+  "variables": {"Repository": "Freedragonlancer/AudioLib-Explorer", "AssetDirectory": "${Root}/dist/public"},
+  "stages": [
+    {"id": "release-metadata", "reuse": "never", "github_auth": true, "command": "gh", "arguments": ["release", "view", "${Tag}", "--repo", "${Repository}", "--json", "tagName,name,isPrerelease,assets"], "outputs": ["${RunDirectory}/release-metadata.stdout.log"]},
+    {"id": "verify", "needs": ["release-metadata"], "script": "tools/verify-release-assets.ps1", "parameters": {"Tag": "${Tag}", "ReleaseJsonPath": "${RunDirectory}/release-metadata.stdout.log", "AssetDirectory": "${AssetDirectory}"}, "input_files": ["${AssetDirectory}"]}
+  ]
+}

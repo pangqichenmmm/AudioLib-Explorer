@@ -8,6 +8,7 @@ use std::sync::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+pub mod albums;
 pub mod compatibility;
 pub mod config;
 pub mod library;
@@ -21,6 +22,7 @@ pub mod tag_filter;
 pub mod waveform_cache;
 pub mod waveform_rate;
 pub mod window_layout;
+pub use albums::{Album, AlbumFacet, AlbumKind, MAX_ALBUM_MEMBERS};
 pub use library::*;
 pub use list_waveform::{
     LIST_WAVEFORM_COLUMNS, LIST_WAVEFORM_ENCODING_VERSION, ListWaveform, ListWaveformBatch,
@@ -32,7 +34,8 @@ pub use list_waveform_i8::{
     i8_base64_len, quantize_i16_to_i8,
 };
 pub use metadata::{
-    SOURCE_TAG_KEYS, display_tags, source_description, source_metadata_search_text, source_tags,
+    SOURCE_TAG_KEYS, album, display_tags, source_description, source_metadata_search_text,
+    source_tags,
 };
 pub use search_workspace::{
     SavedSearchTask, SearchAudioRef, SearchFolderRef, SearchSession, SearchTask,
@@ -194,6 +197,15 @@ pub struct AudioFile {
     pub favorite: bool,
     pub bext_description: String,
     pub attributes: serde_json::Value,
+    /// Library/album declared by the file itself; empty when it declares none.
+    #[serde(default)]
+    pub album: String,
+    /// Shared album membership; absent only on older, unconverted snapshots.
+    #[serde(default)]
+    pub album_id: Option<i64>,
+    /// Captured identity for event-loop actions without another database read.
+    #[serde(default)]
+    pub album_entity: Option<Album>,
     #[serde(default)]
     pub missing: bool,
 }
@@ -233,6 +245,12 @@ pub struct SearchFilters {
     pub exclude_tags: Vec<String>,
     /// Exact library color, ignoring hex letter case.
     pub color: Option<String>,
+    /// Exact library/album name declared by the files; absent keeps every album visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Exact shared entity filter. Mutually exclusive with the declared-name filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -303,6 +321,14 @@ impl SearchRequest {
 
     /// Validate bounded search input before compiling a parameterized FTS5 query.
     pub fn validate(&self) -> Result<()> {
+        if self.filters.album.is_some() && self.filters.album_id.is_some() {
+            return Err(Error::Validation(
+                "Album name and identity filters are mutually exclusive".into(),
+            ));
+        }
+        if self.filters.album_id.is_some_and(|id| id <= 0) {
+            return Err(Error::Validation("Album identity must be positive".into()));
+        }
         if self.query.chars().count() > 500 || self.query.contains(';') || self.query.contains('\0')
         {
             return Err(Error::Validation(
@@ -365,6 +391,18 @@ impl SearchRequest {
                 ..Default::default()
             }
             .validate()?;
+        }
+        // Album names originate in bounded WAV Metadata. Keep exact names usable even
+        // when they exceed the free-text query's 500-character limit.
+        if self
+            .filters
+            .album
+            .as_ref()
+            .is_some_and(|album| album.len() > 32 * 1024 * 1024 || album.contains('\0'))
+        {
+            return Err(Error::Validation(
+                "Album filter exceeds the Metadata size limit or contains NUL".into(),
+            ));
         }
         Ok(())
     }
@@ -521,6 +559,94 @@ pub trait DataProvider: Send + Sync {
         result
     }
     fn get_audio(&self, id: i64) -> Result<AudioFile>;
+    /// Search-scoped album counts; clear both album filters for cross-navigation.
+    fn album_facets(&self, _request: &SearchRequest) -> Result<Vec<AlbumFacet>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Cancellable shared album aggregation.
+    fn album_facets_cancellable(
+        &self,
+        request: &SearchRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AlbumFacet>> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        self.album_facets(request)
+    }
+    /// Resolve an owned album by its identity within this provider.
+    fn get_album(&self, _id: i64) -> Result<Album> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Indexed semantic lookup when rebinding a personal filter to another library.
+    fn find_album_by_semantic(
+        &self,
+        _kind: AlbumKind,
+        _metadata_key: Option<&str>,
+        _folder_path: Option<&str>,
+    ) -> Result<Option<Album>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Present members of the entire album, ordered by audio ID, bounded to 64.
+    fn album_members(
+        &self,
+        _id: i64,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Present members in exactly one indexed parent directory, ordered by audio ID.
+    /// The positive album ID and limit `1..=64` are validated; folder IDs retain
+    /// the full signed range accepted by `get_folder`. This never includes child
+    /// directories or falls back to members elsewhere in the shared album.
+    fn album_members_in_folder(
+        &self,
+        _id: i64,
+        _folder_id: i64,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        Err(Error::Validation(
+            "This provider cannot resolve album members within a directory".into(),
+        ))
+    }
+    /// Present unassigned members whose source path has exactly this parent directory.
+    /// Only records without a folder ID are eligible. Directory identities use source
+    /// path syntax, accept an empty parent for a relative filename, and are bounded
+    /// to 4096 UTF-8 bytes. Results are ordered by audio ID and limited to `1..=64`.
+    fn album_members_in_unassigned_directory(
+        &self,
+        _id: i64,
+        _directory: &str,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        Err(Error::Validation(
+            "This provider cannot resolve unassigned album members within a directory".into(),
+        ))
+    }
+    /// Paginate all member identities, including missing records, for local preferences.
+    /// IDs are strictly ascending and the page limit is 1..=4096.
+    fn album_member_ids(
+        &self,
+        _id: i64,
+        _after_audio_id: Option<i64>,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<i64>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
     fn folders(&self, parent_id: Option<i64>) -> Result<Vec<Folder>>;
     /// Retrieve one owned folder by its stable identity; absence is `NotFound`.
     /// Providers may implement a direct indexed lookup instead of the tree fallback.
@@ -799,6 +925,17 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn album_filters_reject_nul_and_unbounded_input_without_truncating_declared_names() {
+        let mut request = SearchRequest::default();
+        request.filters.album = Some("名".repeat(1000));
+        assert!(request.validate().is_ok());
+        request.filters.album = Some("name\0suffix".into());
+        assert!(request.validate().is_err());
+        request.filters.album = Some("x".repeat(32 * 1024 * 1024 + 1));
+        assert!(request.validate().is_err());
     }
 
     #[test]

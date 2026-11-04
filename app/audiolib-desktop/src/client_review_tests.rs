@@ -89,7 +89,19 @@ fn child_playback_feedback() {
             );
             let ui = weak.upgrade().unwrap();
             match observed.get() {
-                0 if !ui.get_searching() => {
+                // Row paging becomes idle before the initial directory model.
+                // Settle both publications before testing persistent audio errors.
+                0 if !ui.get_searching()
+                    && !ui.get_search_workspace_loading()
+                    && !ui.get_task_restoring()
+                    && c.search_publication
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|state| {
+                            state.page == SearchPagePhase::Published && state.model_published
+                        }) =>
+                {
                     c.command(AudioCommand::Seek(f64::NAN));
                     observed.set(1);
                 }
@@ -222,4 +234,106 @@ fn preview_volume_label_follows_slider_while_dragging() {
         "dB label did not change during drag: {labels:?}"
     );
     controller.shutdown();
+}
+
+#[test]
+fn focused_volume_reflects_ipc_acknowledgement_without_replaying_stale_drag_status() {
+    use audiolib_core::config::{DEFAULT_THEME, STUDIO_THEME};
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
+    use slint::{
+        LogicalPosition,
+        platform::{PointerEventButton, WindowEvent},
+    };
+
+    i_slint_backend_testing::init_no_event_loop();
+    for theme in [DEFAULT_THEME, STUDIO_THEME] {
+        let (_root, ui, _engine, controller) = make_fixture();
+        ui.window()
+            .set_size(slint::LogicalSize::new(1600.0, 1000.0));
+        crate::theme::apply_theme(&ui, theme);
+        ui.set_audio_ready(true);
+        ui.show().unwrap();
+        let slider = ElementQuery::from_root(&ui)
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Slider)
+            .find_all()
+            .into_iter()
+            .find(|item| item.accessible_value_minimum() == Some(-60.0))
+            .expect("active volume slider");
+        let origin = slider.absolute_position();
+        let size = slider.size();
+        let position =
+            LogicalPosition::new(origin.x + size.width * 0.8, origin.y + size.height / 2.0);
+        ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+        assert!(ui.get_volume_adjusting());
+        let draft_db = ui.get_volume_db();
+        controller.publish_confirmed_volume(&ui, 1.0);
+        assert_eq!(
+            ui.get_volume_db(),
+            draft_db,
+            "{theme}: an old snapshot replaced the drag draft"
+        );
+        ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        });
+        assert!(
+            ui.get_volume_adjusting(),
+            "{theme}: slider must retain keyboard focus after release"
+        );
+        // Delay consumption of IPC A's exact completion until GUI B is admitted.
+        // The channel retains A's result even if the engine has already applied B,
+        // making this ordering regression deterministic without scheduling sleeps.
+        let late_ipc = controller.enqueue_volume(0.1).unwrap();
+        slider.set_accessible_value("-6");
+        let latest = gain_from_db(-6.0);
+        assert!((controller.playback.lock().unwrap().volume - latest).abs() < 0.000_01);
+        let old = late_ipc.wait(Duration::from_secs(2)).unwrap();
+        assert!((old.volume - 0.1).abs() < 0.000_01);
+        assert!(
+            (controller.playback.lock().unwrap().volume - latest).abs() < 0.000_01,
+            "{theme}: late IPC completion replaced the newer admitted GUI level"
+        );
+        controller.publish_confirmed_volume(&ui, old.volume);
+        assert!((ui.get_volume_db() + 6.0).abs() < 0.001);
+        let confirmed = controller
+            .audio
+            .send_and_wait(AudioCommand::Synchronize, Duration::from_secs(2))
+            .unwrap();
+        assert!((confirmed.volume - latest).abs() < 0.000_01);
+        controller.publish_confirmed_volume(&ui, confirmed.volume);
+        assert!((ui.get_volume_db() + 6.0).abs() < 0.001);
+        assert!(controller.enqueue_volume(f32::NAN).is_err());
+        assert!((controller.playback.lock().unwrap().volume - latest).abs() < 0.000_01);
+        let reply = controller.ipc(serde_json::json!({"command":"volume","volume":0.1}));
+        assert_eq!(reply["success"], true, "{reply}");
+        controller.publish_confirmed_volume(&ui, controller.audio.status().volume);
+        assert!(
+            (ui.get_volume_db() + 20.0).abs() < 0.001,
+            "{theme}: acknowledged IPC level did not reach the focused slider"
+        );
+        assert_eq!(ui.get_volume_label().as_str(), "-20.0 dB");
+        if theme == STUDIO_THEME {
+            for label in ["Mute", "Unmute"] {
+                ElementHandle::find_by_accessible_label(&ui, label)
+                    .next()
+                    .expect(label)
+                    .invoke_accessible_default_action();
+            }
+            assert!(
+                (controller.playback.lock().unwrap().volume - 0.1).abs() < 0.000_01,
+                "unmute must restore the confirmed level"
+            );
+            let status = controller
+                .audio
+                .send_and_wait(AudioCommand::Stop, Duration::from_secs(2))
+                .unwrap();
+            assert!((status.volume - 0.1).abs() < 0.000_01);
+        }
+        controller.shutdown();
+        ui.hide().unwrap();
+    }
 }

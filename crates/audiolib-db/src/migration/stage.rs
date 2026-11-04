@@ -82,7 +82,7 @@ pub(super) fn normalize(
                         .retain(|name| !name.eq_ignore_ascii_case(column));
                 }
             }
-            SchemaChange::AddColumn { .. } => {}
+            SchemaChange::AddColumn { .. } | SchemaChange::CreateAlbumEntities => {}
         }
     }
     let retired = job
@@ -212,6 +212,9 @@ fn initialize(job: &MigrationJob, candidate: &mut Connection, input: &Connection
          INSERT INTO audiolib_migration_copy VALUES('', 'copy',NULL,0,0);",
     ).map_err(db_error)?;
     for (name, _) in &blueprint.tables {
+        if !table_exists(input, name)? {
+            continue;
+        }
         tx.execute(
             "INSERT INTO audiolib_migration_copy VALUES(?1,'table',NULL,0,0)",
             [name],
@@ -266,6 +269,12 @@ fn copy_table(
                 && column.eq_ignore_ascii_case("source_tags_text")
             {
                 "audiolib_source_tags_key(metadata_json)".into()
+            } else if table.eq_ignore_ascii_case("audio_files")
+                && column.eq_ignore_ascii_case("metadata_json")
+            {
+                // A legacy experimental BLOB is decoded once; every new
+                // candidate stores the original UTF-8 bytes as SQLite TEXT.
+                "audiolib_metadata_json(metadata_json)".into()
             } else {
                 search_storage::quote_identifier(column)
             }
@@ -343,6 +352,28 @@ fn copy_table(
     }
 }
 
+/// Index only the owned candidate during album derivation. The source blueprint's
+/// ordinary indexes are installed afterwards; relying on them here makes each
+/// member's ancestor lookup scan the complete closure table.
+fn backfill_albums(conn: &Connection, cancel: &AtomicBool) -> Result<()> {
+    search_storage::transaction_required(conn)?;
+    let name = format!("audiolib_album_backfill_{}", uuid::Uuid::new_v4().simple());
+    let quoted = search_storage::quote_identifier(&name);
+    // No IF NOT EXISTS: an unexpected collision fails before we can remove any
+    // pre-existing object. The caller rolls the entire owned transaction back.
+    conn.execute(
+        &format!(
+            "CREATE INDEX main.{quoted} ON folder_closure(descendant_id,depth DESC,ancestor_id)"
+        ),
+        [],
+    )
+    .map_err(db_error)?;
+    crate::albums::backfill(conn, cancel)?;
+    conn.execute(&format!("DROP INDEX main.{quoted}"), [])
+        .map_err(db_error)?;
+    Ok(())
+}
+
 pub(super) fn build(
     job: &mut MigrationJob,
     cancel: &AtomicBool,
@@ -413,9 +444,34 @@ pub(super) fn build(
                 )
                 .map_err(db_error)?;
             }
-            for (_, sql) in &blueprint.objects {
-                search_storage::execute_schema(&tx, sql)?;
+            backfill_albums(&tx, cancel).map_err(|e| match e {
+                audiolib_core::Error::Database(message) => {
+                    audiolib_core::Error::Database(format!("Album candidate backfill: {message}"))
+                }
+                other => other,
+            })?;
+            crate::albums::configure_compression(&tx, false)?;
+            if job.plan.source.format.schema_version < 8 && job.plan.local_history.is_some() {
+                tx.execute("UPDATE audiolib_album_id_sequence SET legacy_scope=?1 WHERE singleton=1 AND legacy_scope IS NULL",[job.plan.source.source.to_string_lossy().as_ref()]).map_err(db_error)?;
             }
+            for (name, sql) in &blueprint.objects {
+                if [
+                    "audiolib_album_id_high_water",
+                    "audiolib_album_audio_insert",
+                    "audiolib_album_audio_update",
+                    "audiolib_album_folder_delete",
+                    "idx_albums_folder",
+                    "idx_audio_visible_album",
+                    "idx_audio_album_members",
+                ]
+                .contains(&name.as_str())
+                {
+                    continue;
+                }
+                search_storage::execute_schema(&tx, sql)
+                    .map_err(|error| invalid(format!("Candidate object {name}: {error}")))?;
+            }
+            crate::albums::install_triggers(&tx)?;
             search_storage::create_index(&tx)?;
             tx.execute("UPDATE audiolib_migration_copy SET phase='index',last_id=NULL,completed=0 WHERE name=''", []).map_err(db_error)?;
             tx.commit().map_err(db_error)?;
@@ -464,11 +520,47 @@ pub(super) fn build(
     })
 }
 
+fn validate_text_metadata(conn: &Connection, cancel: &AtomicBool) -> Result<()> {
+    // Bounded primary-key ranges preserve cancellation even for published
+    // verification, which does not install the owned-writer interrupt hook.
+    let mut last = None;
+    loop {
+        check_cancel(cancel)?;
+        let high: Option<i64> = if let Some(low) = last {
+            conn.query_row(
+                "SELECT MAX(id) FROM (SELECT id FROM audio_files WHERE id>?1 ORDER BY id LIMIT ?2)",
+                params![low, BATCH],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?
+        } else {
+            conn.query_row(
+                "SELECT MAX(id) FROM (SELECT id FROM audio_files ORDER BY id LIMIT ?1)",
+                [BATCH],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?
+        };
+        let Some(high) = high else { return Ok(()) };
+        let non_text: bool = if let Some(low) = last {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM audio_files WHERE id>?1 AND id<=?2 AND typeof(metadata_json)<>'text')", params![low, high], |row| row.get(0)).map_err(db_error)?
+        } else {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM audio_files WHERE id<=?1 AND typeof(metadata_json)<>'text')", [high], |row| row.get(0)).map_err(db_error)?
+        };
+        if non_text {
+            return Err(invalid("Candidate Metadata must use SQLite TEXT storage"));
+        }
+        last = Some(high);
+    }
+}
+
 pub(super) fn verify_connection(
     conn: &Connection,
     job: &MigrationJob,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    // Logical decoded-byte parity alone cannot label mixed legacy storage as a1.
+    validate_text_metadata(conn, cancel)?;
     let expected = job
         .target_business
         .as_ref()
@@ -487,6 +579,20 @@ pub(super) fn verify_connection(
             && !columns.iter().any(|name| name.eq_ignore_ascii_case(column))
         {
             columns.push(column.clone());
+        }
+    }
+    if job.target_schema_sha256.is_none()
+        && job
+            .plan
+            .schema_changes
+            .contains(&SchemaChange::CreateAlbumEntities)
+    {
+        for table in &actual.tables {
+            if ["albums", "audiolib_album_id_sequence"].contains(&table.table.as_str()) {
+                expected_shape
+                    .entry(table.table.clone())
+                    .or_insert_with(|| table.columns.clone());
+            }
         }
     }
     let actual_shape = actual
@@ -518,6 +624,12 @@ pub(super) fn verify_connection(
     if job.target_schema_sha256.is_none() {
         for change in &job.plan.schema_changes {
             if let SchemaChange::AddColumn { table, column, .. } = change {
+                if table == "audio_files" && column == "album_id" {
+                    if !crate::albums::ready(conn)? {
+                        return Err(invalid("Shared album backfill is incomplete"));
+                    }
+                    continue;
+                }
                 let default: Option<String> = conn
                     .query_row(
                         "SELECT dflt_value FROM pragma_table_xinfo(?1) WHERE name=?2 COLLATE NOCASE",
@@ -592,6 +704,14 @@ pub(super) fn verify_connection(
 }
 
 pub(super) fn validate(job: &MigrationJob, cancel: &AtomicBool) -> Result<()> {
+    // The immutable candidate precedes a separately proved new-library identity
+    // admission; published verification still uses the complete admitted digest.
+    let mut original = job.clone();
+    if let Some(proof) = &job.import_identity {
+        original.target_business = Some(proof.before.clone());
+        original.import_identity = None;
+    }
+    let job = &original;
     let mut conn = open_rw(&job.artifact("candidate.db")?)?;
     schema::register_tokenizer(&conn, crate::load_tokenizer())?;
     crate::owned_cancellation::run(&mut conn, cancel, |conn| {
@@ -603,6 +723,171 @@ pub(super) fn validate(job: &MigrationJob, cancel: &AtomicBool) -> Result<()> {
         .map_err(db_error)?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod album_backfill_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn candidate() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::register_library_functions(&conn).unwrap();
+        // The explicit owned index must provide the bound; a planner-generated
+        // automatic index must not mask a regression on another SQLite build.
+        conn.pragma_update(None, "automatic_index", false).unwrap();
+        conn.execute_batch("CREATE TABLE folders(id INTEGER PRIMARY KEY,folder_path TEXT,folder_name TEXT,parent_id INTEGER);
+            CREATE TABLE folder_closure(ancestor_id INTEGER,descendant_id INTEGER,depth INTEGER,PRIMARY KEY(ancestor_id,descendant_id));
+            CREATE TABLE audio_files(id INTEGER PRIMARY KEY,file_path TEXT,filename TEXT,folder_id INTEGER,metadata_json TEXT NOT NULL DEFAULT '{}',album_id INTEGER,missing INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO folders VALUES(1,'owned','owned',NULL);
+            WITH RECURSIVE groups(g) AS (VALUES(0) UNION ALL SELECT g+1 FROM groups WHERE g<1023), levels(n) AS (VALUES(0),(1),(2),(3))
+            INSERT INTO folders SELECT 2+4*g+n,'owned/library-'||g||'/level-'||n,CASE WHEN n=0 THEN 'library-'||g ELSE 'nested-'||n END,CASE WHEN n=0 THEN 1 ELSE 1+4*g+n END FROM groups CROSS JOIN levels;
+            WITH RECURSIVE ancestors(descendant,ancestor,depth) AS (SELECT id,id,0 FROM folders UNION ALL SELECT a.descendant,f.parent_id,a.depth+1 FROM ancestors a JOIN folders f ON f.id=a.ancestor WHERE f.parent_id IS NOT NULL)
+            INSERT INTO folder_closure SELECT ancestor,descendant,depth FROM ancestors;
+            WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<2048)
+            INSERT INTO audio_files(id,file_path,filename,folder_id) SELECT id,'owned/'||id||'.wav','sound.wav',5+4*((id-1)%1024) FROM ids;
+            INSERT INTO audio_files(id,file_path,filename,folder_id) VALUES(2049,'owned/direct.wav','direct.wav',1);
+            CREATE INDEX audiolib_album_backfill_keep_unknown ON folders(folder_name);").unwrap();
+        conn
+    }
+
+    #[test]
+    fn owned_album_backfill_without_descendant_index_has_a_linear_vm_budget() {
+        let mut conn = candidate();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM folders", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            4097
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM folder_closure", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            14337
+        );
+        // More than 29M closure rows would be inspected by one full scan per
+        // audio. A progress budget fails that regression promptly and is stable
+        // across host speed; it counts native bundled SQLite VM instructions.
+        const BUDGET: usize = 4_000_000;
+        let steps = Arc::new(AtomicUsize::new(0));
+        let observed = steps.clone();
+        conn.progress_handler(
+            100,
+            Some(move || observed.fetch_add(100, Ordering::Relaxed) >= BUDGET),
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        let result = backfill_albums(&tx, &AtomicBool::new(false));
+        tx.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(
+            result.is_ok(),
+            "owned album backfill exceeded its VM budget: {result:?}; steps={}",
+            steps.load(Ordering::Relaxed)
+        );
+        assert!(steps.load(Ordering::Relaxed) <= BUDGET);
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM albums", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1025
+        );
+        assert_eq!(tx.query_row("SELECT COUNT(*) FROM audio_files af LEFT JOIN albums al ON al.id=af.album_id WHERE al.id IS NULL OR al.kind<>'folder' OR al.folder_id<>CASE WHEN af.id=2049 THEN 1 ELSE 2+4*((af.id-1)%1024) END",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(tx.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'audiolib_album_backfill_%'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert!(tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='audiolib_album_backfill_keep_unknown')",[],|row|row.get::<_,bool>(0)).unwrap());
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn cancelled_owned_album_backfill_rolls_back_its_unique_covering_index() {
+        let mut conn = candidate();
+        {
+            let tx = conn.transaction().unwrap();
+            assert!(matches!(
+                backfill_albums(&tx, &AtomicBool::new(true)),
+                Err(audiolib_core::Error::Cancelled)
+            ));
+        }
+        assert!(!conn.table_exists(None, "albums").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM audio_files WHERE album_id IS NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2049
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'audiolib_album_backfill_%'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='audiolib_album_backfill_keep_unknown')",[],|row|row.get::<_,bool>(0)).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod plain_metadata_validation_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::Ordering};
+
+    fn data() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE audio_files(id INTEGER PRIMARY KEY,metadata_json); WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<10001) INSERT INTO audio_files SELECT id,'{}' FROM ids; INSERT INTO audio_files VALUES(-9223372036854775808,'{}'),(9223372036854775807,'{}');").unwrap();
+        conn
+    }
+
+    #[test]
+    fn publication_checks_late_rows_and_extreme_ids_without_rewriting_them() {
+        let conn = data();
+        let cancel = AtomicBool::new(false);
+        validate_text_metadata(&conn, &cancel).unwrap();
+        conn.execute(
+            "UPDATE audio_files SET metadata_json=x'00' WHERE id=9223372036854775807",
+            [],
+        )
+        .unwrap();
+        assert!(validate_text_metadata(&conn, &cancel).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT metadata_json FROM audio_files WHERE id=9223372036854775807",
+                [],
+                |row| row.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            [0]
+        );
+        conn.execute(
+            "UPDATE audio_files SET metadata_json='{}' WHERE id=9223372036854775807",
+            [],
+        )
+        .unwrap();
+        validate_text_metadata(&conn, &cancel).unwrap();
+    }
+
+    #[test]
+    fn publication_type_scan_observes_cancellation_between_ranges() {
+        let conn = data();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed = cancel.clone();
+        conn.progress_handler(
+            500,
+            Some(move || {
+                observed.store(true, Ordering::Release);
+                false
+            }),
+        )
+        .unwrap();
+        let result = validate_text_metadata(&conn, &cancel);
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(matches!(result, Err(audiolib_core::Error::Cancelled)));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM audio_files", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            10003
+        );
+    }
 }
 
 #[cfg(test)]

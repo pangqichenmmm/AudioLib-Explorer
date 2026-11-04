@@ -1,6 +1,6 @@
 // crates/audiolib-audio/src/wav_id3.rs
 //! Bounded ID3v2 text/COMM/TXXX reader; binary and compressed frames are skipped.
-use super::{EmbeddedMetadata, MAX_FIELDS, append};
+use super::{ArtworkPriority, EmbeddedMetadata, MAX_FIELDS, append};
 use encoding_rs::{UTF_16BE, UTF_16LE};
 use serde_json::Map;
 use std::io::{Read, Seek, SeekFrom};
@@ -59,6 +59,10 @@ impl EmbeddedMetadata {
         let bytes = if let Some(bytes) = compact {
             bytes
         } else {
+            if size > super::MAX_CHUNK_BYTES as usize {
+                self.warning("ID3: complex tag exceeds Metadata size limit");
+                return Ok(());
+            }
             reader.seek(SeekFrom::Start(start))?;
             let mut bytes = vec![0; size];
             reader.read_exact(&mut bytes)?;
@@ -257,6 +261,9 @@ fn compact_tag(reader: &mut (impl Read + Seek), size: usize) -> std::io::Result<
             return Ok(None);
         }
         if header[0] == b'T' || matches!(&header[..id_size], b"COMM" | b"COM") {
+            if bytes.len() + header_size + frame_size > super::MAX_CHUNK_BYTES as usize {
+                return Ok(None);
+            }
             bytes.extend_from_slice(&header[..header_size]);
             let offset = bytes.len();
             bytes.resize(offset + frame_size, 0);
@@ -271,4 +278,167 @@ fn compact_tag(reader: &mut (impl Read + Seek), size: usize) -> std::io::Result<
         *byte = ((size >> (7 * (3 - index))) & 0x7f) as u8;
     }
     Ok(Some(bytes))
+}
+
+impl EmbeddedMetadata {
+    /// Read only the ID3 `APIC` cover. Ordinary tag reads skip binary frames, so artwork
+    /// needs this targeted pass; callers request it for one file per album, not every file.
+    pub(crate) fn read_id3_artwork(
+        &mut self,
+        reader: &mut (impl Read + Seek),
+        size: usize,
+    ) -> std::io::Result<()> {
+        if !self.accepts_artwork(ArtworkPriority::Id3Front)
+            || size < 10
+            || size > super::MAX_ID3_BYTES as usize
+        {
+            return Ok(());
+        }
+        let mut bytes = vec![0u8; size];
+        reader.read_exact(&mut bytes)?;
+        self.id3_artwork(&bytes);
+        Ok(())
+    }
+
+    fn id3_artwork(&mut self, bytes: &[u8]) {
+        if bytes.len() < 10 || &bytes[..3] != b"ID3" || !(2..=4).contains(&bytes[3]) {
+            return;
+        }
+        let version = bytes[3];
+        let flags = bytes[5];
+        if version == 2 && flags & 0x40 != 0 {
+            return;
+        }
+        let Some(size) = syncsafe(&bytes[6..10]) else {
+            return;
+        };
+        let Some(payload) = bytes.get(10..10 + size) else {
+            return;
+        };
+        let decoded;
+        let mut rest = if version < 4 && flags & 0x80 != 0 {
+            decoded = unsync(payload);
+            &decoded[..]
+        } else {
+            payload
+        };
+        if version >= 3 && flags & 0x40 != 0 {
+            let Some(header) = rest.get(..4) else {
+                return;
+            };
+            let size = if version == 4 {
+                let Some(size) = syncsafe(header) else {
+                    return;
+                };
+                size
+            } else {
+                big_endian(header) + 4
+            };
+            let Some(payload) = rest.get(size..).filter(|_| size >= 6) else {
+                return;
+            };
+            rest = payload;
+        }
+        let header_size = if version == 2 { 6 } else { 10 };
+        let id_size = if version == 2 { 3 } else { 4 };
+        for _ in 0..MAX_FIELDS {
+            if rest.is_empty() || rest[0] == 0 {
+                break;
+            }
+            let Some(header) = rest.get(..header_size) else {
+                break;
+            };
+            if !header[..id_size]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                break;
+            }
+            let frame_size = if version == 4 {
+                let Some(size) = syncsafe(&header[4..8]) else {
+                    break;
+                };
+                size
+            } else {
+                big_endian(&header[id_size..id_size + if version == 2 { 3 } else { 4 }])
+            };
+            let Some(content) = rest.get(header_size..header_size + frame_size) else {
+                break;
+            };
+            rest = &rest[header_size + frame_size..];
+            if &header[..id_size] == b"APIC" || &header[..id_size] == b"PIC" {
+                let frame_flags = if version == 2 { 0 } else { header[9] };
+                if (version == 3 && frame_flags & 0xc0 != 0)
+                    || (version == 4 && frame_flags & 0x0c != 0)
+                {
+                    continue;
+                }
+                let decoded;
+                let content = if version == 4 && (flags & 0x80 != 0 || frame_flags & 2 != 0) {
+                    decoded = unsync(content);
+                    &decoded[..]
+                } else {
+                    content
+                };
+                let skip = usize::from(
+                    (version == 3 && frame_flags & 0x20 != 0)
+                        || (version == 4 && frame_flags & 0x40 != 0),
+                ) + if version == 4 && frame_flags & 1 != 0 {
+                    4
+                } else {
+                    0
+                };
+                let Some(content) = content.get(skip..) else {
+                    continue;
+                };
+                if let Some((picture_type, image)) = apic_parts(version, content)
+                    && image.len() <= super::MAX_ARTWORK_BYTES
+                {
+                    let priority = if picture_type == 3 {
+                        ArtworkPriority::Id3Front
+                    } else {
+                        ArtworkPriority::Id3
+                    };
+                    if self.accepts_artwork(priority) {
+                        self.set_artwork(image.to_vec(), priority);
+                    }
+                }
+                if !self.accepts_artwork(ArtworkPriority::Id3Front) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Split APIC/PIC into its picture type and bytes; image magic supplies the MIME.
+fn apic_parts(version: u8, content: &[u8]) -> Option<(u8, &[u8])> {
+    let (&encoding, body) = content.split_first()?;
+    if encoding > 3 {
+        return None;
+    }
+    let mut rest = body;
+    if version == 2 {
+        rest = rest.get(3..)?;
+    } else {
+        let end = rest.iter().position(|b| *b == 0)?;
+        rest = rest.get(end + 1..)?;
+    }
+    let (&picture_type, body) = rest.split_first()?;
+    rest = body;
+    let utf16 = matches!(encoding, 1 | 2);
+    let description_end = if utf16 {
+        let mut index = 0;
+        loop {
+            let pair = rest.get(index..index + 2)?;
+            if pair.iter().all(|byte| *byte == 0) {
+                break index;
+            }
+            index += 2;
+        }
+    } else {
+        rest.iter().position(|b| *b == 0)?
+    };
+    let image = rest.get(description_end + if utf16 { 2 } else { 1 }..)?;
+    Some((picture_type, image))
 }

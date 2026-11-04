@@ -793,7 +793,7 @@ fn root_relocation_after_a_case_only_rename_preserves_records_and_source_audio()
 
     let conn = support::connection(f.provider.database_path()).unwrap();
     conn.execute(
-        "UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.unknown_extension','keep') WHERE id=?1",
+        "UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.unknown_extension','keep') WHERE id=?1",
         [first.id],
     )
     .unwrap();
@@ -1111,7 +1111,7 @@ fn root_relocation_resolves_existing_source_aliases() {
     let conn = support::connection(f.provider.database_path()).unwrap();
     for id in &f.ids {
         conn.execute(
-            "UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.unknown_extension',json(?1)) WHERE id=?2",
+            "UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.unknown_extension',json(?1)) WHERE id=?2",
             rusqlite::params![extension.to_string(), id],
         )
         .unwrap();

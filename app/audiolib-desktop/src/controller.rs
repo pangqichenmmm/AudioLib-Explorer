@@ -11,25 +11,29 @@ use std::time::{Duration, Instant};
 use crate::list_waveforms::{
     ListWaveformCell, ListWaveformHost, ListWaveforms, render_list_waveform, window_ids,
 };
-use crate::waveform_view::{WaveView, db_from_gain, gain_from_db, render_waveform};
-use crate::{AppWindow, AudioRow, CrumbRow, FolderRow, LocalScanRootRow};
+use crate::waveform_view::{
+    WaveView, db_from_gain, gain_from_db, render_waveform, render_waveform_mask, ruler_marks,
+};
+use crate::{AlbumRow, AppWindow, AudioRow, CrumbRow, FolderRow, LocalScanRootRow, RulerTick};
 use audiolib_audio::{
     AudioBackend, AudioCommand, AudioDevice, AudioEvent, AudioHandle, AuditionSettings,
     PlaybackConfig, PlaybackState, RatePolicy, WaveformRequest,
 };
 use audiolib_core::config::{
-    AppConfig, AudioTablePreferences, SpectralPeakPreferences, UI_SCALE_PERCENTS,
+    AppConfig, AudioTablePreferences, STUDIO_THEME, SpectralPeakPreferences, UI_SCALE_PERCENTS,
     normalize_ui_scale_percent,
 };
 use audiolib_core::{
-    AudioFile, BatchMetadataRequest, DataProvider, FileVisibility, Folder, LibraryExportFormat,
-    ListWaveformSource, MaintenanceAction, MetadataPatch, ScanSession, SearchFilters,
-    SearchRequest, SortOrder, TagEditMode,
+    Album, AlbumKind, AudioFile, BatchMetadataRequest, DataProvider, FileVisibility, Folder,
+    LibraryExportFormat, ListWaveformSource, MaintenanceAction, MetadataPatch, ScanSession,
+    SearchFilters, SearchRequest, SortOrder, TagEditMode,
 };
 use audiolib_db::{ScanCancellation, ScanOptions, ScanService, SqliteProvider};
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
 const PAGE_SIZE: usize = 200;
+/// Sidebar album covers are read only for the first rows; later rows show text only.
+const ALBUM_THUMBNAILS: usize = 12;
 const HISTORY_SIZE: usize = 50;
 /// Owned scan presentation can be regenerated after a runtime language change.
 #[derive(Clone)]
@@ -64,6 +68,10 @@ struct ScanTerminal {
 mod client_review_tests;
 #[path = "controller_history.rs"]
 mod history;
+#[path = "library_progress.rs"]
+mod library_progress;
+#[path = "result_window.rs"]
+mod result_window;
 #[path = "search_tasks.rs"]
 mod search_tasks;
 
@@ -135,6 +143,10 @@ fn table_preferences(ui: &AppWindow) -> AudioTablePreferences {
     .normalized()
 }
 
+#[path = "artwork_album_hints.rs"]
+mod artwork_album_hints;
+#[path = "controller_artwork.rs"]
+mod artwork_controller;
 #[cfg(test)]
 #[path = "click_preview_tests.rs"]
 mod click_preview_tests;
@@ -155,8 +167,13 @@ mod remote_output_tests;
 #[path = "request_recovery_tests.rs"]
 mod request_recovery_tests;
 #[cfg(test)]
+#[path = "result_paging_tests.rs"]
+mod result_paging_tests;
+#[cfg(test)]
 #[path = "result_rows_tests.rs"]
 mod result_rows_tests;
+#[path = "shared_album_artwork.rs"]
+mod shared_album_artwork;
 #[cfg(test)]
 #[path = "single_click_play_tests.rs"]
 mod single_click_play_tests;
@@ -185,6 +202,8 @@ enum LibraryOperation {
     DataSource(remote_mode::DataSourceSwitch),
     /// Server root mutations share the Metadata drain and library operation gate.
     ServerRoot(Box<remote_mode::RootOperation>),
+    /// Register or select a local library through the same write/scan drain barrier.
+    LocalSource(Box<remote_mode::LocalSourceRequest>),
 }
 
 impl LibraryOperation {
@@ -211,6 +230,7 @@ impl LibraryOperation {
                 | Self::Batch(_)
                 | Self::DataSource(_)
                 | Self::ServerRoot(_)
+                | Self::LocalSource(_)
         )
     }
 
@@ -231,9 +251,11 @@ impl LibraryOperation {
 
     fn affects_playback(&self, file: Option<&AudioFile>, removed_folders: &HashSet<i64>) -> bool {
         match self {
-            Self::Restore(_) | Self::Switch { .. } | Self::DataSource(_) | Self::ServerRoot(_) => {
-                true
-            }
+            Self::Restore(_)
+            | Self::Switch { .. }
+            | Self::DataSource(_)
+            | Self::ServerRoot(_)
+            | Self::LocalSource(_) => true,
             Self::RemoveAudio(ids) => file.is_some_and(|file| ids.contains(&file.id)),
             Self::RemoveFolder(_) => file.is_some_and(|file| {
                 file.folder_id
@@ -319,6 +341,22 @@ struct SearchJob {
     provider: Arc<SqliteProvider>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtworkFolderContext {
+    folder_id: Option<i64>,
+    path: String,
+    namespace: String,
+}
+
+struct ArtworkJob {
+    album: Album,
+    folder: ArtworkFolderContext,
+    source_generation: u64,
+    epoch: u64,
+    cancel: Arc<AtomicBool>,
+    notice: Mutex<Option<String>>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchPagePhase {
     Pending,
@@ -336,6 +374,8 @@ struct SearchPublication {
     model_published: bool,
     /// A failed close resumes reads without hiding the Metadata save failure.
     retained_status: Option<String>,
+    /// A bounded scrolling window keeps the visible audio anchored during publication.
+    result_window: bool,
 }
 
 #[derive(Clone)]
@@ -683,6 +723,7 @@ pub struct Controller {
     config: Arc<Mutex<AppConfig>>,
     /// Latest GUI preference; its worker serializes disk writes with other settings.
     single_click_play: AtomicBool,
+    show_album_artwork: AtomicBool,
     /// Latest table layout, captured on the event loop and saved by the preferences worker.
     audio_table: Mutex<AudioTablePreferences>,
     task_workspace: Mutex<search_tasks::TaskWorkspaceState>,
@@ -727,6 +768,16 @@ pub struct Controller {
     search_publication: Mutex<Option<SearchPublication>>,
     search_cancel: Mutex<Arc<AtomicBool>>,
     facet_revision: AtomicU64,
+    artwork_job: Mutex<Option<ArtworkJob>>,
+    artwork_inflight: Mutex<Option<(u64, i64, ArtworkFolderContext, u64)>>,
+    artwork_override_migrations: Mutex<HashSet<(u64, String)>>,
+    artwork_wake: Condvar,
+    artwork_epoch: AtomicU64,
+    artwork_cancel: Mutex<Arc<AtomicBool>>,
+    artwork_cache_lock: Mutex<()>,
+    artwork_album_hints: Mutex<artwork_album_hints::ArtworkAlbumHints>,
+    artwork_actions: Mutex<artwork_controller::ArtworkActions>,
+    artwork_actions_wake: Condvar,
     library_info_generation: AtomicU64,
     request: Mutex<SearchRequest>,
     waveform_generation: AtomicU64,
@@ -735,6 +786,9 @@ pub struct Controller {
     waveform_wake: Condvar,
     waveform_size: Mutex<(u32, u32)>,
     wave_view: Mutex<(String, WaveView)>,
+    /// A manual pan stops a zoomed Waveform from paging along with playback
+    /// until the next Play or click-to-play.
+    wave_follow_paused: AtomicBool,
     devices: Mutex<Vec<AudioDevice>>,
     device_generation: AtomicU64,
     scan_generation: AtomicU64,
@@ -837,6 +891,21 @@ impl Controller {
         .normalized()
     }
 
+    /// Mirror a checkbox change before a source operation can replace its atomic
+    /// runtime value. The caller holds the configuration lock; no file I/O occurs.
+    fn mirror_local_waveform_preference(&self, config: &mut AppConfig) {
+        let enabled = self.pregenerate_list_waveforms.load(Ordering::Acquire);
+        config.pregenerate_list_waveforms = enabled;
+        let sources = &mut config.data_source;
+        if let Some(library) = sources
+            .local_libraries
+            .iter_mut()
+            .find(|library| sources.active_local_library.as_deref() == Some(library.id.as_str()))
+        {
+            library.pregenerate_list_waveforms = enabled;
+        }
+    }
+
     /// Provider for annotation writes: the local library, or in server mode the
     /// server API (`RemoteProvider`; the snapshot follows by the revision rule).
     fn metadata_provider(self: &Arc<Self>) -> Result<Arc<dyn DataProvider>, String> {
@@ -885,10 +954,16 @@ impl Controller {
         playback: PlaybackConfig,
         remote: Option<RemoteStartup>,
     ) -> Arc<Self> {
+        let playback = platform_playback_config(playback);
         let chinese = config.language == "cn";
         ui.set_chinese(chinese);
+        ui.set_native_macos(cfg!(target_os = "macos"));
+        if cfg!(target_os = "macos") {
+            ui.set_audio_backend_names(ModelRc::new(VecModel::from(vec!["CoreAudio".into()])));
+        }
         ui.set_audition_play_on_single_click(config.audition_play_on_single_click);
         ui.set_pregenerate_list_waveforms(config.pregenerate_list_waveforms);
+        ui.set_artwork_enabled(config.show_album_artwork);
         ui.set_hold_list_waveform_batches(config.hold_list_waveform_batches_after_audition);
         apply_ui_scale(ui, config.ui_scale_percent);
         crate::window_layout::restore_panes(ui, &config.window_layout);
@@ -921,7 +996,7 @@ impl Controller {
         ui.set_buffer_frames(playback.buffer_frames.to_string().into());
         ui.set_pair_index(playback.output_pair.to_string().into());
         ui.set_source_pair(playback.source_pair.to_string().into());
-        ui.set_asio_enabled(cfg!(feature = "asio"));
+        ui.set_asio_enabled(cfg!(all(windows, feature = "asio")));
         let controller = Arc::new(Self {
             ui: ui.as_weak(),
             sqlite: RwLock::new(sqlite),
@@ -941,6 +1016,7 @@ impl Controller {
             audio,
             removed_audio_generation: AtomicU64::new(u64::MAX),
             single_click_play: AtomicBool::new(config.audition_play_on_single_click),
+            show_album_artwork: AtomicBool::new(config.show_album_artwork),
             list_waveforms: ListWaveforms::new(config.pregenerate_list_waveforms)
                 .with_hold_after_audition(config.hold_list_waveform_batches_after_audition),
             pregenerate_list_waveforms: AtomicBool::new(config.pregenerate_list_waveforms),
@@ -990,6 +1066,16 @@ impl Controller {
             search_publication: Mutex::new(None),
             search_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             facet_revision: AtomicU64::new(0),
+            artwork_job: Mutex::new(None),
+            artwork_inflight: Mutex::new(None),
+            artwork_override_migrations: Mutex::new(HashSet::new()),
+            artwork_wake: Condvar::new(),
+            artwork_epoch: AtomicU64::new(0),
+            artwork_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            artwork_cache_lock: Mutex::new(()),
+            artwork_album_hints: Mutex::new(artwork_album_hints::ArtworkAlbumHints::default()),
+            artwork_actions: Mutex::new(artwork_controller::ArtworkActions::default()),
+            artwork_actions_wake: Condvar::new(),
             library_info_generation: AtomicU64::new(0),
             request: Mutex::new(SearchRequest::default()),
             waveform_generation: AtomicU64::new(0),
@@ -1005,6 +1091,7 @@ impl Controller {
                     ..Default::default()
                 },
             )),
+            wave_follow_paused: AtomicBool::new(false),
             devices: Mutex::new(Vec::new()),
             device_generation: AtomicU64::new(0),
             scan_generation: AtomicU64::new(0),
@@ -1058,6 +1145,7 @@ impl Controller {
 
     fn bind(self: &Arc<Self>, ui: &AppWindow) {
         self.bind_search_tasks(ui);
+        self.bind_artwork(ui);
         let c = self.clone();
         ui.on_exit_requested(move || {
             if let Some(ui) = c.ui.upgrade() {
@@ -1143,10 +1231,26 @@ impl Controller {
         let c = self.clone();
         ui.on_theme_requested(move |index| {
             let id = crate::theme::theme_id(index);
-            if let Some(ui) = c.ui.upgrade() {
-                crate::theme::apply_theme(&ui, &id);
+            let studio = id == STUDIO_THEME;
+            let changed = *c.theme.lock().unwrap() != id;
+            let ui = c.ui.upgrade();
+            if let Some(ui) = &ui {
+                crate::theme::apply_theme(ui, &id);
+                if !studio {
+                    ui.set_waveform_mask(Image::default());
+                }
             }
             *c.theme.lock().unwrap() = id;
+            // The default renderer does not build Studio's progress mask. Refresh
+            // the current viewport on entry, including a selected but idle sound.
+            if changed
+                && studio
+                && let Some(ui) = ui
+                && let Some(file) =
+                    c.waveform_refresh_file(&c.audio.status(), ui.get_waveform_ready())
+            {
+                c.queue_waveform(&file);
+            }
             *c.single_click_play_pending.lock().unwrap() = true;
             c.single_click_play_wake.notify_one();
         });
@@ -1224,6 +1328,47 @@ impl Controller {
             }
         });
         let c = self.clone();
+        ui.on_album_selected(move |identity| {
+            if !c.available() || !c.album_facets_available() {
+                return;
+            }
+            let Some(ui) = c.ui.upgrade() else { return };
+            let Ok(id) = identity.parse::<i64>() else {
+                return;
+            };
+            if id <= 0 {
+                return;
+            }
+            // IDs distinguish same-named folder libraries. Clicking the active
+            // entity clears its filter without turning a label into an identity.
+            let current = c.request.lock().unwrap().filters.album_id;
+            let next = (ui.get_album_filter_unavailable() || current != Some(id)).then_some(id);
+            if !c.admit_task_album_filter(next) {
+                return;
+            }
+            // The scope changes even when an invalid draft defers the search.
+            // Never capture the previous page under the new task definition.
+            c.begin_task_search(false);
+            ui.set_album_filter_unavailable(false);
+            {
+                let mut request = c.request.lock().unwrap();
+                request.filters.album = None;
+                request.filters.album_id = next;
+                request.offset = 0;
+                ui.set_album_filter_id(next.map(|id| id.to_string()).unwrap_or_default().into());
+                let label = next
+                    .and_then(|_| {
+                        ui.get_albums()
+                            .iter()
+                            .find(|row| row.id == identity)
+                            .map(|row| row.name)
+                    })
+                    .unwrap_or_default();
+                ui.set_album_filter(label);
+            }
+            c.request_navigation_search(&ui, true, false);
+        });
+        let c = self.clone();
         ui.on_filter_requested(move || {
             if let Some(ui) = c.ui.upgrade() {
                 c.request_navigation_search(&ui, true, true);
@@ -1267,6 +1412,12 @@ impl Controller {
                 crate::tag_chips::relayout(&ui);
             }
         });
+        let weak = ui.as_weak();
+        ui.on_detail_tags_relayout(move || {
+            if let Some(ui) = weak.upgrade() {
+                crate::detail_presentation::relayout(&ui);
+            }
+        });
         let c = self.clone();
         ui.on_color_filter_edited(move || {
             if let Some(ui) = c.ui.upgrade() {
@@ -1287,20 +1438,22 @@ impl Controller {
                 ui.set_color_filter("".into());
                 ui.set_duration_min("".into());
                 ui.set_duration_max("".into());
+                ui.set_album_filter("".into());
+                ui.set_album_filter_id("".into());
+                ui.set_album_filter_unavailable(false);
                 c.request_navigation_search(&ui, true, true);
             }
         });
         let c = self.clone();
         ui.on_page_requested(move |delta| {
             if let Some(ui) = c.ui.upgrade() {
-                let mut request = c.request.lock().unwrap();
-                request.offset = if delta < 0 {
-                    request.offset.saturating_sub(PAGE_SIZE)
-                } else {
-                    request.offset.saturating_add(PAGE_SIZE)
-                };
-                drop(request);
-                c.request_navigation_search(&ui, true, false);
+                c.request_page(&ui, delta);
+            }
+        });
+        let c = self.clone();
+        ui.on_result_range_requested(move |delta| {
+            if let Some(ui) = c.ui.upgrade() {
+                c.extend_result_window(&ui, delta);
             }
         });
         let c = self.clone();
@@ -1447,11 +1600,27 @@ impl Controller {
         });
         let c = self.clone();
         ui.on_all_library_requested(move || {
+            if !c.available() {
+                return;
+            }
+            c.begin_task_search(true);
+            c.clear_task_folder_error();
             c.tree.lock().unwrap().selected = None;
-            c.request.lock().unwrap().folder_id = None;
+            {
+                let mut request = c.request.lock().unwrap();
+                request.folder_id = None;
+                request.filters.album = None;
+                request.filters.album_id = None;
+            }
             // Invalidate any pending publication carrying the previous folder.
             c.reload_tree();
             if let Some(ui) = c.ui.upgrade() {
+                // Folder and Album are both navigation scopes. Clear both before
+                // rebuilding the request so the UI cannot reapply the old Album;
+                // the normal task capture also drops its retained Album binding.
+                ui.set_album_filter("".into());
+                ui.set_album_filter_id("".into());
+                ui.set_album_filter_unavailable(false);
                 ui.set_selected_folder(-1);
                 ui.set_selected_folder_path("".into());
                 ui.set_crumbs(ModelRc::new(VecModel::<CrumbRow>::default()));
@@ -1509,6 +1678,7 @@ impl Controller {
             if !c.available() {
                 return;
             }
+            c.wave_follow_paused.store(false, Ordering::Release);
             if c.audio.status().generation == c.removed_audio_generation.load(Ordering::Acquire) {
                 let selected = c.selected.lock().unwrap().as_ref().map(|file| file.id);
                 if let Some(id) = selected {
@@ -1539,24 +1709,20 @@ impl Controller {
         let c = self.clone();
         ui.on_seek_play_requested(move |position| {
             if c.available() {
+                c.wave_follow_paused.store(false, Ordering::Release);
                 c.command(AudioCommand::SeekAndPlay(position as f64));
             }
         });
         let c = self.clone();
         ui.on_volume_requested(move |volume| {
-            c.command(AudioCommand::SetVolume(volume));
-            c.playback.lock().unwrap().volume = volume;
-            // The status poll skips volume publishing while the slider keeps focus,
-            // so refresh the dB label here to follow the drag live.
-            if let Some(ui) = c.ui.upgrade() {
-                ui.set_volume_label(volume_label(volume));
-            }
+            c.request_volume(volume);
         });
         let c = self.clone();
         ui.on_start_requested(move || {
             if !c.available() {
                 return;
             }
+            c.wave_follow_paused.store(false, Ordering::Release);
             match c.audio_reload_target() {
                 Some(id) => c.select_id(id, true),
                 None => c.command(AudioCommand::Play),
@@ -1566,15 +1732,7 @@ impl Controller {
         ui.on_pause_requested(move || c.command(AudioCommand::Pause));
         let c = self.clone();
         ui.on_volume_db_requested(move |db| {
-            // The audition slider reports dB through this callback (not
-            // volume-requested). The status poll skips volume publishing while the
-            // slider is being adjusted, so the label must follow the drag here.
-            let volume = gain_from_db(db);
-            c.command(AudioCommand::SetVolume(volume));
-            c.playback.lock().unwrap().volume = volume;
-            if let Some(ui) = c.ui.upgrade() {
-                ui.set_volume_label(volume_label(volume));
-            }
+            c.request_volume(gain_from_db(db));
         });
         let c = self.clone();
         ui.on_transform_requested(move |pitch, rate, mono, repeat| {
@@ -1593,6 +1751,7 @@ impl Controller {
                 c.command(AudioCommand::SetAudition(settings));
             } else if let Some(ui) = c.ui.upgrade() {
                 publish_audition(&ui, c.audio.status().audition);
+                ui.invoke_audition_input_rejected(rejected_audition_fields(&pitch, &rate));
                 c.status(
                     if c.chinese.load(Ordering::Acquire) {
                         "Pitch 范围 -24 到 +24 半音；Rate 范围 0.25 到 4.0"
@@ -1605,8 +1764,11 @@ impl Controller {
         });
         let c = self.clone();
         ui.on_waveform_zoom_requested(move |factor| {
+            let Some(ui) = c.ui.upgrade() else {
+                return;
+            };
             let status = c.audio.status();
-            let Some(file) = c.waveform_file(&status) else {
+            let Some(file) = c.waveform_refresh_file(&status, ui.get_waveform_ready()) else {
                 return;
             };
             {
@@ -1628,22 +1790,31 @@ impl Controller {
                 return;
             };
             let status = c.audio.status();
-            let Some(file) = c.waveform_file(&status) else {
+            let Some(file) = c.waveform_refresh_file(&status, ui.get_waveform_ready()) else {
                 return;
             };
-            zoom_waveform_at_pointer(
-                &ui,
-                &mut c.wave_view.lock().unwrap().1,
-                factor,
-                fraction,
-                file.duration,
-            );
+            let view = {
+                let mut state = c.wave_view.lock().unwrap();
+                zoom_waveform_at_pointer(&ui, &mut state.1, factor, fraction, file.duration);
+                state.1
+            };
+            // Later wheel steps anchor to the range drawn from now on.
+            publish_wave_target(&ui, view, file.duration);
+            let (start, end) = view.range(file.duration);
+            if !(start..=end).contains(&status.position) {
+                c.wave_follow_paused.store(true, Ordering::Release);
+            }
             c.queue_waveform(&file);
         });
         let c = self.clone();
         ui.on_waveform_pan_requested(move |scroll| {
+            let Some(ui) = c.ui.upgrade() else {
+                return;
+            };
+            c.wave_follow_paused.store(true, Ordering::Release);
             c.wave_view.lock().unwrap().1.scroll = f64::from(scroll.clamp(0.0, 1.0));
-            if let Some(file) = c.waveform_file(&c.audio.status()) {
+            if let Some(file) = c.waveform_refresh_file(&c.audio.status(), ui.get_waveform_ready())
+            {
                 c.queue_waveform(&file);
             }
         });
@@ -1671,7 +1842,9 @@ impl Controller {
                     *c.single_click_play_pending.lock().unwrap() = true;
                     c.single_click_play_wake.notify_one();
                 }
-                if let Some(file) = c.waveform_file(&c.audio.status()) {
+                if let Some(file) =
+                    c.waveform_refresh_file(&c.audio.status(), ui.get_waveform_ready())
+                {
                     c.queue_waveform(&file);
                 }
             }
@@ -1730,7 +1903,9 @@ impl Controller {
             let old = *c.waveform_size.lock().unwrap();
             *c.waveform_size.lock().unwrap() = size;
             if old != size
-                && let Some(file) = c.waveform_file(&c.audio.status())
+                && let Some(ui) = c.ui.upgrade()
+                && let Some(file) =
+                    c.waveform_refresh_file(&c.audio.status(), ui.get_waveform_ready())
             {
                 c.queue_waveform(&file);
             }
@@ -1777,6 +1952,7 @@ impl Controller {
         );
         if let Some(id) = id {
             if let Some(ui) = self.ui.upgrade() {
+                ui.set_preserve_result_scroll(false);
                 ui.set_selected_row(index);
             }
             self.publish_checked();
@@ -2081,6 +2257,9 @@ impl Controller {
     }
 
     fn invalidate_library_reads(&self) {
+        self.cancel_artwork();
+        self.artwork_album_hints.lock().unwrap().clear();
+        self.artwork_override_migrations.lock().unwrap().clear();
         self.library_info_generation.fetch_add(1, Ordering::AcqRel);
         self.search_cancel
             .lock()
@@ -2101,7 +2280,10 @@ impl Controller {
     /// UI edits and scanning are frozen until completion; failure preserves drafts/library.
     fn run_library_operation(self: &Arc<Self>, operation: LibraryOperation) {
         let source_handoff = self.source_changing.load(Ordering::Acquire)
-            && matches!(operation, LibraryOperation::DataSource(_))
+            && matches!(
+                operation,
+                LibraryOperation::DataSource(_) | LibraryOperation::LocalSource(_)
+            )
             && !self.library_busy.load(Ordering::Acquire)
             && !self.closing.load(Ordering::Acquire)
             && !self.shutdown.load(Ordering::Acquire);
@@ -2109,6 +2291,14 @@ impl Controller {
             return;
         }
         let Some(ui) = self.ui.upgrade() else { return };
+        if matches!(operation, LibraryOperation::LocalSource(_))
+            && !self.source_changing.load(Ordering::Acquire)
+            && let Err(error) = self.begin_local_library_change(&ui)
+        {
+            ui.set_sm_local_message(error.clone().into());
+            ui.set_ds_message(error.into());
+            return;
+        }
         let retain_search = matches!(&operation, LibraryOperation::DataSource(target)
             if self.is_same_library_snapshot_refresh(target));
         let retain_context = operation.retains_library_identity();
@@ -2119,10 +2309,14 @@ impl Controller {
             LibraryOperation::Switch { .. }
                 | LibraryOperation::Restore(_)
                 | LibraryOperation::DataSource(_)
+                | LibraryOperation::LocalSource(_)
         );
         let selected_id = ui.get_selected_id().parse::<i64>().ok();
         self.capture_metadata(&ui);
-        let recovering_handoff = matches!(operation, LibraryOperation::DataSource(_));
+        let recovering_handoff = matches!(
+            operation,
+            LibraryOperation::DataSource(_) | LibraryOperation::LocalSource(_)
+        );
         let mut metadata_warning = None;
         let enqueue_result = if recovering_handoff {
             self.enqueue_transition_metadata()
@@ -2136,6 +2330,10 @@ impl Controller {
                 self.metadata.lock().unwrap().sequence
             }
             Err(error) => {
+                if matches!(operation, LibraryOperation::LocalSource(_)) {
+                    ui.set_sm_local_message(error.clone().into());
+                    self.finish_source_change(&ui, false);
+                }
                 ui.set_status(error.clone().into());
                 ui.set_management_report(error.into());
                 return;
@@ -2151,7 +2349,9 @@ impl Controller {
         if switches_workspace {
             self.freeze_search_workspace();
         }
+        ui.set_library_operation_stage("".into());
         ui.set_library_busy(true);
+        let operation_started = Instant::now();
         let opening_cache = matches!(
             operation,
             LibraryOperation::DataSource(remote_mode::DataSourceSwitch::Server { .. })
@@ -2194,6 +2394,12 @@ impl Controller {
             let mut removed_folders = HashSet::new();
             let mut retained_checked = None;
             let mut removed_audio_generation = None;
+            let mut progress = library_progress::LibraryProgress::new(&c);
+            progress.stage(
+                "draining_writes",
+                "正在保存待处理的设置和 Metadata…",
+                "Saving pending settings and Metadata…",
+            );
             let result = (|| -> Result<String, String> {
                 c.wait_workspace_writes()?;
                 // Keep the old snapshot and its drafts when a save fails. A refresh
@@ -2212,12 +2418,22 @@ impl Controller {
                         });
                     }
                 }
+                progress.stage(
+                    "draining_playback",
+                    "正在等待播放记录和 Waveform 任务完成…",
+                    "Waiting for playback history and Waveform tasks…",
+                );
                 c.wait_remote_plays()?;
                 // The busy gate keeps list Waveform work from starting; cancel a running
                 // decode and let its (lease-protected) write finish first.
                 c.list_waveforms.suspend();
                 c.list_waveforms.wait_idle(Duration::from_secs(5));
                 c.list_waveforms.resume();
+                progress.stage(
+                    "draining_scans",
+                    "正在等待扫描安全结束…",
+                    "Waiting for scans to finish safely…",
+                );
                 while c.scan_cancel.lock().unwrap().is_some() {
                     if c.shutdown.load(Ordering::Acquire) {
                         return Err("Desktop is shutting down".into());
@@ -2228,6 +2444,11 @@ impl Controller {
                     removed_folders = required_folder_subtree(provider.as_ref(), *id)
                         .map_err(|error| error.to_string())?;
                 }
+                progress.stage(
+                    "stopping_playback",
+                    "正在准备音效库操作…",
+                    "Preparing the library operation…",
+                );
                 let playing = c.audio.status();
                 let playing_file = playing.file_path.as_deref().and_then(|path| {
                     if c.remote_read_only() {
@@ -2339,8 +2560,13 @@ impl Controller {
                             .update_metadata_batch(request)
                             .map_err(|e| e.to_string())?
                     )),
-                    LibraryOperation::DataSource(target) => c.switch_data_source(target)?,
+                    LibraryOperation::DataSource(target) => {
+                        c.switch_data_source_with_progress(target, &mut progress)?
+                    }
                     LibraryOperation::ServerRoot(root) => c.execute_server_root(root)?,
+                    LibraryOperation::LocalSource(request) => {
+                        c.execute_local_source_with_progress(request, &mut progress)?
+                    }
                     LibraryOperation::Switch { path, create } => {
                         if *create && path.exists() {
                             return Err(c.localized("新建音效库的文件已存在，请选择新的文件名", "New database destination already exists; choose a new filename").to_string());
@@ -2360,45 +2586,28 @@ impl Controller {
                         } else {
                             path.canonicalize().map_err(|error| error.to_string())?
                         };
-                        let history_config = c.config.lock().unwrap().clone();
-                        let next = Arc::new(
-                            if *create {
-                                SqliteProvider::open_local_with_progress_cancellable(
-                                    &selected_path,
-                                    &history_config.data_root(),
-                                    history_config.play_history_limit,
-                                    &AtomicBool::new(false),
-                                    |_| {},
-                                )
-                            } else {
-                                SqliteProvider::open_existing_local_with_progress_cancellable(
-                                    &selected_path,
-                                    &history_config.data_root(),
-                                    history_config.play_history_limit,
-                                    &AtomicBool::new(false),
-                                    |_| {},
-                                )
-                            }
-                            .map_err(|e| e.local_display_text(c.chinese.load(Ordering::Acquire)))?,
+                        let next = Arc::new(c.open_local_for_switch(
+                            &selected_path,
+                            *create,
+                            false,
+                            &mut progress,
+                        )?);
+                        progress.stage(
+                            "applying_local",
+                            "正在应用音效库并保存设置…",
+                            "Applying the library and saving settings…",
                         );
-                        let integrity = next.check_library().map_err(|error| error.to_string())?;
-                        if !integrity.is_ok() {
-                            return Err(format!(
-                                "{}: {}",
-                                c.localized(
-                                    "所选音效库未通过校验",
-                                    "Selected library failed validation"
-                                ),
-                                serde_json::to_string(&integrity).unwrap_or_default()
-                            ));
-                        }
-                        crate::startup::prepare_local_search(&next);
                         let mut config = c.config.lock().unwrap();
                         let mut preferences = config.clone();
+                        c.mirror_local_waveform_preference(&mut preferences);
                         preferences
                             .select_database(&selected_path)
                             .map_err(|e| e.to_string())?;
                         preferences.save().map_err(|e| e.to_string())?;
+                        c.pregenerate_list_waveforms
+                            .store(preferences.pregenerate_list_waveforms, Ordering::Release);
+                        c.list_waveforms
+                            .set_pregenerate(preferences.pregenerate_list_waveforms);
                         *config = preferences;
                         *c.sqlite.write().unwrap() = next;
                         format!(
@@ -2455,8 +2664,19 @@ impl Controller {
                 }
                 Ok(report)
             })();
+            progress.stage(
+                "refreshing_view",
+                "正在刷新音效库视图…",
+                "Refreshing the library view…",
+            );
+            tracing::info!(
+                success = result.is_ok(),
+                elapsed_ms = operation_started.elapsed().as_millis() as u64,
+                "Library operation worker finished"
+            );
             let c2 = c.clone();
             post(c.ui.clone(), move |ui| {
+                ui.set_library_operation_stage("".into());
                 c2.library_busy.store(false, Ordering::Release);
                 ui.set_library_busy(false);
                 if opening_cache {
@@ -2473,8 +2693,10 @@ impl Controller {
                 if switches_workspace && !succeeded {
                     c2.thaw_search_workspace();
                 }
-                if matches!(operation, LibraryOperation::DataSource(_))
-                    && c2.source_changing.load(Ordering::Acquire)
+                if matches!(
+                    operation,
+                    LibraryOperation::DataSource(_) | LibraryOperation::LocalSource(_)
+                ) && c2.source_changing.load(Ordering::Acquire)
                 {
                     c2.finish_source_change(&ui, succeeded);
                 }
@@ -2506,6 +2728,7 @@ impl Controller {
                                         LibraryOperation::Switch { .. }
                                             | LibraryOperation::Restore(_)
                                             | LibraryOperation::DataSource(_)
+                                            | LibraryOperation::LocalSource(_)
                                     ) && !retain_search,
                                     retain_search,
                                 );
@@ -2546,6 +2769,10 @@ impl Controller {
                         );
                     }
                     Err(error) => {
+                        if matches!(operation, LibraryOperation::LocalSource(_)) {
+                            ui.set_sm_local_message(error.clone().into());
+                            ui.set_ds_message(error.clone().into());
+                        }
                         if matches!(operation, LibraryOperation::DataSource(_)) {
                             ui.set_ds_message(error.clone().into());
                         }
@@ -2587,6 +2814,33 @@ impl Controller {
                 if let LibraryOperation::ServerRoot(root) = &operation {
                     c2.server_root_finished(&ui, root, succeeded);
                 }
+                if let LibraryOperation::LocalSource(request) = &operation {
+                    c2.publish_data_source(&ui);
+                    if succeeded {
+                        c2.finish_local_source(request, &ui);
+                    }
+                    c2.publish_metadata_recovery_notice(&ui);
+                }
+                if succeeded && matches!(operation, LibraryOperation::Switch { .. }) {
+                    let id = c2
+                        .config
+                        .lock()
+                        .unwrap()
+                        .selected_local_library()
+                        .map(|entry| entry.id.clone());
+                    if let Some(id) = id {
+                        c2.finish_local_source(
+                            &remote_mode::LocalSourceRequest::Switch { id },
+                            &ui,
+                        );
+                    }
+                }
+                tracing::info!(
+                    success = succeeded,
+                    elapsed_ms = operation_started.elapsed().as_millis() as u64,
+                    "Library operation UI handoff finished"
+                );
+                drop(progress);
                 if c2.close_after_operation.swap(false, Ordering::AcqRel) && succeeded {
                     c2.request_close(&ui);
                 }
@@ -2650,6 +2904,7 @@ impl Controller {
             if changed_path {
                 self.mark_audio_reload(file.id);
             }
+            self.queue_artwork(&file);
             if !file.missing {
                 self.queue_waveform(&file);
             }
@@ -2662,6 +2917,12 @@ impl Controller {
             ui.set_selected_name("".into());
             ui.set_selected_path("".into());
             ui.set_selected_format("".into());
+            crate::detail_presentation::clear(ui);
+            ui.set_selected_album("".into());
+            ui.set_selected_album_id("".into());
+            ui.set_selected_artwork_directory("".into());
+            ui.set_album_cover(Image::default());
+            ui.set_album_cover_ready(false);
             ui.set_selected_attributes("".into());
             ui.set_selected_description("".into());
             ui.set_selected_source_tags("".into());
@@ -2670,11 +2931,18 @@ impl Controller {
             ui.set_edit_favorite(false);
             ui.set_waveform_ready(false);
             ui.set_waveform_image(Image::default());
+            ui.set_waveform_mask(Image::default());
             ui.set_waveform_info("".into());
         }
     }
 
     fn reset_library_view(&self, ui: &AppWindow, reset_request: bool, retain_navigation: bool) {
+        // The result ListView is shared. A source change must drop a server viewport;
+        // a same-library refresh keeps the page the user was browsing.
+        if !retain_navigation {
+            ui.invoke_reset_result_list_scroll();
+        }
+        ui.set_albums(ModelRc::new(VecModel::<AlbumRow>::default()));
         *self.latest_selection.lock().unwrap() = None;
         self.metadata.lock().unwrap().reset_library();
         *self.selected.lock().unwrap() = None;
@@ -2709,10 +2977,17 @@ impl Controller {
         ui.set_selected_name("".into());
         ui.set_selected_path("".into());
         ui.set_selected_format("".into());
+        crate::detail_presentation::clear(ui);
+        ui.set_selected_album("".into());
+        ui.set_selected_album_id("".into());
+        ui.set_selected_artwork_directory("".into());
+        ui.set_album_cover(Image::default());
+        ui.set_album_cover_ready(false);
         ui.set_checked_count(0);
         ui.set_audio_ready(false);
         ui.set_waveform_ready(false);
         ui.set_waveform_image(Image::default());
+        ui.set_waveform_mask(Image::default());
         ui.set_waveform_info("".into());
         if ui.get_menu_has_page_rows() {
             ui.set_menu_has_page_rows(false);
@@ -2736,6 +3011,9 @@ impl Controller {
         ui.set_edit_notes("".into());
         ui.set_edit_favorite(false);
         if reset_request {
+            ui.set_album_filter("".into());
+            ui.set_album_filter_id("".into());
+            ui.set_album_filter_unavailable(false);
             *self.request.lock().unwrap() = SearchRequest::default();
             ui.set_query("".into());
             ui.set_favorites_only(false);
@@ -2861,8 +3139,62 @@ impl Controller {
         self.request_history_page(offset);
     }
 
+    /// Order the requested level with its FIFO admission. Never hold this lock
+    /// while waiting for the completion: GUI and IPC requests share this boundary.
+    fn enqueue_volume(
+        &self,
+        volume: f32,
+    ) -> audiolib_core::Result<audiolib_audio::CommandCompletion> {
+        if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+            return Err(audiolib_core::Error::Validation(
+                "Volume must be 0..=1".into(),
+            ));
+        }
+        let mut playback = self.playback.lock().unwrap();
+        let completion = self
+            .audio
+            .enqueue_with_ack(AudioCommand::SetVolume(volume))?;
+        playback.volume = volume;
+        Ok(completion)
+    }
+
+    /// Enqueue GUI volume input without waiting for a driver or engine response.
+    fn request_volume(&self, volume: f32) {
+        match self.enqueue_volume(volume) {
+            Ok(_) => {
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.set_volume_label(volume_label(volume));
+                }
+            }
+            Err(error) => {
+                // A rejected admission must not claim a new accepted level.
+                let requested = self.playback.lock().unwrap().volume;
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.set_volume(requested);
+                    publish_volume(&ui, requested);
+                }
+                self.status(error.to_string());
+            }
+        }
+    }
+
+    // Focus can remain on the slider after a gesture. Protect newer local input
+    // from queued engine snapshots, while still reflecting an acknowledged local
+    // or IPC volume request without requiring the user to move keyboard focus.
+    fn publish_confirmed_volume(&self, ui: &AppWindow, confirmed: f32) {
+        let requested = self.playback.lock().unwrap().volume;
+        if ui.get_volume_adjusting() && (confirmed - requested).abs() > 0.000_01 {
+            return;
+        }
+        if (ui.get_volume() - confirmed).abs() > 0.001 {
+            ui.set_volume(confirmed);
+        }
+        publish_volume(ui, confirmed);
+    }
+
     fn start_workers(self: &Arc<Self>) {
         self.start_workspace_worker();
+        self.start_artwork_worker();
         let c = self.clone();
         std::thread::Builder::new()
             .name("audiolib-selection".into())
@@ -2923,6 +3255,7 @@ impl Controller {
                         }
                         config.audition_play_on_single_click =
                             c.single_click_play.load(Ordering::Acquire);
+                        config.show_album_artwork = c.show_album_artwork.load(Ordering::Acquire);
                         config.pregenerate_list_waveforms =
                             c.pregenerate_list_waveforms.load(Ordering::Acquire);
                         config.hold_list_waveform_batches_after_audition =
@@ -2935,7 +3268,9 @@ impl Controller {
                         config.spectral_peaks = spectral_peaks;
                         config.max_search_tasks = c.max_search_tasks.load(Ordering::Acquire);
                         config.window_layout = c.window_layout.lock().unwrap().clone();
-                        config.save()
+                        config
+                            .reconcile_local_libraries()
+                            .and_then(|_| config.save())
                     };
                     if let Err(error) = result {
                         c.status(error.to_string());
@@ -3093,6 +3428,11 @@ impl Controller {
                     let workspace_revision =
                         revision_before.filter(|revision| Some(*revision) == revision_after);
                     crate::gui_search_benchmark::worker_completed(job.generation, false);
+                    // Hidden server records do not shorten the queried SQL range.
+                    let source_range = result
+                        .as_ref()
+                        .ok()
+                        .map(|page| (page.returned_count, page.total_count));
                     // Server removals stay hidden until the resync swaps the snapshot.
                     if let Ok(page) = result.as_mut() {
                         c.hide_removed_in_page(page);
@@ -3100,7 +3440,16 @@ impl Controller {
                     if c.search_generation.load(Ordering::Acquire) != job.generation {
                         continue;
                     }
-                    if result.is_err() {
+                    if result.is_err()
+                        && !c
+                            .search_publication
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|state| {
+                                state.generation == job.generation && state.result_window
+                            })
+                    {
                         job.cancel.store(true, Ordering::Release);
                     }
                     let c2 = c.clone();
@@ -3110,9 +3459,15 @@ impl Controller {
                         {
                             return;
                         }
-                        ui.set_searching(false);
                         match result {
                             Ok(page) => {
+                                let result_window =
+                                    c2.search_publication.lock().unwrap().as_ref().is_some_and(
+                                        |state| {
+                                            state.generation == job.generation
+                                                && state.result_window
+                                        },
+                                    );
                                 if job.request.offset > 0
                                     && (job.request.offset as u64) >= page.total_count
                                 {
@@ -3128,6 +3483,42 @@ impl Controller {
                                         .and_then(|state| state.retained_status.clone());
                                     c2.resume_search(&ui, retained_status);
                                     return;
+                                }
+                                let append_only = result_window
+                                    && job.request.offset == c2.request.lock().unwrap().offset
+                                    && {
+                                        let current = c2.records.lock().unwrap();
+                                        page.results.len() >= current.len()
+                                            && current
+                                                .iter()
+                                                .zip(&page.results)
+                                                .all(|(old, new)| old.id == new.id)
+                                    };
+                                let preserved_y = if result_window {
+                                    let y = result_window::result_window_scroll_y(
+                                        &c2.records.lock().unwrap(),
+                                        &page.results,
+                                        ui.get_task_result_scroll_y(),
+                                        ui.get_task_result_row_height(),
+                                        ui.get_task_result_visible_height(),
+                                    );
+                                    if y.is_none() {
+                                        // Direction can reverse during prefetch. Keep the
+                                        // old window if the new one would trim visible sounds.
+                                        c2.search_page_published(&ui, job.generation, true);
+                                        ui.set_searching(false);
+                                        return;
+                                    }
+                                    y
+                                } else {
+                                    None
+                                };
+                                if result_window {
+                                    ui.set_preserve_result_scroll(true);
+                                    if !append_only {
+                                        ui.set_task_restoring(true);
+                                    }
+                                    *c2.request.lock().unwrap() = job.request.clone();
                                 }
                                 let checked = c2.multi_selection.lock().unwrap().clone();
                                 let rows = page
@@ -3146,17 +3537,25 @@ impl Controller {
                                     rows.iter().position(|row| row.id == selected_id);
                                 publish_audio_rows(&ui, rows);
                                 ui.set_selected_row(selected_row.map_or(-1, |index| index as i32));
+                                if let Some(y) = preserved_y.filter(|_| !append_only) {
+                                    ui.invoke_restore_result_window_viewport(y);
+                                }
                                 ui.set_can_previous(job.request.offset > 0);
-                                ui.set_can_next(
-                                    ((job.request.offset + page.returned_count) as u64)
-                                        < page.total_count,
-                                );
+                                ui.set_can_next(source_range.is_some_and(|(returned, total)| {
+                                    ((job.request.offset + returned) as u64) < total
+                                }));
+                                let first_page = job.request.offset / PAGE_SIZE + 1;
+                                let last_page = (job.request.offset
+                                    + page.returned_count.saturating_sub(1))
+                                    / PAGE_SIZE
+                                    + 1;
+                                let pages = page.total_count.div_ceil(PAGE_SIZE as u64).max(1);
                                 ui.set_page_label(
-                                    format!(
-                                        "{}/{}",
-                                        job.request.offset / PAGE_SIZE + 1,
-                                        page.total_count.div_ceil(PAGE_SIZE as u64).max(1)
-                                    )
+                                    if first_page == last_page {
+                                        format!("{first_page}/{pages}")
+                                    } else {
+                                        format!("{first_page}–{last_page}/{pages}")
+                                    }
                                     .into(),
                                 );
                                 let shown = if page.total_count == 0 {
@@ -3220,11 +3619,22 @@ impl Controller {
                                     );
                                 }
                                 c2.search_page_published(&ui, job.generation, true);
+                                // Keep range requests gated until the complete row model
+                                // and its navigation bounds have been published together.
+                                ui.set_searching(false);
                                 c2.search_task_page_ready(&ui, workspace_revision);
                             }
                             Err(error) => {
+                                ui.set_searching(false);
                                 ui.set_status(error.to_string().into());
-                                c2.search_page_published(&ui, job.generation, false);
+                                let retained_window =
+                                    c2.search_publication.lock().unwrap().as_ref().is_some_and(
+                                        |state| {
+                                            state.generation == job.generation
+                                                && state.result_window
+                                        },
+                                    );
+                                c2.search_page_published(&ui, job.generation, retained_window);
                             }
                         }
                     });
@@ -3263,6 +3673,10 @@ impl Controller {
                         continue;
                     }
                     let provider = &job.provider;
+                    if c.task_album_choices_only(&job.request) {
+                        c.publish_albums(&job);
+                        continue;
+                    }
                     crate::gui_search_benchmark::worker_started(job.generation, true);
                     let database_revision = provider.search_revision().ok().flatten();
                     let cached = facets.as_ref().filter(|cached| {
@@ -3318,6 +3732,7 @@ impl Controller {
                         });
                     }
                     crate::gui_search_benchmark::worker_completed(job.generation, true);
+                    let album_job = job.clone();
                     let c2 = c.clone();
                     post(c.ui.clone(), move |ui| {
                         if c2.search_generation.load(Ordering::Acquire) != job.generation {
@@ -3330,6 +3745,8 @@ impl Controller {
                             folders.map_err(|error| error.to_string()),
                         );
                     });
+                    // Reuse this coalesced worker: typing never spawns unbounded facet queries.
+                    c.publish_albums(&album_job);
                 }
             })
             .expect("spawn directory search worker");
@@ -3414,6 +3831,7 @@ impl Controller {
                 // Network audition waiting for data: since when, and whether the hint shows.
                 let mut buffering_since: Option<Instant> = None;
                 let mut buffering_shown = false;
+                let mut last_wave_progress = Instant::now() - Duration::from_secs(1);
                 while !c.shutdown.load(Ordering::Acquire) {
                     if c.library_busy.load(Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(65));
@@ -3426,6 +3844,13 @@ impl Controller {
                         status.state,
                         PlaybackState::Loading | PlaybackState::Playing
                     ));
+                    let wave_progress =
+                        if last_wave_progress.elapsed() >= Duration::from_millis(500) {
+                            last_wave_progress = Instant::now();
+                            Some(c.list_waveforms.progress())
+                        } else {
+                            None
+                        };
                     let history_events: Vec<_> = events.try_iter().collect();
                     if playback_history
                         .library_generation
@@ -3492,6 +3917,21 @@ impl Controller {
                             c.buffering_hint(false);
                         }
                     }
+                    // A zoomed Waveform pages along with playback unless the user panned away.
+                    if status.state == PlaybackState::Playing
+                        && !c.wave_follow_paused.load(Ordering::Acquire)
+                        && c.wave_view.lock().unwrap().1.zoom > 1.0
+                        && let Some(file) = c.waveform_file(&status)
+                    {
+                        let moved = {
+                            let mut state = c.wave_view.lock().unwrap();
+                            state.0 == file.file_path
+                                && state.1.follow(status.position, file.duration)
+                        };
+                        if moved {
+                            c.queue_waveform(&file);
+                        }
+                    }
                     let audition_changed = last_audition != Some(status.audition);
                     let error_changed = last_playback_error != status.error;
                     last_playback_error = status.error.clone();
@@ -3503,6 +3943,13 @@ impl Controller {
                         .file_path
                         .as_deref()
                         .map(|path| c.playback_display_name(path));
+                    // An in-memory/server cache registration maps back to the
+                    // original resource, independently of the inspector selection.
+                    let playback_path = status
+                        .file_path
+                        .as_deref()
+                        .map(|path| c.playback_source_path(path));
+                    let buffering = buffering_shown;
                     let c2 = c.clone();
                     post(c.ui.clone(), move |ui| {
                         if c2.library_generation.load(Ordering::Acquire) != library_generation
@@ -3510,7 +3957,18 @@ impl Controller {
                         {
                             return;
                         }
+                        if let Some(progress) = wave_progress
+                            && c2.list_waveforms.generation() == progress.generation
+                            && ui.get_library_visible()
+                            && !ui.get_remote_mode()
+                        {
+                            let text = progress.text(c2.chinese.load(Ordering::Acquire));
+                            if ui.get_local_waveform_progress().as_str() != text {
+                                ui.set_local_waveform_progress(text.into());
+                            }
+                        }
                         publish_playback_progress(&ui, &status, progress_continues);
+                        publish_player_state(&ui, &status, buffering);
                         let ready = !matches!(
                             status.state,
                             PlaybackState::Empty | PlaybackState::Loading | PlaybackState::Error
@@ -3521,12 +3979,11 @@ impl Controller {
                         if let Some(name) = &playback_name {
                             ui.set_playback_name(name.as_str().into());
                         }
-                        if !ui.get_volume_adjusting() {
-                            if (ui.get_volume() - status.volume).abs() > 0.001 {
-                                ui.set_volume(status.volume);
-                            }
-                            publish_volume(&ui, status.volume);
+                        let playback_path = playback_path.as_deref().unwrap_or_default();
+                        if ui.get_playback_path().as_str() != playback_path {
+                            ui.set_playback_path(playback_path.into());
                         }
+                        c2.publish_confirmed_volume(&ui, status.volume);
                         if audition_changed {
                             publish_audition(&ui, status.audition);
                         }
@@ -3593,7 +4050,7 @@ impl Controller {
     }
 
     fn search_page_published(self: &Arc<Self>, ui: &AppWindow, generation: u64, succeeded: bool) {
-        let folders = {
+        let (folders, finish_tree) = {
             let mut publication = self.search_publication.lock().unwrap();
             let Some(state) = publication
                 .as_mut()
@@ -3611,10 +4068,19 @@ impl Controller {
                 state.expected_folders = None;
                 return;
             }
-            state.pending_folders.take()
+            let folders = state.pending_folders.take();
+            let finish_tree = state.result_window
+                && !state.model_published
+                && state.expected_folders.is_some()
+                && folders.is_none();
+            (folders, finish_tree)
         };
         if let Some(folders) = folders {
             self.apply_search_folders(ui, generation, folders);
+        } else if finish_tree {
+            // A tree handoff may have arrived while this same query's window
+            // was pending. Complete readiness without recomputing its facets.
+            self.reload_tree();
         }
     }
 
@@ -3688,6 +4154,160 @@ impl Controller {
         ui.set_status(message.into());
     }
 
+    /// Publish album facets for the current query and filters. The album filter itself is
+    /// dropped so every other album stays reachable. Older remote snapshots skip
+    /// unindexed album aggregation and remain unchanged on disk.
+    fn publish_albums(self: &Arc<Self>, job: &SearchJob) {
+        let current = || {
+            self.search_generation.load(Ordering::Acquire) == job.generation
+                && !job.cancel.load(Ordering::Acquire)
+                && self.available()
+                && self.album_facets_available()
+        };
+        if !current() {
+            return;
+        }
+        let confirmed = self.clone();
+        let provider = job.provider.clone();
+        let mut request = job.request.clone();
+        request.filters.album = None;
+        request.filters.album_id = None;
+        request.limit = 1;
+        let ui = self.ui.clone();
+        let Ok(albums) = provider.album_facets_cancellable(&request, job.cancel.clone()) else {
+            return;
+        };
+        // Sidebar thumbnails read only cached pixels; source extraction stays on the
+        // independent artwork worker. slint::Image is not Send, so pixels cross to
+        // the event loop and images are built there.
+        let mut rows = Vec::with_capacity(albums.len());
+        for (index, facet) in albums.into_iter().enumerate() {
+            if !current() {
+                return;
+            }
+            let thumbnail = self.album_thumbnail(&provider, &facet.album, index);
+            rows.push((facet.album, facet.matching_count, thumbnail));
+        }
+        let generation = job.generation;
+        let cancel = job.cancel.clone();
+        post(ui, move |ui| {
+            if confirmed.search_generation.load(Ordering::Acquire) != generation
+                || cancel.load(Ordering::Acquire)
+                || !confirmed.available()
+                || !confirmed.album_facets_available()
+            {
+                return;
+            }
+            confirmed.remember_task_album_bindings(
+                provider.album_namespace(),
+                rows.iter().map(|(album, _, _)| album.clone()),
+            );
+            let rows: Vec<AlbumRow> = rows
+                .into_iter()
+                .map(|(album, count, thumbnail)| AlbumRow {
+                    id: album.id.to_string().into(),
+                    name: album.name.into(),
+                    count: count.to_string().into(),
+                    cover: match thumbnail {
+                        Some((pixels, width, height)) => slint::Image::from_rgba8(
+                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                                &pixels, width, height,
+                            ),
+                        ),
+                        None => slint::Image::default(),
+                    },
+                })
+                .collect();
+            ui.set_albums(ModelRc::new(VecModel::from(rows)));
+            if !ui.get_album_filter_unavailable()
+                && let Some(active) = ui
+                    .get_albums()
+                    .iter()
+                    .find(|row| row.id == ui.get_album_filter_id())
+            {
+                ui.set_album_filter(active.name);
+            }
+        });
+    }
+
+    fn request_page(self: &Arc<Self>, ui: &AppWindow, delta: i32) {
+        if !self.available()
+            || ui.get_searching()
+            || ui.get_background_blocked()
+            || ui.get_task_restoring()
+            || delta == 0
+            || (delta < 0 && !ui.get_can_previous())
+            || (delta > 0 && !ui.get_can_next())
+        {
+            return;
+        }
+        let mut request = self.request.lock().unwrap();
+        request.offset = if delta < 0 {
+            request.offset.saturating_sub(PAGE_SIZE)
+        } else {
+            request.offset.saturating_add(request.limit)
+        };
+        request.limit = PAGE_SIZE;
+        drop(request);
+        self.request_navigation_search(ui, true, false);
+    }
+
+    /// Keep at most three pages resident, loading before the viewport reaches an edge.
+    fn extend_result_window(self: &Arc<Self>, ui: &AppWindow, direction: i32) -> bool {
+        if !self.available()
+            || ui.get_searching()
+            || ui.get_background_blocked()
+            || ui.get_task_restoring()
+            || direction == 0
+            || (direction < 0 && !ui.get_can_previous())
+            || (direction > 0 && !ui.get_can_next())
+        {
+            return false;
+        }
+        let mut request = self.request.lock().unwrap().clone();
+        let count = self.records.lock().unwrap().len();
+        if count == 0 {
+            return false;
+        }
+        let span = request.limit;
+        if direction < 0 {
+            let added = request.offset.min(PAGE_SIZE);
+            request.offset -= added;
+            request.limit = (span + added).min(PAGE_SIZE * 3);
+        } else if span < PAGE_SIZE * 3 {
+            request.limit = (span + PAGE_SIZE).min(PAGE_SIZE * 3);
+        } else {
+            request.offset = request.offset.saturating_add(PAGE_SIZE);
+            request.limit = PAGE_SIZE * 3;
+        }
+        let generation = self.search_generation.load(Ordering::Acquire);
+        {
+            let mut publication = self.search_publication.lock().unwrap();
+            let Some(state) = publication.as_mut().filter(|state| {
+                state.generation == generation && state.page == SearchPagePhase::Published
+            }) else {
+                return false;
+            };
+            state.page = SearchPagePhase::Pending;
+            state.result_window = true;
+        }
+        // The query and its complete directory counts have not changed. Reuse
+        // their generation/cancellation scope and only fetch the adjoining rows.
+        // A new query, sort, task or library still invalidates the entire scope.
+        let job = SearchJob {
+            request,
+            generation,
+            not_before: Instant::now(),
+            cancel: self.search_cancel.lock().unwrap().clone(),
+            facet_revision: self.facet_revision.load(Ordering::Acquire),
+            provider: self.provider(),
+        };
+        *self.search_job.lock().unwrap() = Some(job);
+        ui.set_searching(true);
+        self.search_wake.notify_one();
+        true
+    }
+
     fn request_navigation_search(self: &Arc<Self>, ui: &AppWindow, immediate: bool, reset: bool) {
         if !self.available() {
             return;
@@ -3704,9 +4324,7 @@ impl Controller {
         let generation = self.search_generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.tree_generation.fetch_add(1, Ordering::AcqRel);
         ui.set_searching(false);
-        if self.task_folder_unavailable(ui) {
-            return;
-        }
+        self.cancel_deferred_task_search();
         let mut request = self.request.lock().unwrap().clone();
         request.query = ui.get_query().to_string();
         if request.needs_more_search_text() {
@@ -3720,8 +4338,13 @@ impl Controller {
             );
             return;
         }
-        request.limit = PAGE_SIZE;
+        if self.task_folder_unavailable(ui, immediate, reset) {
+            self.queue_unavailable_album_choices(ui, generation);
+            return;
+        }
+        request.limit = request.limit.clamp(PAGE_SIZE, PAGE_SIZE * 3);
         if reset {
+            request.limit = PAGE_SIZE;
             request.offset = 0;
         }
         let samples = [0, 44_100, 48_000, 88_200, 96_000, 192_000];
@@ -3787,6 +4410,13 @@ impl Controller {
             tagged_only: ui.get_tagged_only(),
             color: (!ui.get_color_filter().trim().is_empty())
                 .then(|| ui.get_color_filter().trim().to_owned()),
+            album: (ui.get_album_filter_id().is_empty() && !ui.get_album_filter().is_empty())
+                .then(|| ui.get_album_filter().to_string()),
+            album_id: ui
+                .get_album_filter_id()
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0),
             ..SearchFilters::default()
         };
         crate::tag_chips::apply_to(ui, &mut request.filters);
@@ -3797,6 +4427,7 @@ impl Controller {
             return;
         }
         crate::gui_search_benchmark::request(ui, generation, &request);
+        ui.set_preserve_result_scroll(false);
         self.begin_task_search(reset);
         *self.request.lock().unwrap() = request.clone();
         self.persist_search_task(ui);
@@ -3827,6 +4458,7 @@ impl Controller {
             expected_folders: None,
             model_published: false,
             retained_status: None,
+            result_window: false,
         });
         *self.search_job.lock().unwrap() = Some(job.clone());
         *self.facet_job.lock().unwrap() = Some(job);
@@ -3857,7 +4489,6 @@ impl Controller {
     }
 
     fn select_folder_id(self: &Arc<Self>, id: i64) {
-        self.clear_task_folder_error();
         let path = {
             let tree = self.tree.lock().unwrap();
             if tree.selected == Some(id) {
@@ -3865,6 +4496,8 @@ impl Controller {
             }
             tree.known.get(&id).map(|folder| folder.path.clone())
         };
+        self.begin_task_search(true);
+        self.clear_task_folder_error();
         if let Some(ui) = self.ui.upgrade() {
             // Visible folders and breadcrumbs already have a validated owned
             // path. Keep the scope indicator stable while workers publish.
@@ -4165,6 +4798,8 @@ impl Controller {
         {
             return;
         }
+        // Explicit selection may reveal its row; range publication only reindexes it.
+        ui.set_preserve_result_scroll(false);
         let generation = self.selection_generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.invalidate_waveform();
         self.remote_audio_cancel
@@ -4313,10 +4948,13 @@ impl Controller {
             ui.set_selected_row(selected_row.map_or(-1, |index| index as i32));
             ui.set_metadata_dirty(dirty);
             ui.set_audio_ready(false);
+            // Client-local covers are available even when the source WAV is missing.
+            c2.queue_artwork(&displayed);
             if displayed.missing {
                 c2.selection_request_completed(generation);
                 ui.set_waveform_ready(false);
                 ui.set_waveform_image(Image::default());
+                ui.set_waveform_mask(Image::default());
                 ui.set_waveform_info(
                     if c2.chinese.load(Ordering::Acquire) {
                         "文件缺失，请重新关联 WAV"
@@ -4359,6 +4997,11 @@ impl Controller {
             });
             c2.selection_audio_wake.notify_one();
         });
+    }
+
+    /// Cover work never delays Load/Play and never seeks a remote stream to its tail.
+    fn queue_artwork(&self, file: &AudioFile) {
+        self.enqueue_artwork(file);
     }
 
     fn load_selection_audio(self: &Arc<Self>, job: SelectionAudioJob) {
@@ -4483,6 +5126,8 @@ impl Controller {
         let job = job.clone();
         let c2 = self.clone();
         let pixels = render_waveform(data, job.width, job.height, job.view);
+        let studio = *self.theme.lock().unwrap() == STUDIO_THEME;
+        let mask = studio.then(|| render_waveform_mask(data, job.width, job.height, job.view));
         let info = format!(
             "{} ch · {:.1} kHz · {}",
             data.channels,
@@ -4503,22 +5148,22 @@ impl Controller {
             ui.set_waveform_image(Image::from_rgba8(
                 SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&pixels, job.width, job.height),
             ));
+            let mask = if ui.global::<crate::Theme>().get_modern_style() {
+                mask.map_or_else(Image::default, |mask| {
+                    Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                        &mask, job.width, job.height,
+                    ))
+                })
+            } else {
+                Image::default()
+            };
+            ui.set_waveform_mask(mask);
             let (start, end) = job.view.range(job.duration);
             ui.set_view_start(start as f32);
             ui.set_view_end(end as f32);
             ui.set_wave_zoom(job.view.zoom as f32);
             ui.set_wave_scroll(job.view.scroll as f32);
-            let labels = (0..=10)
-                .map(|index| {
-                    let time = start + (end - start) * index as f64 / 10.0;
-                    if end - start < 10.0 {
-                        format!("{}:{:04.1}", (time / 60.0) as u64, time % 60.0).into()
-                    } else {
-                        format!("{}:{:02}", (time / 60.0) as u64, time as u64 % 60).into()
-                    }
-                })
-                .collect::<Vec<slint::SharedString>>();
-            ui.set_ruler_labels(ModelRc::new(VecModel::from(labels)));
+            ui.set_waveform_progress(progress as f32);
             ui.set_waveform_ready(true);
             ui.set_waveform_info(info.into());
         });
@@ -4558,6 +5203,52 @@ impl Controller {
         playback_wave_file(status)
     }
 
+    /// A presentation-only refresh retains the displayed/queued source. The engine
+    /// can still hold the previous sound while a new selection waits for Load.
+    /// Transport and external-IPC discovery keep using `waveform_file` independently.
+    fn waveform_refresh_file(
+        &self,
+        status: &audiolib_audio::PlaybackStatus,
+        current_waveform_ready: bool,
+    ) -> Option<AudioFile> {
+        let selected = self.selected.lock().unwrap().clone();
+        let pending = *self.audio_reload.lock().unwrap();
+        let displayed_path = self.wave_view.lock().unwrap().0.clone();
+        if let Some(file) = selected.as_ref()
+            && !file.missing
+            && (pending == Some(file.id)
+                || displayed_path.is_empty()
+                || same_path(Path::new(&file.file_path), Path::new(&displayed_path)))
+        {
+            return Some(file.clone());
+        }
+        if !current_waveform_ready && selected.as_ref().is_some_and(|file| file.missing) {
+            // Missing selections intentionally clear the old picture. Resizing or
+            // changing theme must not resurrect the engine's retained previous file.
+            return None;
+        }
+        if self.waveform_cancel.lock().unwrap().load(Ordering::Acquire)
+            || status.generation == self.removed_audio_generation.load(Ordering::Acquire)
+        {
+            // Library/source invalidation can retain the engine's stopped path.
+            // Only external-playback discovery may establish a new viewport then.
+            return None;
+        }
+        let playing = if self.remote_read_only() {
+            status
+                .file_path
+                .as_deref()
+                .and_then(|path| self.remote_wave_file(path))
+                .or_else(|| playback_wave_file(status))
+        } else {
+            playback_wave_file(status)
+        };
+        playing.filter(|file| {
+            displayed_path.is_empty()
+                || same_path(Path::new(&file.file_path), Path::new(&displayed_path))
+        })
+    }
+
     fn queue_waveform(&self, file: &AudioFile) {
         if !self.available() || file.missing {
             return;
@@ -4577,6 +5268,7 @@ impl Controller {
                 state.0 = file.file_path.clone();
                 state.1.zoom = 1.0;
                 state.1.scroll = 0.0;
+                self.wave_follow_paused.store(false, Ordering::Release);
             }
             (state.1, changed)
         };
@@ -4593,16 +5285,26 @@ impl Controller {
             duration: file.duration,
             view,
             generation,
-            cancel,
+            cancel: cancel.clone(),
             width,
             height,
         });
-        if changed {
-            post(self.ui.clone(), |ui| {
+        // The requested range and its ruler show at once; the old image is drawn
+        // inside it until this render lands. A newer request supersedes this one.
+        let duration = file.duration;
+        let superseded = cancel;
+        post(self.ui.clone(), move |ui| {
+            if superseded.load(Ordering::Acquire) {
+                return;
+            }
+            if changed {
                 ui.set_waveform_ready(false);
+                ui.set_waveform_progress(0.0);
                 ui.set_waveform_image(Image::default());
-            });
-        }
+                ui.set_waveform_mask(Image::default());
+            }
+            publish_wave_target(&ui, view, duration);
+        });
         self.waveform_wake.notify_one();
     }
 
@@ -4843,6 +5545,10 @@ impl Controller {
                     c.wait_transition_metadata(barrier)
                 }
             });
+            // Cover edits accepted before closing own their original destination.
+            // Drain them off the event loop and retain any persistence failure.
+            let artwork_result = c.wait_artwork_actions();
+            let metadata_result = metadata_result.and(artwork_result);
             // The finish interrupt was only there so Metadata could take the writer.
             // If the window stays open, clear it before a later rollup observes it.
             // Shutdown still aborts that statement instead of starting it over.
@@ -5509,11 +6215,7 @@ impl Controller {
         }
         let c = self.clone();
         std::thread::spawn(move || {
-            let backend = if backend == 1 {
-                AudioBackend::Asio
-            } else {
-                AudioBackend::Wasapi
-            };
+            let backend = backend_for_index(backend);
             let result = audiolib_audio::list_devices(backend);
             if c.device_generation.load(Ordering::Acquire) != generation {
                 return;
@@ -5652,11 +6354,7 @@ impl Controller {
                 return;
             }
         };
-        let backend = if ui.get_backend_index() == 1 {
-            AudioBackend::Asio
-        } else {
-            AudioBackend::Wasapi
-        };
+        let backend = backend_for_index(ui.get_backend_index());
         let devices = self.devices.lock().unwrap();
         let device = devices.get(ui.get_device_index() as usize);
         if device.is_none() {
@@ -5894,6 +6592,11 @@ impl Controller {
             .map(|file| file.id)
             .collect();
         let first = usize::try_from(first).unwrap_or(0);
+        // A server window reported after the model shrank must not retarget local rows.
+        if ids.is_empty() || first >= ids.len() {
+            self.list_waveforms.set_window(Vec::new(), 0);
+            return;
+        }
         let count = usize::try_from(count).unwrap_or(0).max(1);
         self.list_waveforms
             .set_window(window_ids(&ids, first, count), count);
@@ -5986,7 +6689,35 @@ impl Controller {
             {
                 c.status(error.to_string());
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            {
+                let result = if select_file {
+                    audiolib_windows::reveal_path(Path::new(&path))
+                } else {
+                    Path::new(&path)
+                        .canonicalize()
+                        .and_then(|path| {
+                            std::process::Command::new("/usr/bin/open")
+                                .arg(path)
+                                .status()
+                        })
+                        .map_err(audiolib_core::Error::from)
+                        .and_then(|status| {
+                            if status.success() {
+                                Ok(())
+                            } else {
+                                Err(std::io::Error::other(format!(
+                                    "Finder folder open failed ({status})"
+                                ))
+                                .into())
+                            }
+                        })
+                };
+                if let Err(error) = result {
+                    c.status(error.to_string());
+                }
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
             {
                 let _ = (path, select_file);
                 c.status("Reveal in Explorer requires Windows".into());
@@ -6299,7 +7030,11 @@ impl Controller {
         if let Err(error) = self.wait_workspace_writes() {
             tracing::warn!(%error, "Save search workspace during shutdown");
         }
+        if let Err(error) = self.wait_artwork_actions() {
+            tracing::warn!(%error, "Save artwork settings during shutdown");
+        }
         self.shutdown.store(true, Ordering::Release);
+        self.cancel_artwork();
         {
             let _writes = self.workspace_writes.lock().unwrap();
             self.workspace_wake.notify_all();
@@ -6365,6 +7100,11 @@ impl Controller {
             self.selection_audio_wake.notify_all();
         }
         {
+            let mut pending = self.artwork_job.lock().unwrap();
+            *pending = None;
+            self.artwork_wake.notify_all();
+        }
+        {
             let _signal = self.poll_signal.lock().unwrap();
             self.poll_wake.notify_all();
         }
@@ -6374,6 +7114,7 @@ impl Controller {
         let spectral_peaks = self.spectral_peak_preferences();
         let mut config = self.config.lock().unwrap();
         config.audition_play_on_single_click = self.single_click_play.load(Ordering::Acquire);
+        config.show_album_artwork = self.show_album_artwork.load(Ordering::Acquire);
         config.pregenerate_list_waveforms = self.pregenerate_list_waveforms.load(Ordering::Acquire);
         config.hold_list_waveform_batches_after_audition =
             self.hold_list_waveform_batches.load(Ordering::Acquire);
@@ -6390,7 +7131,10 @@ impl Controller {
         }
         config.playback =
             serde_json::to_value(self.playback.lock().unwrap().clone()).unwrap_or_default();
-        if let Err(error) = config.save() {
+        if let Err(error) = config
+            .reconcile_local_libraries()
+            .and_then(|_| config.save())
+        {
             tracing::warn!(%error,"Save desktop preferences");
         }
         let _ = self.audio.send(AudioCommand::Shutdown);
@@ -6470,20 +7214,19 @@ impl Controller {
         ) {
             self.list_waveforms.note_audition_start();
         }
-        match self.audio.send_and_wait(command, Duration::from_secs(4)) {
-            Ok(status) => {
-                if value["command"] == "volume" {
-                    self.playback.lock().unwrap().volume = status.volume;
-                }
-                audiolib_core::success(serde_json::json!(status))
-            }
+        let completion = match command {
+            AudioCommand::SetVolume(volume) => self.enqueue_volume(volume),
+            command => self.audio.enqueue_with_ack(command),
+        };
+        match completion.and_then(|completion| completion.wait(Duration::from_secs(4))) {
+            Ok(status) => audiolib_core::success(serde_json::json!(status)),
             Err(error) => audiolib_core::failure(&error.to_string()),
         }
     }
 }
 
-/// Keep native pointer gestures and the viewport when a refresh retains the same row
-/// identities and order. New identities replace delegates, cancelling old gestures.
+/// Refresh or append a retained row prefix in place, preserving native gestures,
+/// scrolling animations and the viewport. Reorders and removals replace delegates.
 fn publish_audio_rows(ui: &AppWindow, rows: Vec<AudioRow>) {
     let has_page_rows = !rows.is_empty();
     if ui.get_menu_has_page_rows() != has_page_rows {
@@ -6491,15 +7234,19 @@ fn publish_audio_rows(ui: &AppWindow, rows: Vec<AudioRow>) {
     }
     let existing = ui.get_rows();
     if let Some(model) = existing.as_any().downcast_ref::<VecModel<AudioRow>>()
-        && model.row_count() == rows.len()
-        && rows.iter().enumerate().all(|(index, row)| {
+        && model.row_count() <= rows.len()
+        && (model.row_count() > 0 || rows.is_empty())
+        && (0..model.row_count()).all(|index| {
             model
                 .row_data(index)
-                .is_some_and(|current| current.id == row.id)
+                .is_some_and(|current| current.id == rows[index].id)
         })
     {
+        let previous_count = model.row_count();
         for (index, row) in rows.into_iter().enumerate() {
-            if model.row_data(index).as_ref() != Some(&row) {
+            if index >= previous_count {
+                model.push(row);
+            } else if model.row_data(index).as_ref() != Some(&row) {
                 model.set_row_data(index, row);
             }
         }
@@ -6798,10 +7545,42 @@ fn playback_wave_file(status: &audiolib_audio::PlaybackStatus) -> Option<AudioFi
     })
 }
 
+/// Adapt imported Windows ASIO preferences to the default CoreAudio host on macOS.
+/// The persisted backend spelling stays compatible with existing settings files.
+pub(crate) fn platform_playback_config(playback: PlaybackConfig) -> PlaybackConfig {
+    playback_config_for_platform(playback, cfg!(target_os = "macos"))
+}
+
+fn playback_config_for_platform(mut playback: PlaybackConfig, macos: bool) -> PlaybackConfig {
+    if macos && playback.backend == AudioBackend::Asio {
+        playback.backend = AudioBackend::Wasapi;
+        playback.device_id = None;
+        playback.buffer_frames = 0;
+        playback.rate_policy = RatePolicy::DeviceDefault;
+    }
+    playback
+}
+
+fn backend_for_index(index: i32) -> AudioBackend {
+    if index == 1 && !cfg!(target_os = "macos") {
+        AudioBackend::Asio
+    } else {
+        AudioBackend::Wasapi
+    }
+}
+
+fn default_backend_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "CoreAudio"
+    } else {
+        "WASAPI"
+    }
+}
+
 fn output_summary(status: &audiolib_audio::PlaybackStatus) -> String {
     let output = match status.active_backend {
         Some(AudioBackend::Asio) => "ASIO",
-        Some(AudioBackend::Wasapi) => "WASAPI",
+        Some(AudioBackend::Wasapi) => default_backend_name(),
         None => "Output idle",
     };
     let pair = |value: Option<u16>| {
@@ -6940,11 +7719,30 @@ fn same_patch(left: &MetadataPatch, right: &MetadataPatch) -> bool {
 }
 
 fn present_file(ui: &AppWindow, file: &AudioFile) {
+    crate::detail_presentation::present(ui, file);
+    let album = file
+        .album_entity
+        .as_ref()
+        .map(|album| album.name.clone())
+        .unwrap_or_else(|| file.album.clone());
+    let identity = file.album_id.map(|id| id.to_string()).unwrap_or_default();
+    let directory = audiolib_db::source_parent_path_identity(&file.file_path);
+    let same_cover = !identity.is_empty()
+        && ui.get_selected_album_id().as_str() == identity
+        && ui.get_selected_artwork_directory().as_str() == directory;
     ui.set_selected_id(file.id.to_string().into());
     ui.set_has_selection(true);
     ui.set_selected_missing(file.missing);
     ui.set_selected_name(file.filename.clone().into());
     ui.set_selected_path(file.file_path.clone().into());
+    // Members retain pixels only within the same album and direct parent directory.
+    if !same_cover {
+        ui.set_album_cover_ready(false);
+        ui.set_album_cover(Image::default());
+    }
+    ui.set_selected_album(album.into());
+    ui.set_selected_album_id(identity.into());
+    ui.set_selected_artwork_directory(directory.into());
     ui.set_selected_format(
         format!(
             "{:.1} kHz / {} bit / {} ch / {}",
@@ -7058,6 +7856,8 @@ impl ListWaveformHost for Controller {
 }
 
 fn audio_row(file: &AudioFile) -> AudioRow {
+    let tag_labels = crate::detail_presentation::labels(file);
+    let tag_extra = tag_labels.len().saturating_sub(3).min(i32::MAX as usize) as i32;
     let marker = file
         .color
         .as_deref()
@@ -7072,6 +7872,7 @@ fn audio_row(file: &AudioFile) -> AudioRow {
             .map_or(String::new(), |path| path.to_string_lossy().into_owned())
             .into(),
         duration: format!("{:.2}s", file.duration).into(),
+        duration_clock: format_time(file.duration).into(),
         format: format!(
             "{:.1}k / {}b",
             file.sample_rate as f64 / 1000.0,
@@ -7080,6 +7881,11 @@ fn audio_row(file: &AudioFile) -> AudioRow {
         .into(),
         channels: file.channels.to_string().into(),
         tags: audiolib_core::display_tags(&file.tags, &file.attributes).into(),
+        tag_preview: ModelRc::new(VecModel::from(
+            tag_labels.into_iter().take(3).collect::<Vec<_>>(),
+        )),
+        tag_extra,
+        album: file.album.clone().into(),
         favorite: file.favorite,
         missing: file.missing,
         checked: false,
@@ -7112,8 +7918,13 @@ pub(crate) fn zoom_waveform_at_pointer(
     fraction: f32,
     duration: f64,
 ) {
-    let start = f64::from(ui.get_view_start());
-    let end = f64::from(ui.get_view_end());
+    // Anchor to the range drawn under the pointer: a pending request's range,
+    // else the displayed image's own range.
+    let (mut start, mut end) = (ui.get_wave_target_start(), ui.get_wave_target_end());
+    if end <= start {
+        (start, end) = (ui.get_view_start(), ui.get_view_end());
+    }
+    let (start, end) = (f64::from(start), f64::from(end));
     if end <= start {
         return;
     }
@@ -7158,6 +7969,99 @@ pub(crate) fn publish_playback_progress(
     ui.set_play_duration(status.duration as f32);
     ui.set_play_time(format_time(status.position).into());
     ui.set_play_end(format_time(status.duration).into());
+}
+
+/// Player-bar transport phase, see `AppWindow.playback-state`.
+fn playback_state_code(state: PlaybackState) -> i32 {
+    match state {
+        PlaybackState::Empty => 0,
+        PlaybackState::Loading => 1,
+        PlaybackState::Ready => 2,
+        PlaybackState::Playing => 3,
+        PlaybackState::Paused => 4,
+        PlaybackState::Stopped => 5,
+        PlaybackState::Ended => 6,
+        PlaybackState::Error => 7,
+    }
+}
+
+/// Publish the transport phase, playback error and output route that the player
+/// bar draws as state. `buffering` is the delayed network-starvation hint.
+pub(crate) fn publish_player_state(
+    ui: &AppWindow,
+    status: &audiolib_audio::PlaybackStatus,
+    buffering: bool,
+) {
+    ui.set_playback_state(playback_state_code(status.state));
+    let error = status.error.as_deref().unwrap_or_default();
+    if ui.get_playback_error().as_str() != error {
+        ui.set_playback_error(error.into());
+    }
+    ui.set_playback_buffering(buffering && status.state == PlaybackState::Playing);
+    let (backend, rate) = output_route(status);
+    if ui.get_output_backend().as_str() != backend {
+        ui.set_output_backend(backend.into());
+    }
+    if ui.get_output_rate().as_str() != rate {
+        ui.set_output_rate(rate.into());
+    }
+    ui.set_output_xruns(i32::try_from(status.underruns).unwrap_or(i32::MAX));
+}
+
+/// Active backend ("" while idle) and device rate, e.g. `("WASAPI", "48 kHz")`.
+fn output_route(status: &audiolib_audio::PlaybackStatus) -> (&'static str, String) {
+    let backend = match status.active_backend {
+        Some(AudioBackend::Asio) => "ASIO",
+        Some(AudioBackend::Wasapi) => default_backend_name(),
+        None => return ("", String::new()),
+    };
+    if status.device_sample_rate == 0 {
+        return (backend, String::new());
+    }
+    let khz = f64::from(status.device_sample_rate) / 1000.0;
+    let rate = if khz.fract() == 0.0 {
+        format!("{khz:.0} kHz")
+    } else {
+        format!("{khz:.1} kHz")
+    };
+    (backend, rate)
+}
+
+/// Publish the requested Waveform range, its zoom and its ruler ticks. The panel
+/// draws the last image inside this range until the render for it lands.
+pub(crate) fn publish_wave_target(ui: &AppWindow, view: WaveView, duration: f64) {
+    let (start, end) = view.range(duration);
+    ui.set_wave_target_start(start as f32);
+    ui.set_wave_target_end(end as f32);
+    ui.set_wave_zoom(view.zoom as f32);
+    ui.set_wave_scroll(view.scroll as f32);
+    let ticks = ruler_marks(start, end)
+        .into_iter()
+        .map(|mark| RulerTick {
+            fraction: mark.fraction as f32,
+            major: mark.label.is_some(),
+            label: mark.label.unwrap_or_default().into(),
+        })
+        .collect::<Vec<_>>();
+    ui.set_ruler_ticks(ModelRc::new(VecModel::from(ticks)));
+}
+
+/// Typed transform fields the engine would reject: bit 1 Pitch, bit 2 Rate.
+pub(crate) fn rejected_audition_fields(pitch: &str, rate: &str) -> i32 {
+    let valid = |settings: AuditionSettings| settings.validate().is_ok();
+    let pitch_ok = pitch.trim().parse::<f32>().is_ok_and(|pitch_semitones| {
+        valid(AuditionSettings {
+            pitch_semitones,
+            ..AuditionSettings::default()
+        })
+    });
+    let rate_ok = rate.trim().parse::<f32>().is_ok_and(|rate| {
+        valid(AuditionSettings {
+            rate,
+            ..AuditionSettings::default()
+        })
+    });
+    i32::from(!pitch_ok) | (i32::from(!rate_ok) << 1)
 }
 
 fn publish_audition(ui: &AppWindow, settings: AuditionSettings) {
@@ -7362,6 +8266,159 @@ mod tests {
     use audiolib_audio::{WaveformData, WaveformPeak};
 
     #[test]
+    fn presentation_refresh_retains_pending_selection_and_rejects_cleared_missing_waveform() {
+        i_slint_backend_testing::init_no_event_loop();
+        let root = tempfile::tempdir().unwrap();
+        let path_a = root.path().join("A.wav");
+        let path_b = root.path().join("B.wav");
+        std::fs::write(&path_a, tiny_pcm_wav()).unwrap();
+        std::fs::write(&path_b, tiny_pcm_wav()).unwrap();
+        let provider = Arc::new(SqliteProvider::open(&root.path().join("library.db")).unwrap());
+        let engine = audiolib_audio::AudioEngine::new(PlaybackConfig::default()).unwrap();
+        // Load establishes the retained engine source without opening an output
+        // device or playing sound. B's Load is deliberately still pending below.
+        let loaded = engine
+            .handle()
+            .send_and_wait(AudioCommand::Load(path_a.clone()), Duration::from_secs(4))
+            .unwrap();
+        assert_eq!(loaded.state, PlaybackState::Ready);
+        let ui = AppWindow::new().unwrap();
+        let controller = Controller::new(
+            &ui,
+            provider,
+            engine.handle(),
+            AppConfig::load_in(root.path().join("preferences")).unwrap(),
+            PlaybackConfig::default(),
+        );
+        // Let external-playback discovery baseline A before staging B. Otherwise
+        // the poller's first observation could race this deliberately pending view.
+        let baseline = Instant::now();
+        while controller.wave_view.lock().unwrap().0 != path_a.to_string_lossy() {
+            assert!(
+                baseline.elapsed() < Duration::from_secs(2),
+                "A was not baselined"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let file_b = AudioFile {
+            id: 20,
+            filename: "B.wav".into(),
+            file_path: path_b.to_string_lossy().into_owned(),
+            sample_rate: loaded.sample_rate,
+            channels: loaded.channels,
+            duration: loaded.duration,
+            ..Default::default()
+        };
+        *controller.selected.lock().unwrap() = Some(file_b.clone());
+        present_file(&ui, &file_b);
+        controller.mark_audio_reload(file_b.id);
+        *controller.wave_view.lock().unwrap() = (
+            file_b.file_path.clone(),
+            WaveView {
+                zoom: 4.0,
+                scroll: 0.25,
+                ..Default::default()
+            },
+        );
+        ui.set_waveform_ready(false);
+        ui.invoke_theme_requested(crate::theme::theme_index(STUDIO_THEME));
+        let assert_b_view = || {
+            let state = controller.wave_view.lock().unwrap();
+            assert_eq!(state.0, file_b.file_path);
+            assert_eq!((state.1.zoom, state.1.scroll), (4.0, 0.25));
+        };
+        assert_b_view();
+        ui.invoke_waveform_resize_requested(480, 72);
+        assert_b_view();
+        // Presentation controls must keep the same pending B, just like a theme
+        // or size refresh, even though the engine is still reporting A.
+        ui.invoke_waveform_zoom_requested(2.0);
+        assert_eq!(controller.wave_view.lock().unwrap().0, file_b.file_path);
+        ui.invoke_waveform_wheel_zoom_requested(2.0, 0.5);
+        assert_eq!(controller.wave_view.lock().unwrap().0, file_b.file_path);
+        ui.invoke_waveform_pan_requested(0.4);
+        assert_eq!(controller.wave_view.lock().unwrap().0, file_b.file_path);
+        ui.invoke_peak_style_requested();
+        assert_eq!(controller.wave_view.lock().unwrap().0, file_b.file_path);
+        assert_eq!(
+            engine.handle().status().file_path.as_deref(),
+            Some(path_a.as_path())
+        );
+
+        // A missing B clears a formerly displayed A but leaves A loaded. Neither
+        // theme entry nor a presenter resize may start a fresh A render.
+        let mut missing_b = file_b.clone();
+        missing_b.missing = true;
+        *controller.selected.lock().unwrap() = Some(missing_b.clone());
+        present_file(&ui, &missing_b);
+        *controller.wave_view.lock().unwrap() =
+            (path_a.to_string_lossy().into_owned(), WaveView::default());
+        controller.invalidate_waveform();
+        ui.set_waveform_ready(false);
+        ui.set_waveform_image(Image::default());
+        ui.set_waveform_mask(Image::default());
+        let generation = controller.waveform_generation.load(Ordering::Acquire);
+        ui.invoke_theme_requested(crate::theme::theme_index(
+            audiolib_core::config::DEFAULT_THEME,
+        ));
+        ui.invoke_theme_requested(crate::theme::theme_index(STUDIO_THEME));
+        ui.invoke_waveform_resize_requested(500, 84);
+        ui.invoke_waveform_zoom_requested(2.0);
+        ui.invoke_waveform_wheel_zoom_requested(2.0, 0.5);
+        ui.invoke_waveform_pan_requested(0.5);
+        ui.invoke_peak_style_requested();
+        assert_eq!(
+            controller.waveform_generation.load(Ordering::Acquire),
+            generation
+        );
+        assert!(ui.get_selected_missing());
+        assert!(!ui.get_waveform_ready());
+        assert_eq!(ui.get_waveform_image().size().width, 0);
+        assert_eq!(ui.get_waveform_mask().size().width, 0);
+
+        // A genuine external audition already owning the viewport remains the
+        // refresh source even when the inspector points at another valid record.
+        *controller.selected.lock().unwrap() = Some(file_b.clone());
+        *controller.audio_reload.lock().unwrap() = None;
+        *controller.waveform_cancel.lock().unwrap() = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            controller
+                .waveform_refresh_file(&loaded, true)
+                .unwrap()
+                .file_path,
+            path_a.to_string_lossy()
+        );
+        let remote_file = AudioFile {
+            id: 70,
+            file_path: "Z:/Server/Original.wav".into(),
+            ..file_b
+        };
+        controller.set_remote_wave_file_for_test(path_a.clone(), remote_file.clone());
+        controller.remote_mode.store(true, Ordering::Release);
+        controller.wave_view.lock().unwrap().0 = remote_file.file_path.clone();
+        assert_eq!(
+            controller
+                .waveform_refresh_file(&loaded, true)
+                .unwrap()
+                .file_path,
+            remote_file.file_path
+        );
+        controller.remote_mode.store(false, Ordering::Release);
+        // A source/library reset invalidates the old viewport even though the
+        // engine still reports A. A presentation change must not re-admit it.
+        *controller.selected.lock().unwrap() = None;
+        controller.wave_view.lock().unwrap().0 = path_a.to_string_lossy().into_owned();
+        controller.invalidate_waveform();
+        assert!(controller.waveform_refresh_file(&loaded, false).is_none());
+        *controller.waveform_cancel.lock().unwrap() = Arc::new(AtomicBool::new(false));
+        controller
+            .removed_audio_generation
+            .store(loaded.generation, Ordering::Release);
+        assert!(controller.waveform_refresh_file(&loaded, true).is_none());
+        controller.shutdown();
+    }
+
+    #[test]
     fn missing_selection_rejects_queued_and_late_waveform_partials() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -7446,7 +8503,7 @@ mod tests {
         );
         *controller.selected.lock().unwrap() = Some(present.clone());
         present_file(&ui, present);
-        let job = WaveJob {
+        let mut job = WaveJob {
             path: PathBuf::from(&present.file_path),
             remote_id: Some(present.id),
             sample_rate: 48000,
@@ -7491,6 +8548,19 @@ mod tests {
                     }
                     match observed.get() {
                         0 if ui.get_waveform_ready() => {
+                            if ui.get_waveform_mask().size().width != 0 {
+                                return Err("Default presentation retained a Studio mask".into());
+                            }
+                            // The real theme callback must refresh an idle selected
+                            // Waveform; no transport tick or new selection is needed.
+                            ui.invoke_theme_requested(crate::theme::theme_index(STUDIO_THEME));
+                            observed.set(4);
+                        }
+                        4 if ui.get_waveform_ready()
+                            && ui.get_waveform_mask().size().width != 0 =>
+                        {
+                            job.generation = c.waveform_generation.load(Ordering::Acquire);
+                            job.cancel = c.waveform_cancel.lock().unwrap().clone();
                             // This callback is queued with the old valid generation.
                             c.publish_waveform(&job, &data, 0.75);
                             c.select_id(missing_id, false);
@@ -7504,7 +8574,10 @@ mod tests {
                             observed.set(1);
                         }
                         1 if ui.get_selected_id() == missing_id.to_string() => {
-                            if !ui.get_selected_missing() || ui.get_waveform_ready() {
+                            if !ui.get_selected_missing()
+                                || ui.get_waveform_ready()
+                                || ui.get_waveform_mask().size().width != 0
+                            {
                                 return Err(
                                     "Missing selection retained the previous Waveform".into()
                                 );
@@ -7516,6 +8589,7 @@ mod tests {
                         2 => {
                             if ui.get_waveform_ready()
                                 || ui.get_waveform_image().size().width != 0
+                                || ui.get_waveform_mask().size().width != 0
                                 || !ui.get_selected_missing()
                             {
                                 return Err(
@@ -7903,6 +8977,9 @@ mod tests {
     #[test]
     #[ignore = "helper invoked by the close-grace regression in an isolated process"]
     fn child_close_finishes_within_remote_grace() {
+        // This child polls close completion without running a native event loop.
+        // Keep UI notifications unavailable, as in the other close-drain fixtures.
+        let _rejected = init_close_without_post_delivery();
         let root = std::env::temp_dir().join(format!(
             "audiolib-desktop-close-grace-{}-{}",
             std::process::id(),
@@ -8197,6 +9274,7 @@ mod tests {
             playback: serde_json::to_value(&playback).unwrap(),
             audition_play_on_single_click: false,
             play_history_limit: audiolib_core::config::PLAY_HISTORY_LIMIT_PER_LIBRARY,
+            show_album_artwork: true,
             max_search_tasks: 6,
             pregenerate_list_waveforms: false,
             hold_list_waveform_batches_after_audition: false,
@@ -9367,12 +10445,90 @@ mod tests {
         };
         let text = output_summary(&fallback);
         assert!(
-            text.contains("WASAPI")
+            text.contains(default_backend_name())
                 && text.contains("src 3/4 → out 1/2")
                 && text.contains("resampling")
         );
         let idle = output_summary(&audiolib_audio::PlaybackStatus::default());
         assert!(idle.contains("Output idle") && idle.contains("src — → out —"));
+    }
+
+    #[test]
+    fn output_route_names_the_active_backend_and_device_rate() {
+        let idle = audiolib_audio::PlaybackStatus::default();
+        assert_eq!(output_route(&idle), ("", String::new()));
+        let mut status = audiolib_audio::PlaybackStatus {
+            active_backend: Some(AudioBackend::Asio),
+            device_sample_rate: 48_000,
+            ..Default::default()
+        };
+        assert_eq!(output_route(&status), ("ASIO", "48 kHz".to_string()));
+        status.active_backend = Some(AudioBackend::Wasapi);
+        status.device_sample_rate = 44_100;
+        assert_eq!(
+            output_route(&status),
+            (default_backend_name(), "44.1 kHz".to_string())
+        );
+    }
+
+    #[test]
+    fn rejected_audition_fields_name_each_invalid_input() {
+        assert_eq!(rejected_audition_fields("0.00", "1.00"), 0);
+        assert_eq!(rejected_audition_fields(" -24 ", "4"), 0);
+        assert_eq!(rejected_audition_fields("25", "1.00"), 1);
+        assert_eq!(rejected_audition_fields("abc", "1.00"), 1);
+        assert_eq!(rejected_audition_fields("0", "0.2"), 2);
+        assert_eq!(rejected_audition_fields("NaN", "inf"), 3);
+    }
+
+    #[test]
+    fn imported_asio_preferences_keep_user_controls_when_adapted_to_coreaudio() {
+        let playback = PlaybackConfig {
+            backend: AudioBackend::Asio,
+            device_id: Some("windows-driver".into()),
+            buffer_frames: 128,
+            rate_policy: RatePolicy::Native,
+            volume: 0.35,
+            output_pair: 2,
+            source_pair: 1,
+            audition: AuditionSettings {
+                pitch_semitones: 3.0,
+                rate: 0.75,
+                mono: true,
+                loop_enabled: true,
+            },
+        };
+        let expected = serde_json::to_value(&playback).unwrap();
+        assert_eq!(
+            serde_json::to_value(playback_config_for_platform(playback.clone(), false)).unwrap(),
+            expected
+        );
+        let adapted = playback_config_for_platform(playback.clone(), true);
+        assert_eq!(adapted.backend, AudioBackend::Wasapi);
+        assert_eq!(adapted.device_id, None);
+        assert_eq!(adapted.buffer_frames, 0);
+        assert_eq!(adapted.rate_policy, RatePolicy::DeviceDefault);
+        assert_eq!(adapted.volume, playback.volume);
+        assert_eq!(adapted.output_pair, playback.output_pair);
+        assert_eq!(adapted.source_pair, playback.source_pair);
+        assert_eq!(
+            serde_json::to_value(adapted.audition).unwrap(),
+            serde_json::to_value(playback.audition).unwrap()
+        );
+    }
+
+    #[test]
+    fn macos_default_host_preferences_are_not_rewritten() {
+        let playback = PlaybackConfig {
+            device_id: Some("coreaudio-device".into()),
+            buffer_frames: 256,
+            volume: 0.4,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(playback_config_for_platform(playback.clone(), true)).unwrap(),
+            serde_json::to_value(playback).unwrap()
+        );
     }
 
     #[test]

@@ -1235,7 +1235,7 @@ mod tests {
     fn token_errors_follow_the_server_codes_and_point_to_the_admin_page() {
         // §2.2: missing and wrong tokens are both `401 UNAUTHORIZED`; whether the request
         // carried a token decides which message is shown.
-        let missing_body = r#"{"error_code":"UNAUTHORIZED","message":"A bearer token is required for access from outside the LAN"}"#;
+        let missing_body = r#"{"error_code":"UNAUTHORIZED","message":"A bearer token is required: this request is not from a trusted direct LAN peer"}"#;
         let required =
             RemoteError::from_response(401, missing_body, "GET /library", None).without_token();
         assert!(

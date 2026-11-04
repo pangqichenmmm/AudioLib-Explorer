@@ -2,6 +2,7 @@
 //! Persistent cross-process destination leases covering import and history publication.
 use audiolib_core::{Error, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
@@ -20,11 +21,34 @@ pub(crate) struct LocalImportIntent {
     library_id: String,
     data_root: PathBuf,
     limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    album_namespace: Option<String>,
 }
 
 impl LocalImportIntent {
     pub(crate) fn limit(&self) -> u32 {
         self.limit
+    }
+
+    /// Repeated recovery opens must admit exactly one new-library identity. Old
+    /// receipts derive it from their already persisted owner without rewriting it.
+    pub(crate) fn admission_namespace(&self) -> Result<String> {
+        if let Some(namespace) = &self.album_namespace {
+            return uuid::Uuid::parse_str(namespace)
+                .map(|value| value.to_string())
+                .map_err(|_| invalid("Local import album namespace is invalid"));
+        }
+        let identity = serde_json::to_vec(&(&self.library_id, &self.data_root, self.limit))
+            .map_err(|error| invalid(&error.to_string()))?;
+        let mut hash = Sha256::new();
+        hash.update(b"audiolib-local-import-album-v1\0");
+        hash.update(identity);
+        let digest = hash.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Ok(uuid::Uuid::from_bytes(bytes).to_string())
     }
 }
 
@@ -121,6 +145,7 @@ impl ImportDestinationLease {
             library_id: crate::local_play_history::local_library_id(&self.destination)?,
             data_root,
             limit,
+            album_namespace: Some(uuid::Uuid::new_v4().to_string()),
         };
         let bytes = serde_json::to_vec(&intent).map_err(|error| invalid(&error.to_string()))?;
         let mut file = &self.file;
@@ -163,6 +188,10 @@ fn read_intent(file: &fs::File, destination: &Path) -> Result<Option<LocalImport
     if intent.protocol != INTENT_PROTOCOL
         || !intent.data_root.is_absolute()
         || intent.library_id != crate::local_play_history::local_library_id(destination)?
+        || intent
+            .album_namespace
+            .as_deref()
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_err())
     {
         return Err(invalid(
             "Local import intent identity is unsupported or mismatched",

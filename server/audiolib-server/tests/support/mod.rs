@@ -20,7 +20,10 @@ pub fn modern(request: Builder) -> Builder {
             CLIENT_COMPATIBILITY_HEADER,
             serde_json::to_string(&compatibility_manifest()).unwrap(),
         )
-        .header("x-audiolib-snapshot-schema-max", "6")
+        .header(
+            "x-audiolib-snapshot-schema-max",
+            audiolib_db::MAX_SNAPSHOT_SCHEMA.to_string(),
+        )
         .header("x-audiolib-search-storage-max", "1")
         .header("x-audiolib-tokenization-max", "3")
 }

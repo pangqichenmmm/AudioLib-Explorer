@@ -118,13 +118,52 @@ fn read_existing(path: &Path, target: &SearchWorkspaceTarget) -> Result<Option<S
     if bytes.len() > MAX_WORKSPACE_BYTES {
         return Err(invalid("Search workspace exceeds 16 MiB"));
     }
-    let workspace: SearchWorkspace = serde_json::from_slice(&bytes)
+    let original: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| invalid(format!("Cannot read search workspace: {error}")))?;
-    workspace.validate()?;
+    let mut workspace: SearchWorkspace = serde_json::from_value(original.clone())
+        .map_err(|error| invalid(format!("Cannot read search workspace: {error}")))?;
+    let decoded = serde_json::to_value(&workspace)
+        .map_err(|error| invalid(format!("Cannot inspect search workspace: {error}")))?;
+    reject_unknown_fields(&original, &decoded, false)?;
+    workspace.upgrade_legacy_version()?;
     if workspace.library_scope != target.library_scope {
         return Err(invalid("Search workspace belongs to another library"));
     }
     Ok(Some(workspace))
+}
+
+// Refuse state this reader cannot preserve. Missing defaults are allowed, but
+// silently discarding an unknown stored condition could broaden a saved search.
+fn reject_unknown_fields(
+    original: &serde_json::Value,
+    decoded: &serde_json::Value,
+    filters: bool,
+) -> Result<()> {
+    match (original, decoded) {
+        (serde_json::Value::Object(original), serde_json::Value::Object(decoded)) => {
+            for (key, value) in original {
+                if let Some(known) = decoded.get(key) {
+                    reject_unknown_fields(value, known, key == "filters")?;
+                } else if !(filters
+                    && matches!(
+                        key.as_str(),
+                        "include_tags" | "exclude_tags" | "album" | "album_id"
+                    ))
+                {
+                    return Err(invalid(format!(
+                        "Unknown search workspace field {key}; original state was preserved"
+                    )));
+                }
+            }
+        }
+        (serde_json::Value::Array(original), serde_json::Value::Array(decoded)) => {
+            for (value, known) in original.iter().zip(decoded) {
+                reject_unknown_fields(value, known, false)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn load(target: &SearchWorkspaceTarget) -> Result<SearchWorkspace> {

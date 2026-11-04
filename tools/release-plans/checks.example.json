@@ -1,0 +1,9 @@
+[
+  {
+    "id": "source-checks",
+    "reuse": "inputs",
+    "input_paths": ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", "app/audiolib-desktop", "app/audiolib-cli", "crates", "resources", "vendor", "tools/check-local.ps1", "tools/prepare-asio.ps1"],
+    "script": "tools/check-local.ps1",
+    "parameters": {"Package": ["audiolib-desktop", "audiolib-cli"], "Asio": "${Asio}"}
+  }
+]

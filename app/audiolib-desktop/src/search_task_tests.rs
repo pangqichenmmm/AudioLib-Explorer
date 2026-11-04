@@ -2,6 +2,8 @@
 //! Isolated controller regressions for task identity, saved definitions and persistence.
 use super::super::*;
 
+#[path = "album_review_tests.rs"]
+mod album_review;
 #[path = "search_task_favorite_review_tests.rs"]
 mod favorite_review;
 #[path = "search_task_lifecycle_review_tests.rs"]
@@ -110,7 +112,7 @@ fn fixture() -> Fixture {
             "active_database": root.join("library.db"),
             "language": "en",
             "audition_play_on_single_click": false,
-            "max_search_tasks": 6,
+            "max_search_tasks": audiolib_core::config::DEFAULT_MAX_SEARCH_TASKS,
             "playback": playback,
         }))
         .unwrap(),
@@ -166,6 +168,18 @@ fn fixture() -> Fixture {
 }
 
 fn wait_for(ui: &AppWindow, ready: impl Fn(&AppWindow) -> bool + 'static) {
+    wait_for_window(ui, ready, false);
+}
+
+fn wait_for_same_window(ui: &AppWindow, ready: impl Fn(&AppWindow) -> bool + 'static) {
+    wait_for_window(ui, ready, true);
+}
+
+fn wait_for_window(
+    ui: &AppWindow,
+    ready: impl Fn(&AppWindow) -> bool + 'static,
+    keep_window: bool,
+) {
     let started = Instant::now();
     let weak = ui.as_weak();
     let completed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -185,15 +199,16 @@ fn wait_for(ui: &AppWindow, ready: impl Fn(&AppWindow) -> bool + 'static) {
                 "Task transition timed out: {}",
                 ui.get_status()
             );
-            if ready(&ui) {
-                observed.set(true);
+            // The testing backend updates timers before consuming a queued Quit.
+            // A repeated tick must not leave another Quit for the next wait.
+            if ready(&ui) && !observed.replace(true) {
                 slint::quit_event_loop().unwrap();
             }
         },
     );
-    // Re-showing a ComponentHandle reattaches its component and resets pointer
-    // tracking. Keep the same visible window across consecutive interactions.
-    if !ui.window().is_visible() {
+    // The mock backend needs show() to refresh virtual-list layout for ordinary
+    // waits. Pointer regressions must retain the same window across clicks.
+    if !keep_window || !ui.window().is_visible() {
         ui.show().unwrap();
     }
     slint::run_event_loop().unwrap();
@@ -563,7 +578,9 @@ fn task_capacity_and_lower_limit_never_discard_an_open_search() {
 fn child_task_capacity() {
     let fixture = fixture();
     let ui = &fixture.ui;
-    for count in 2..=6 {
+    let capacity = audiolib_core::search_workspace::MAX_SEARCH_TASKS;
+    assert_eq!(ui.get_max_search_tasks(), capacity as i32);
+    for count in 2..=capacity {
         ui.invoke_search_task_created();
         wait_for(ui, move |ui| {
             ui.get_search_tasks().row_count() == count
@@ -574,11 +591,13 @@ fn child_task_capacity() {
     let active = active_id(ui);
     let ids: Vec<_> = ui.get_search_tasks().iter().map(|task| task.id).collect();
     ui.invoke_search_task_created();
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     assert_eq!(active_id(ui), active);
+    ui.invoke_max_search_tasks_requested(i32::MAX);
+    assert_eq!(ui.get_max_search_tasks(), capacity as i32);
     ui.invoke_max_search_tasks_requested(2);
-    assert_eq!(ui.get_max_search_tasks(), 6);
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_max_search_tasks(), capacity as i32);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     for id in ids {
         ui.invoke_search_task_closed(id);
     }
@@ -593,7 +612,8 @@ fn child_task_capacity() {
     assert_eq!(ui.get_max_search_tasks(), 1);
     ui.invoke_search_task_created();
     assert_eq!(ui.get_search_tasks().row_count(), 1);
-    ui.invoke_max_search_tasks_requested(6);
+    ui.invoke_max_search_tasks_requested(capacity as i32);
+    assert_eq!(ui.get_max_search_tasks(), capacity as i32);
     ui.invoke_search_task_created();
     assert_eq!(ui.get_search_tasks().row_count(), 2);
     wait_for(ui, |ui| {
@@ -812,6 +832,414 @@ fn child_late_facets_and_external_revision() {
     });
     assert!(ui.get_rows().iter().all(|row| row.favorite));
     assert!(ui.get_favorites_only());
+    finish(&fixture);
+}
+
+/// Workspace files still name a server library with a `server-` prefix. Any other
+/// non-empty scope is a local library. An empty scope is not loaded yet.
+#[test]
+fn server_prefix_marks_a_server_workspace_scope() {
+    let matches = super::super::Controller::workspace_scope_matches_source;
+    assert!(matches("", false));
+    assert!(matches("", true));
+    assert!(matches("server-audition-library", true));
+    assert!(!matches("server-audition-library", false));
+    assert!(matches("local-library", false));
+    assert!(!matches("local-library", true));
+    assert!(matches("not-server-library", false));
+    assert!(!matches("not-server-library", true));
+    assert!(matches("server", false));
+    assert!(!matches("server", true));
+}
+
+#[test]
+fn result_scroll_follows_rows_after_an_empty_page() {
+    isolated("child_result_scroll_follows_rows");
+}
+
+#[test]
+#[ignore = "isolated Slint result scroll is reapplied after rows are published"]
+fn child_result_scroll_follows_rows() {
+    use audiolib_core::search_workspace::SearchTaskView;
+
+    let fixture = fixture();
+    let ui = &fixture.ui;
+    let controller = &fixture.controller;
+    let scope = controller
+        .task_workspace
+        .lock()
+        .unwrap()
+        .workspace
+        .library_scope
+        .clone();
+    assert!(!scope.is_empty(), "fixture workspace has no library scope");
+    assert!(
+        !scope.starts_with("server-"),
+        "local fixture scope must not use the server prefix: {scope}"
+    );
+
+    ui.set_rows(slint::ModelRc::new(
+        slint::VecModel::<crate::AudioRow>::default(),
+    ));
+    wait_for(ui, |ui| ui.get_rows().row_count() == 0);
+    controller.restore_task_scroll(
+        ui,
+        &SearchTaskView {
+            list_top_row: 15,
+            list_row_offset: 0.4,
+            list_scroll_x: -48.0,
+            folder_scroll_y: -120.0,
+            filter_scroll_y: -80.0,
+            inspector_scroll_y: -55.0,
+            ..Default::default()
+        },
+    );
+    wait_for(ui, |ui| !ui.get_task_restoring());
+    let parked_y = ui.get_task_result_scroll_y();
+    let parked_x = ui.get_task_result_scroll_x();
+    assert!(
+        parked_y.abs() < 1.0 && parked_x.abs() < 1.0,
+        "empty page must park the result list at the origin, y={parked_y} x={parked_x}"
+    );
+    assert!(
+        ui.get_task_filter_scroll_y() < -40.0,
+        "empty result page still restores the filter area: {}",
+        ui.get_task_filter_scroll_y()
+    );
+    assert!(
+        ui.get_task_inspector_scroll_y() < -30.0,
+        "empty result page still restores the inspector: {}",
+        ui.get_task_inspector_scroll_y()
+    );
+
+    let rows = synthetic_rows(80);
+    ui.set_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+    wait_for(ui, |ui| ui.get_rows().row_count() == 80);
+    // A task tab or local reload publishes rows before restoring, so the saved
+    // row is applied in that same turn instead of being parked at zero.
+    controller.restore_task_scroll(
+        ui,
+        &SearchTaskView {
+            list_top_row: 15,
+            ..Default::default()
+        },
+    );
+    let row_height = ui.get_task_result_row_height();
+    wait_for(ui, |ui| !ui.get_task_restoring());
+    let expected = -15.0 * row_height;
+    let applied = ui.get_task_result_scroll_y();
+    assert!(
+        (applied - expected).abs() < 2.0,
+        "rows already on the list must restore row 15: height {row_height}, expected {expected}, got {applied}"
+    );
+
+    ui.set_rows(slint::ModelRc::new(
+        slint::VecModel::<crate::AudioRow>::default(),
+    ));
+    wait_for(ui, |ui| ui.get_rows().row_count() == 0);
+    controller.task_workspace.lock().unwrap().pending_view = Some(SearchTaskView {
+        list_top_row: 15,
+        ..Default::default()
+    });
+    ui.set_rows(slint::ModelRc::new(slint::VecModel::from(synthetic_rows(
+        80,
+    ))));
+    wait_for(ui, |ui| ui.get_rows().row_count() == 80);
+    controller.search_task_page_ready(ui, Some(7));
+    assert!(
+        controller
+            .task_workspace
+            .lock()
+            .unwrap()
+            .pending_view
+            .is_none()
+    );
+    assert_eq!(
+        controller.task_workspace.lock().unwrap().page_revision,
+        Some(7)
+    );
+    wait_for(ui, |ui| !ui.get_task_restoring());
+    let filled = ui.get_task_result_scroll_y();
+    assert!(
+        (filled - expected).abs() < 2.0,
+        "page callback must restore the parked row after rows exist: expected {expected}, got {filled}"
+    );
+
+    controller.capture_search_task(ui);
+    let before = active_list_top_row(controller);
+    assert_eq!(before, 15, "captured row {before}");
+    controller.remote_mode.store(true, Ordering::Release);
+    ui.set_remote_mode(true);
+    ui.invoke_restore_search_task_viewport(0.0, 0.0, 0.0, 0.0, 0.0);
+    wait_for(ui, |ui| !ui.get_task_restoring());
+    controller.capture_search_task(ui);
+    assert_eq!(
+        active_list_top_row(controller),
+        before,
+        "server viewport must not overwrite the local task's saved row"
+    );
+    controller.remote_mode.store(false, Ordering::Release);
+    ui.set_remote_mode(false);
+    finish(&fixture);
+}
+
+fn synthetic_rows(count: usize) -> Vec<crate::AudioRow> {
+    (0..count)
+        .map(|index| crate::AudioRow {
+            id: format!("local-{index}").into(),
+            name: format!("local {index:03}.wav").into(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn active_list_top_row(controller: &Controller) -> usize {
+    let state = controller.task_workspace.lock().unwrap();
+    let active = state.workspace.session.active_task_id.clone();
+    state
+        .workspace
+        .session
+        .tasks
+        .iter()
+        .find(|task| Some(&task.id) == active.as_ref())
+        .expect("active task")
+        .view
+        .list_top_row
+}
+
+#[test]
+fn result_window_restore_limit_is_bounded_for_saved_rows() {
+    use audiolib_core::search_workspace::SearchTaskView;
+
+    for (top, expected) in [
+        (0, 200),
+        (190, 400),
+        (199, 400),
+        (200, 400),
+        (399, 600),
+        (400, 600),
+        (599, 600),
+        (usize::MAX, 600),
+    ] {
+        let view = SearchTaskView {
+            list_top_row: top,
+            ..Default::default()
+        };
+        assert_eq!(super::task_result_window_limit(&view, 32), expected);
+    }
+}
+
+#[test]
+fn result_window_restores_saved_rows_and_cached_range() {
+    isolated("child_result_window_restore");
+}
+
+#[test]
+#[ignore = "isolated Slint task restore covers cold and cached continuous result windows"]
+fn child_result_window_restore() {
+    use super::TaskCache;
+    use audiolib_core::search_workspace::SearchTaskView;
+
+    fn wait_for_result_layout(ui: &AppWindow, ready: impl Fn(&AppWindow) -> bool + 'static) {
+        let measured = std::cell::RefCell::new(None::<(slint::ModelRc<crate::AudioRow>, usize)>);
+        wait_for(ui, move |ui| {
+            // The system-time testing loop runs timers without rendering. The
+            // element traversal performs the repeater instantiation that a real
+            // renderer frame would run after a model change. Do this once per
+            // model/count, so large-tree traversals cannot starve queued events.
+            let rows = ui.get_rows();
+            let count = rows.row_count();
+            let needs_layout =
+                measured
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|(previous, previous_count)| {
+                        previous != &rows || *previous_count != count
+                    });
+            if needs_layout {
+                let _ = i_slint_backend_testing::ElementHandle::find_by_element_id(
+                    ui,
+                    "AppWindow::result-list",
+                )
+                .next()
+                .map(|list| list.size());
+                measured.replace(Some((rows, count)));
+            }
+            ready(ui)
+        });
+    }
+
+    let fixture = fixture();
+    let ui = &fixture.ui;
+    let controller = &fixture.controller;
+    // This regression isolates task restoration and its SQL range. Deriving
+    // Waveforms for 596 newly scanned files would concurrently change the
+    // provider revision and correctly invalidate the manually restored cache.
+    ui.set_list_waveforms_enabled(false);
+    // All additional source audio belongs to this test's existing temporary tree.
+    let sounds = fixture.root.join("sounds");
+    let wav = std::fs::read(sounds.join("wind/wind.wav")).unwrap();
+    for index in 0..596 {
+        std::fs::write(sounds.join(format!("scroll {index:03}.wav")), &wav).unwrap();
+    }
+    ScanService::new(fixture.provider.clone())
+        .scan(
+            &sounds,
+            &ScanOptions::default(),
+            &ScanCancellation::default(),
+            |_| {},
+        )
+        .unwrap();
+    let records = fixture
+        .provider
+        .search(&SearchRequest {
+            limit: 600,
+            ..Default::default()
+        })
+        .unwrap()
+        .results;
+    assert_eq!(records.len(), 600);
+
+    let id = active_id(ui);
+    {
+        let mut state = controller.task_workspace.lock().unwrap();
+        state.caches.remove(&id);
+        let task = state
+            .workspace
+            .session
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .unwrap();
+        task.view = SearchTaskView {
+            list_top_row: 250,
+            ..Default::default()
+        };
+    }
+    let (task, cache, epoch) = controller.prepare_search_task_restore(ui, &id).unwrap();
+    assert!(cache.is_none());
+    assert_eq!(controller.request.lock().unwrap().limit, 400);
+    controller.finish_search_task_restore(
+        ui,
+        &id,
+        epoch,
+        Ok((task.clone(), None, None, false, Vec::new())),
+    );
+    let ready = controller.clone();
+    wait_for_result_layout(ui, move |ui| {
+        !ui.get_searching()
+            && !ui.get_task_restoring()
+            && ui.get_rows().row_count() == 400
+            && fully_published(&ready)
+    });
+    let expected = -250.0 * ui.get_task_result_row_height();
+    eprintln!(
+        "Cold window model ready: y={}, expected={expected}, height={}",
+        ui.get_task_result_scroll_y(),
+        ui.get_task_result_row_height()
+    );
+    wait_for_result_layout(ui, move |ui| {
+        !ui.get_task_restoring() && (ui.get_task_result_scroll_y() - expected).abs() < 2.0
+    });
+    assert!(
+        (ui.get_task_result_scroll_y() - expected).abs() < 2.0,
+        "A cold task must restore its saved row inside the second buffered page: y={}, expected={expected}",
+        ui.get_task_result_scroll_y(),
+    );
+
+    let mut edge_task = task.clone();
+    edge_task.view.list_top_row = 190;
+    controller.apply_search_task(ui, edge_task, None, None, false, Vec::new());
+    let ready = controller.clone();
+    wait_for_result_layout(ui, move |ui| {
+        !ui.get_searching()
+            && !ui.get_task_restoring()
+            && ui.get_rows().row_count() == 400
+            && fully_published(&ready)
+    });
+    assert_eq!(
+        controller.request.lock().unwrap().limit,
+        400,
+        "Saved row 190 needs the next page to fit the rest of its screen"
+    );
+    let expected = -190.0 * ui.get_task_result_row_height();
+    wait_for_result_layout(ui, move |ui| {
+        !ui.get_task_restoring() && (ui.get_task_result_scroll_y() - expected).abs() < 2.0
+    });
+    assert!(
+        (ui.get_task_result_scroll_y() - expected).abs() < 2.0,
+        "A saved row near a page boundary must not be clamped upward: y={}, expected={expected}",
+        ui.get_task_result_scroll_y(),
+    );
+
+    let mut cached_task = task;
+    cached_task.view.list_top_row = 20;
+    let cache = TaskCache {
+        provider: Arc::downgrade(&fixture.provider),
+        revision: fixture.provider.search_revision().unwrap().unwrap(),
+        tree: controller.tree.lock().unwrap().clone(),
+        records,
+        limit: 600,
+        summary: "1–600 of 600 sounds".into(),
+        page: "1–3/3".into(),
+        previous: false,
+        next: false,
+    };
+    controller.apply_search_task(
+        ui,
+        cached_task.clone(),
+        Some(cache.clone()),
+        None,
+        false,
+        Vec::new(),
+    );
+    wait_for_result_layout(ui, |ui| {
+        !ui.get_task_restoring() && ui.get_rows().row_count() == 600
+    });
+    assert_eq!(
+        controller.request.lock().unwrap().limit,
+        600,
+        "Restoring a full cache must retain its range even near the first page"
+    );
+    // A server snapshot can retain its original SQL span after deleted records
+    // are filtered out. Restoring or recapturing it must not shorten that span.
+    let mut filtered_cache = cache;
+    filtered_cache.records.truncate(180);
+    filtered_cache.next = true;
+    controller.apply_search_task(
+        ui,
+        cached_task,
+        Some(filtered_cache),
+        None,
+        false,
+        Vec::new(),
+    );
+    let ready = controller.clone();
+    wait_for_result_layout(ui, move |ui| {
+        let state = ready.task_workspace.lock().unwrap();
+        !ui.get_task_restoring()
+            && !ui.get_searching()
+            && ui.get_rows().row_count() == 180
+            && !state.loading
+            && !state.restoring
+            && !state.restore_failed
+            && state.page_complete
+            && state.page_revision.is_some()
+            && state.folders_revision == state.page_revision
+    });
+    assert_eq!(controller.request.lock().unwrap().limit, 600);
+    controller.capture_search_task(ui);
+    let state = controller.task_workspace.lock().unwrap();
+    let captured = state
+        .caches
+        .get(&id)
+        .expect("completed cache was recaptured");
+    assert_eq!(captured.records.len(), 180);
+    assert_eq!(
+        captured.limit, 600,
+        "Filtered rows must retain the SQL span for the next window request"
+    );
+    drop(state);
     finish(&fixture);
 }
 

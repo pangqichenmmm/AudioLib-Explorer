@@ -6,6 +6,145 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel, platform::WindowEvent};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 #[test]
+fn artwork_management_actions_are_reachable_in_both_modes_and_languages() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        for remote in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window()
+                .set_size(slint::LogicalSize::new(1400.0, 1000.0));
+            ui.set_chinese(chinese);
+            ui.set_sm_sources(source_rows(remote));
+            ui.set_remote_mode(remote);
+            ui.invoke_open_library(0);
+            ui.set_sm_selected(if remote { 1 } else { 0 });
+            ui.set_sm_page(if remote { 2 } else { 0 });
+            ui.set_has_selection(true);
+            ui.set_selected_album("Sound pack".into());
+            let actions = Rc::new(RefCell::new(Vec::new()));
+            let observed = actions.clone();
+            ui.on_artwork_action_requested(move |action| observed.borrow_mut().push(action));
+            ui.show().unwrap();
+            click_label(
+                &ui,
+                if chinese {
+                    "当前目录的专辑封面 ▸"
+                } else {
+                    "Album cover in this folder ▸"
+                },
+            );
+            assert!(ui.get_artwork_management_expanded());
+            let labels = if chinese {
+                [
+                    "指定 / 替换本目录图片…",
+                    "移除本目录封面",
+                    "恢复本目录默认",
+                    "重新加载本目录封面",
+                    "清理本机封面缓存",
+                ]
+            } else {
+                [
+                    "Set folder image…",
+                    "Remove folder cover",
+                    "Restore folder default",
+                    "Reload folder cover",
+                    "Clear cover thumbnails",
+                ]
+            };
+            for (label, action) in labels.into_iter().zip([2, 3, 4, 0, 1]) {
+                click_label(&ui, label);
+                assert_eq!(actions.borrow().last(), Some(&action));
+            }
+            ui.set_artwork_busy(true);
+            click_label(
+                &ui,
+                if chinese {
+                    "移除本目录封面"
+                } else {
+                    "Remove folder cover"
+                },
+            );
+            assert_eq!(
+                actions.borrow().len(),
+                5,
+                "busy artwork actions are disabled"
+            );
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn artwork_preferences_and_actions_are_disabled_during_library_transitions_and_close() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        for remote in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window()
+                .set_size(slint::LogicalSize::new(1400.0, 1000.0));
+            ui.set_chinese(chinese);
+            ui.set_sm_sources(source_rows(remote));
+            ui.set_remote_mode(remote);
+            ui.invoke_open_library(0);
+            ui.set_sm_selected(if remote { 1 } else { 0 });
+            ui.set_sm_page(if remote { 2 } else { 0 });
+            ui.set_has_selection(true);
+            ui.set_selected_album("Sound pack".into());
+            ui.set_artwork_management_expanded(true);
+            let actions = Rc::new(RefCell::new(Vec::new()));
+            let observed = actions.clone();
+            ui.on_artwork_action_requested(move |action| observed.borrow_mut().push(action));
+            let preferences = Rc::new(RefCell::new(Vec::new()));
+            let observed = preferences.clone();
+            ui.on_artwork_enabled_requested(move |enabled| observed.borrow_mut().push(enabled));
+            ui.show().unwrap();
+            let toggle = if chinese {
+                "显示封面（本地与服务器）"
+            } else {
+                "Show covers (local and server)"
+            };
+            let labels = if chinese {
+                [
+                    "指定 / 替换本目录图片…",
+                    "移除本目录封面",
+                    "恢复本目录默认",
+                    "重新加载本目录封面",
+                    "清理本机封面缓存",
+                ]
+            } else {
+                [
+                    "Set folder image…",
+                    "Remove folder cover",
+                    "Restore folder default",
+                    "Reload folder cover",
+                    "Clear cover thumbnails",
+                ]
+            };
+            for gate in 0..4 {
+                ui.set_artwork_busy(gate == 0);
+                ui.set_library_busy(gate == 1);
+                ui.set_ds_applying(gate == 2);
+                ui.set_closing(gate == 3);
+                click_label(&ui, toggle);
+                for label in labels {
+                    click_label(&ui, label);
+                }
+                assert!(ui.get_artwork_enabled());
+                assert!(preferences.borrow().is_empty());
+                assert!(actions.borrow().is_empty());
+            }
+            ui.set_closing(false);
+            click_label(&ui, toggle);
+            assert!(!ui.get_artwork_enabled());
+            assert_eq!(&*preferences.borrow(), &[false]);
+            click_label(&ui, labels[1]);
+            assert_eq!(&*actions.borrow(), &[3]);
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
 fn mirror_folder_action_requires_an_existing_cache_and_remains_available_during_sync() {
     i_slint_backend_testing::init_no_event_loop();
     for chinese in [false, true] {
@@ -189,6 +328,7 @@ fn server_cache_page_hides_local_scan_buttons_and_keeps_audition_hold_option() {
 
         // Local settings still expose the scan controls unchanged.
         ui.set_remote_mode(false);
+        ui.set_sm_sources(source_rows(false));
         ui.set_sm_selected(0);
         ui.set_sm_page(0);
         for label in [add, incr, full] {
@@ -238,7 +378,9 @@ fn keyboard_selection_keeps_compact_result_rows_visible() {
             ui.set_selected_row((ui.get_selected_row() + step).clamp(0, 119));
         });
         ui.show().unwrap();
-        click_label(&ui, "Scroll 0.wav");
+        // A row spans horizontally scrollable columns, so its midpoint can be clipped
+        // behind the inspector. Focus the visible left edge before sending real keys.
+        click_at(&ui, result_row_position(&ui, "Scroll 0.wav"));
         for (key, targets) in [
             (
                 slint::platform::Key::DownArrow,
@@ -346,9 +488,49 @@ fn scan_progress_controls_pause_resume_cancel_and_guard_terminal_phases() {
 }
 
 #[test]
+fn classic_transport_keeps_separate_play_pause_and_shared_transform_state() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    ui.set_audio_ready(true);
+    ui.set_pitch_text("7.00".into());
+    ui.set_speed_text("0.50".into());
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let observed = actions.clone();
+    ui.on_start_requested(move || observed.borrow_mut().push("play".to_owned()));
+    let observed = actions.clone();
+    ui.on_pause_requested(move || observed.borrow_mut().push("pause".to_owned()));
+    let observed = actions.clone();
+    ui.on_transform_requested(move |pitch, rate, mono, repeat| {
+        observed
+            .borrow_mut()
+            .push(format!("{pitch}/{rate}/{mono}/{repeat}"));
+    });
+    ui.show().unwrap();
+    click_label(&ui, "Play");
+    click_label(&ui, "Pause");
+    click_label(&ui, "Mono monitoring");
+    // A round trip through Studio must retain the toggled transform state.
+    crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
+    crate::theme::apply_theme(&ui, audiolib_core::config::DEFAULT_THEME);
+    click_label(&ui, "Repeat sound");
+    assert_eq!(
+        &*actions.borrow(),
+        &[
+            "play",
+            "pause",
+            "7.00/0.50/true/false",
+            "7.00/0.50/true/true"
+        ]
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
 fn audition_buttons_have_distinct_transport_actions_and_submit_transform_settings() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
+    crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
     ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
     ui.set_audio_ready(true);
     ui.set_pitch_text("7.00".into());
@@ -364,7 +546,16 @@ fn audition_buttons_have_distinct_transport_actions_and_submit_transform_setting
             .push(format!("{pitch}/{rate}/{mono}/{repeat}"));
     });
     ui.show().unwrap();
+    // Play and Pause share one toggle whose label follows the transport.
     for label in ["Play", "Pause", "Mono monitoring", "Repeat sound"] {
+        ui.set_playing(label == "Pause");
+        assert_eq!(
+            ElementHandle::find_by_accessible_label(&ui, "Pause")
+                .next()
+                .is_some(),
+            label == "Pause",
+            "the toggle reads Pause only while playing"
+        );
         let item = ElementHandle::find_by_accessible_label(&ui, label)
             .next()
             .expect(label);
@@ -1037,17 +1228,35 @@ fn repair_references_shows_missing_files_across_the_library_in_both_languages() 
                         "Manage library"
                     },
                 );
-                // The scan-roots list added in 0.7.7 moves repair below the
-                // initial viewport. Reach it through the real scroll area.
-                scroll_library_management(&ui, -400.0);
-                click_label(
-                    &ui,
-                    if chinese {
-                        "修复文件引用"
-                    } else {
-                        "Repair file references"
-                    },
-                );
+                let repair = if chinese {
+                    "修复文件引用"
+                } else {
+                    "Repair file references"
+                };
+                // Library settings can exceed a compact window's viewport.
+                // Bring the real action into view before exercising its pointer path.
+                let scroll = ElementHandle::find_by_element_id(&ui, "AppWindow::library-scroll")
+                    .next()
+                    .expect("library settings scroll view");
+                for _ in 0..8 {
+                    if has_label(&ui, repair) {
+                        break;
+                    }
+                    scroll_library_management(&ui, -scroll.size().height * 0.6);
+                }
+                let action = ElementHandle::find_by_accessible_label(&ui, repair)
+                    .next()
+                    .expect("repair references action is reachable by scrolling");
+                let top = scroll.absolute_position().y + 4.0;
+                let bottom = scroll.absolute_position().y + scroll.size().height - 4.0;
+                let action_top = action.absolute_position().y;
+                let action_bottom = action_top + action.size().height;
+                if action_top < top {
+                    scroll.scroll(0.0, top - action_top);
+                } else if action_bottom > bottom {
+                    scroll.scroll(0.0, bottom - action_bottom);
+                }
+                click_label(&ui, repair);
             } else {
                 click_menu_item(
                     &ui,
@@ -2164,6 +2373,358 @@ fn database_batch_and_confirmation_actions_are_reachable_in_both_languages() {
 }
 
 #[test]
+fn audition_sliders_keep_bilingual_accessible_names_in_both_themes() {
+    use audiolib_core::config::THEME_IDS;
+
+    i_slint_backend_testing::init_no_event_loop();
+    for id in THEME_IDS {
+        for chinese in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            crate::theme::apply_theme(&ui, id);
+            ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+            ui.set_chinese(chinese);
+            ui.set_audio_ready(true);
+            ui.set_play_duration(20.0);
+            ui.set_view_end(20.0);
+            ui.set_wave_zoom(4.0);
+            let volumes = Rc::new(RefCell::new(Vec::new()));
+            let observed = volumes.clone();
+            ui.on_volume_db_requested(move |db| observed.borrow_mut().push(db));
+            ui.show().unwrap();
+            for (label, minimum, maximum) in [
+                (if chinese { "音量" } else { "Volume" }, -60.0, 0.0),
+                (
+                    if chinese {
+                        "波形可视范围"
+                    } else {
+                        "Visible waveform range"
+                    },
+                    0.0,
+                    1.0,
+                ),
+            ] {
+                let slider = ElementHandle::find_by_accessible_label(&ui, label)
+                    .find(|element| element.accessible_role() == Some(AccessibleRole::Slider))
+                    .unwrap_or_else(|| panic!("{id}: missing named slider {label}"));
+                assert_eq!(slider.accessible_value_minimum(), Some(minimum));
+                assert_eq!(slider.accessible_value_maximum(), Some(maximum));
+                assert_eq!(slider.accessible_enabled(), Some(true));
+                if minimum < 0.0 {
+                    slider.set_accessible_value("-6");
+                    assert!((ui.get_volume_db() + 6.0).abs() < 0.001);
+                    assert_eq!(volumes.borrow().last(), Some(&-6.0));
+                }
+            }
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn classic_waveform_pan_requires_ready_audio_for_pointer_keyboard_and_accessibility() {
+    use slint::platform::Key;
+
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+        ui.set_chinese(chinese);
+        ui.set_audio_ready(true);
+        ui.set_play_duration(20.0);
+        ui.set_view_end(20.0);
+        ui.set_wave_zoom(4.0);
+        ui.set_wave_scroll(0.5);
+        let pans = Rc::new(RefCell::new(Vec::new()));
+        let observed = pans.clone();
+        ui.on_waveform_pan_requested(move |value| observed.borrow_mut().push(value));
+        ui.show().unwrap();
+        let label = if chinese {
+            "波形可视范围"
+        } else {
+            "Visible waveform range"
+        };
+        let pan = ElementHandle::find_by_accessible_label(&ui, label)
+            .find(|element| element.accessible_role() == Some(AccessibleRole::Slider))
+            .expect("classic pan has an accessible slider owner");
+        pan.set_accessible_value("0.5");
+        pan.invoke_accessible_increment_action();
+        assert!((ui.get_wave_scroll() - 0.505).abs() < 0.001);
+        assert_eq!(pans.borrow().last(), Some(&ui.get_wave_scroll()));
+        let origin = pan.absolute_position();
+        let size = pan.size();
+        click_at(
+            &ui,
+            slint::LogicalPosition::new(origin.x + size.width * 0.75, origin.y + size.height / 2.0),
+        );
+        assert!(ui.get_wave_scroll() > 0.7 && ui.get_wave_scroll() < 0.8);
+        let before_key = ui.get_wave_scroll();
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        assert!((ui.get_wave_scroll() - before_key - 0.005).abs() < 0.001);
+
+        for gate in ["not-ready", "missing", "maintenance", "full-range"] {
+            // Start each case with the real slider focused, then disable it.
+            ui.set_audio_ready(true);
+            ui.set_selected_missing(false);
+            ui.set_library_busy(false);
+            ui.set_wave_zoom(4.0);
+            pan.set_accessible_value("0.5");
+            click_at(
+                &ui,
+                slint::LogicalPosition::new(
+                    origin.x + size.width / 2.0,
+                    origin.y + size.height / 2.0,
+                ),
+            );
+            match gate {
+                "not-ready" => ui.set_audio_ready(false),
+                "missing" => ui.set_selected_missing(true),
+                "maintenance" => ui.set_library_busy(true),
+                "full-range" => ui.set_wave_zoom(1.0),
+                _ => unreachable!(),
+            }
+            assert_eq!(pan.accessible_enabled(), Some(false), "{gate}");
+            let previous = ui.get_wave_scroll();
+            let count = pans.borrow().len();
+            click_at(
+                &ui,
+                slint::LogicalPosition::new(
+                    origin.x + size.width * 0.75,
+                    origin.y + size.height / 2.0,
+                ),
+            );
+            send_keys(&ui, &[Key::RightArrow.into()]);
+            pan.set_accessible_value("0.8");
+            pan.invoke_accessible_increment_action();
+            pan.invoke_accessible_decrement_action();
+            assert_eq!(
+                pans.borrow().len(),
+                count,
+                "{gate}: disabled pan dispatched work"
+            );
+            assert_eq!(
+                ui.get_wave_scroll(),
+                previous,
+                "{gate}: disabled pan changed the view"
+            );
+        }
+        ui.set_audio_ready(true);
+        ui.set_selected_missing(false);
+        ui.set_library_busy(false);
+        ui.set_wave_zoom(4.0);
+        assert_eq!(pan.accessible_enabled(), Some(true));
+        pan.set_accessible_value("0.25");
+        assert!((ui.get_wave_scroll() - 0.25).abs() < 0.001);
+        assert_eq!(pans.borrow().last(), Some(&0.25));
+        ui.hide().unwrap();
+    }
+}
+
+#[test]
+fn classic_waveform_ruler_carries_minutes_and_distinguishes_short_ranges() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    ui.set_audio_ready(true);
+    ui.set_play_duration(120.0);
+    ui.show().unwrap();
+    for (start, end, decimals, precision) in [
+        (59.96_f32, 61.96_f32, 1, 0.1_f64),
+        (0.99, 1.04, 3, 0.001),
+        (59.996, 60.496, 2, 0.01),
+    ] {
+        ui.set_view_start(start);
+        ui.set_view_end(end);
+        let ruler = ElementHandle::find_by_accessible_label(&ui, "Waveform time ruler")
+            .next()
+            .expect("classic Waveform ruler");
+        let mut labels = ruler
+            .query_descendants()
+            .match_inherits("Text")
+            .find_all()
+            .into_iter()
+            .filter_map(|element| {
+                let text = element.accessible_label()?;
+                let (minutes, seconds) = text.split_once(':')?;
+                let minutes = minutes.parse::<u32>().expect("ruler minutes");
+                let seconds = seconds.parse::<f64>().expect("ruler seconds");
+                let decimals = text
+                    .split_once('.')
+                    .map_or(0, |(_, fraction)| fraction.len());
+                Some((element.absolute_position().x, minutes, seconds, decimals))
+            })
+            .collect::<Vec<_>>();
+        labels.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert_eq!(
+            labels.len(),
+            11,
+            "all visible ruler labels must be readable"
+        );
+        for (index, (_, minutes, seconds, digits)) in labels.iter().enumerate() {
+            assert!(
+                (0.0..60.0).contains(seconds),
+                "seconds must carry into minutes"
+            );
+            assert_eq!(*digits, decimals, "precision must follow the visible range");
+            let actual = f64::from(*minutes) * 60.0 + seconds;
+            let expected = f64::from(start) + f64::from(end - start) * index as f64 / 10.0;
+            assert!(
+                (actual - expected).abs() <= precision * 0.501,
+                "tick {index}: {actual} vs {expected}"
+            );
+        }
+        if start > 59.9 {
+            assert_eq!(
+                labels[0].1, 1,
+                "rounding must carry the first tick into the next minute"
+            );
+            assert_eq!(labels[0].2, 0.0);
+        }
+        for pair in labels.windows(2) {
+            let left = f64::from(pair[0].1) * 60.0 + pair[0].2;
+            let right = f64::from(pair[1].1) * 60.0 + pair[1].2;
+            assert!(right > left, "zoomed ruler labels must remain distinct");
+        }
+    }
+    ui.hide().unwrap();
+}
+
+#[test]
+fn waveform_overview_is_tab_reachable_and_keyboard_pan_preserves_playback() {
+    use slint::platform::Key;
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        let ui = AppWindow::new().unwrap();
+        crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
+        ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+        ui.set_chinese(chinese);
+        ui.set_audio_ready(true);
+        ui.set_play_duration(100.0);
+        ui.set_view_end(100.0);
+        ui.set_wave_zoom(4.0);
+        ui.set_wave_scroll(0.5);
+        let pans = Rc::new(RefCell::new(Vec::new()));
+        let observed = pans.clone();
+        ui.on_waveform_pan_requested(move |scroll| observed.borrow_mut().push(scroll));
+        let seeks = Rc::new(RefCell::new(Vec::new()));
+        let observed = seeks.clone();
+        ui.on_seek_requested(move |seconds| observed.borrow_mut().push(seconds));
+        ui.show().unwrap();
+        // Start from the preceding slider's real pointer focus, then Tab through
+        // the transport. Arrow presses on the Waveform itself seek, not pan.
+        click_label(&ui, if chinese { "音量" } else { "Volume" });
+        for _ in 0..10 {
+            send_keys(&ui, &[Key::Tab.into()]);
+            send_keys(&ui, &[Key::RightArrow.into()]);
+            if !pans.borrow().is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !pans.borrow().is_empty(),
+            "Tab must reach the zoomed Waveform overview"
+        );
+        assert!((ui.get_wave_scroll() - 0.55).abs() < 0.001);
+        let seek_count = seeks.borrow().len();
+        for (key, expected) in [
+            (Key::LeftArrow, 0.5),
+            (Key::DownArrow, 0.45),
+            (Key::UpArrow, 0.5),
+            (Key::PageUp, 0.75),
+            (Key::PageDown, 0.5),
+            (Key::End, 1.0),
+            (Key::Home, 0.0),
+            (Key::RightArrow, 0.05),
+        ] {
+            send_keys(&ui, &[key.into()]);
+            assert!((ui.get_wave_scroll() - expected).abs() < 0.001);
+            assert!((pans.borrow().last().copied().unwrap() - expected).abs() < 0.001);
+        }
+        assert_eq!(seeks.borrow().len(), seek_count, "overview keys only pan");
+        // Tab leaves the slider; reverse Tab returns to its keyboard owner.
+        let pan_count = pans.borrow().len();
+        send_keys(&ui, &[Key::Tab.into()]);
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        assert_eq!(pans.borrow().len(), pan_count);
+        send_keys(&ui, &[Key::Shift.into(), Key::Tab.into()]);
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        assert!((ui.get_wave_scroll() - 0.1).abs() < 0.001);
+        let overview = ElementHandle::find_by_accessible_label(
+            &ui,
+            if chinese {
+                "波形可视范围"
+            } else {
+                "Visible waveform range"
+            },
+        )
+        .next()
+        .unwrap();
+        assert_eq!(overview.accessible_role(), Some(AccessibleRole::Slider));
+        // A full-range view cannot pan, including through accessibility actions.
+        ui.set_wave_zoom(1.0);
+        let pan_count = pans.borrow().len();
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        overview.invoke_accessible_increment_action();
+        assert_eq!(pans.borrow().len(), pan_count);
+        assert_eq!(overview.accessible_enabled(), Some(false));
+        ui.hide().unwrap();
+    }
+}
+
+#[test]
+fn player_bar_states_offer_recovery_and_mute_restores_the_level() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = AppWindow::new().unwrap();
+    crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
+    ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let observed = actions.clone();
+    ui.on_file_action_requested(move |id, action| {
+        observed.borrow_mut().push(format!("file {id} {action}"));
+    });
+    let observed = actions.clone();
+    ui.on_audition_requested(move |row| observed.borrow_mut().push(format!("audition {row}")));
+    let observed = actions.clone();
+    ui.on_volume_db_requested(move |db| observed.borrow_mut().push(format!("volume {db}")));
+    ui.set_has_selection(true);
+    ui.set_selected_id("42".into());
+    ui.set_selected_row(3);
+    ui.show().unwrap();
+
+    // A missing source explains itself on the timeline and offers the repair.
+    ui.set_selected_missing(true);
+    click_label(&ui, "Locate the moved WAV and repair");
+    // A failed load offers a retry of the selected row.
+    ui.set_selected_missing(false);
+    ui.set_playback_state(7);
+    ui.set_playback_error("Decoder failed".into());
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Locate the moved WAV and repair")
+            .next()
+            .is_none()
+    );
+    click_label(&ui, "Reload and audition");
+    ui.set_playback_state(2);
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Reload and audition")
+            .next()
+            .is_none()
+    );
+
+    // Mute drops to silence; unmute restores the previous level.
+    ui.set_audio_ready(true);
+    ui.set_volume_db(-12.0);
+    click_label(&ui, "Mute");
+    assert_eq!(ui.get_volume_db(), -60.0);
+    click_label(&ui, "Unmute");
+    assert_eq!(ui.get_volume_db(), -12.0);
+    assert_eq!(
+        &*actions.borrow(),
+        &["file 42 20", "audition 3", "volume -60", "volume -12"]
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
 fn missing_records_and_library_freeze_disable_audition_and_batch_apply() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
@@ -2616,7 +3177,8 @@ fn pending_waveform_zoom_uses_the_image_still_visible_under_the_pointer() {
     scroll_timeline(&ui, "Waveform timeline", 0.25, 120.0);
     let first = view.borrow().range(100.0);
     assert!((first.0 - 12.5).abs() < 0.001 && (first.1 - 62.5).abs() < 0.001);
-    // The first render has not completed; the image and ruler still show 0..100.
+    // The first render has not completed and no target is published: the image
+    // and ruler still show 0..100.
     scroll_timeline(&ui, "Waveform time ruler", 0.75, 120.0);
     let second = view.borrow().range(100.0);
     assert!((second.0 - 56.25).abs() < 0.001 && (second.1 - 81.25).abs() < 0.001);
@@ -2627,6 +3189,14 @@ fn pending_waveform_zoom_uses_the_image_still_visible_under_the_pointer() {
     scroll_timeline(&ui, "Waveform timeline", 0.5, -120.0);
     let third = view.borrow().range(100.0);
     assert!((third.0 - 43.75).abs() < 0.001 && (third.1 - 93.75).abs() < 0.001);
+    // A published target is what the panel draws (the old image stretched into
+    // it), so the next step anchors to the target even before its render lands.
+    crate::controller::publish_wave_target(&ui, *view.borrow(), 100.0);
+    scroll_timeline(&ui, "Waveform timeline", 0.25, 120.0);
+    let fourth = view.borrow().range(100.0);
+    let anchor = third.0 + (third.1 - third.0) * 0.25;
+    assert!((fourth.0 + (fourth.1 - fourth.0) * 0.25 - anchor).abs() < 0.001);
+    assert!((fourth.1 - fourth.0 - 25.0).abs() < 0.001);
     ui.hide().unwrap();
 }
 
@@ -3530,18 +4100,26 @@ fn unified_source_window_lists_sources_and_shows_server_pages_in_both_languages(
         click_label(
             &ui,
             if chinese {
-                "确认删除"
+                "确认移除"
             } else {
-                "Delete profile"
+                "Confirm removal"
             },
         );
         assert!(!ui.get_sm_confirm_delete());
         click_label(
             &ui,
             if chinese {
-                "＋ 添加服务器"
+                "＋ 添加源"
             } else {
-                "+ Add server"
+                "+ Add source"
+            },
+        );
+        click_label(
+            &ui,
+            if chinese {
+                "服务器音效库…"
+            } else {
+                "Server library…"
             },
         );
         assert_eq!(ui.get_sm_selected(), -1);
@@ -3582,6 +4160,131 @@ fn unified_source_window_lists_sources_and_shows_server_pages_in_both_languages(
         assert!(!ui.get_library_visible());
     }
     ui.hide().unwrap();
+}
+
+#[test]
+fn local_source_chooser_and_multiple_local_rows_keep_their_own_controls() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(slint::LogicalSize::new(1080.0, 700.0));
+        ui.set_chinese(chinese);
+        let mut sources = source_rows(false).iter().collect::<Vec<_>>();
+        sources.insert(
+            1,
+            SourceRow {
+                id: "local-foley".into(),
+                name: "Foley".into(),
+                subtitle: "D:/Sounds/Foley.db".into(),
+                kind: 0,
+                ..Default::default()
+            },
+        );
+        ui.set_sm_sources(ModelRc::new(VecModel::from(sources)));
+        ui.set_sm_local_count(2);
+        let local_adds = Rc::new(RefCell::new(0));
+        let observed = local_adds.clone();
+        let weak = ui.as_weak();
+        ui.on_sm_local_add_requested(move || {
+            *observed.borrow_mut() += 1;
+            let ui = weak.upgrade().unwrap();
+            ui.set_sm_local_form(true);
+            ui.set_sm_local_editing(false);
+            ui.set_sm_local_pregenerate(true);
+        });
+        let weak = ui.as_weak();
+        ui.on_sm_source_selected(move |index| {
+            weak.upgrade().unwrap().set_sm_local_default(index == 0);
+        });
+        let deletions = Rc::new(RefCell::new(0));
+        let observed = deletions.clone();
+        ui.on_sm_delete_requested(move || *observed.borrow_mut() += 1);
+        ui.show().unwrap();
+        ui.invoke_open_library(0);
+        let add = if chinese {
+            "＋ 添加源"
+        } else {
+            "+ Add source"
+        };
+        let local = if chinese {
+            "本地音效库路径…"
+        } else {
+            "Local library path…"
+        };
+        click_label(&ui, add);
+        click_label(&ui, local);
+        assert_eq!(*local_adds.borrow(), 1);
+        assert!(ui.get_sm_local_form() && ui.get_sm_local_pregenerate());
+        assert_eq!(
+            ui.get_sm_selected(),
+            0,
+            "a draft keeps its real source selection"
+        );
+        assert!(!ui.get_sm_add_choice());
+        click_label(&ui, if chinese { "取消" } else { "Cancel" });
+        assert!(!ui.get_sm_local_form());
+
+        ui.invoke_sm_select_row(1);
+        assert!(!has_label(
+            &ui,
+            if chinese {
+                "测试连接"
+            } else {
+                "Test connection"
+            }
+        ));
+        assert!(has_label(
+            &ui,
+            if chinese {
+                "编辑音效库…"
+            } else {
+                "Edit library…"
+            }
+        ));
+        let remove = if chinese {
+            "移除此本地音效库…"
+        } else {
+            "Remove this local library…"
+        };
+        click_label(&ui, remove);
+        assert!(ui.get_sm_confirm_delete());
+        click_label(&ui, if chinese { "取消" } else { "Keep" });
+        ui.invoke_sm_select_row(0);
+        assert!(!has_label(&ui, remove), "default has no removal action");
+        assert_eq!(*deletions.borrow(), 0);
+
+        click_label(
+            &ui,
+            if chinese {
+                "服务器设置"
+            } else {
+                "Server settings"
+            },
+        );
+        assert_eq!(ui.get_sm_selected(), 2, "server tab skips every local row");
+        assert!(has_label(
+            &ui,
+            if chinese {
+                "测试连接"
+            } else {
+                "Test connection"
+            }
+        ));
+        ui.set_ds_dirty(true);
+        click_label(&ui, add);
+        click_label(&ui, local);
+        assert_eq!(ui.get_sm_pending_select(), -4);
+        assert_eq!(
+            *local_adds.borrow(),
+            1,
+            "dirty connection prompts before local creation"
+        );
+        click_label(&ui, if chinese { "放弃修改" } else { "Discard" });
+        assert_eq!(*local_adds.borrow(), 2);
+        assert!(ui.get_sm_local_form() && !ui.get_ds_dirty());
+        assert_eq!(ui.get_sm_selected(), 2);
+        ui.hide().unwrap();
+    }
 }
 
 #[test]

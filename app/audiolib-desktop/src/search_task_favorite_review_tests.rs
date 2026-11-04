@@ -142,13 +142,14 @@ fn child_folder_identity_drift() {
             .unwrap()
             .modified
     );
-    for _ in 1..6 {
+    let capacity = audiolib_core::search_workspace::MAX_SEARCH_TASKS;
+    for _ in 1..capacity {
         new_task(&fixture);
     }
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     ui.invoke_saved_search_opened(saved.id.clone().into());
     wait_task(&fixture, &first);
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     let row = ui
         .get_search_tasks()
         .iter()
@@ -267,7 +268,8 @@ fn child_case_distinct_full_capacity() {
         .unwrap()
         .unwrap();
     assert_ne!(upper.id, lower.id);
-    for _ in 1..6 {
+    let capacity = audiolib_core::search_workspace::MAX_SEARCH_TASKS;
+    for _ in 1..capacity {
         new_task(&fixture);
     }
     let before = active_id(ui);
@@ -297,7 +299,7 @@ fn child_case_distinct_full_capacity() {
     controller.publish_search_tasks(ui);
     ui.invoke_saved_search_opened(saved.id.clone().into());
     assert_eq!(active_id(ui), before);
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     assert!(ui.get_status().contains("limit"));
     let state = controller.task_workspace.lock().unwrap();
     assert_eq!(state.workspace.favorites, vec![saved]);

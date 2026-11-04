@@ -73,20 +73,52 @@ fn log_native_window_state(window: &slint::Window, event: &WindowEvent) {
     });
 }
 
+thread_local! {
+    /// A focus, restore or resize asked for the next frame to repaint everything.
+    static FULL_REPAINT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn handle_event(window: &slint::Window, event: &WindowEvent) {
     match event {
-        WindowEvent::Focused(true) | WindowEvent::Occluded(false) => window.request_redraw(),
+        WindowEvent::Focused(true) | WindowEvent::Occluded(false) => {
+            FULL_REPAINT_PENDING.with(|pending| pending.set(true));
+            window.request_redraw();
+        }
         WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+            FULL_REPAINT_PENDING.with(|pending| pending.set(true));
             window.request_redraw();
         }
         // On Windows Occluded is not emitted for ordinary covering/uncovering.
         // WM_PAINT exposure arrives as RedrawRequested; softbuffer's age may
         // still say "reused" even though Windows cleared the presented surface.
         // Invalidate before rendering, even when no application property changed.
+        // Slint's own frames (animations, the moving playhead) also arrive as
+        // RedrawRequested; they stay partial unless Windows invalidated pixels or
+        // a focus/restore/resize asked for a full frame, so playback does not
+        // repaint the whole window every frame.
         // No timer or additional redraw is requested here, so idle stays idle.
-        WindowEvent::RedrawRequested if cfg!(windows) => mark_full_damage(window),
+        WindowEvent::RedrawRequested if cfg!(windows) => {
+            let requested = FULL_REPAINT_PENDING.with(|pending| pending.replace(false));
+            // Always consume the exposure record, even when a full frame is pending.
+            if native_exposure(window) | requested {
+                mark_full_damage(window);
+            }
+        }
         _ => {}
     }
+}
+
+/// Whether Windows invalidated this window's pixels since the last redraw. A
+/// window without a Win32 handle (headless tests) or an unwatchable one reports
+/// `true`, keeping the conservative full repaint.
+#[cfg(windows)]
+fn native_exposure(window: &slint::Window) -> bool {
+    audiolib_windows::paint_exposure::take_exposure(crate::dialogs::owner_handle(window))
+}
+
+#[cfg(not(windows))]
+fn native_exposure(_window: &slint::Window) -> bool {
+    true
 }
 
 fn mark_full_damage(window: &slint::Window) {

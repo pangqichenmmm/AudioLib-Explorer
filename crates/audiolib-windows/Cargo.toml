@@ -7,13 +7,14 @@ license.workspace = true
 
 [features]
 default = []
-asio = []
+asio = ["dep:asio-sys"]
 
 [dependencies]
 audiolib-core = { path = "../audiolib-core" }
 serde.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+asio-sys = { version = "0.4", optional = true }
 winreg = "0.55"
 # OLE drag source (CF_HDROP) for dragging files out of the desktop app.
 windows-core = "0.62"

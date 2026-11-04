@@ -6,7 +6,7 @@
 param(
     [Parameter(Mandatory)][string]$Tag,
     [Parameter(Mandatory)]
-    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')]
+    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin')]
     [string]$Target,
     [switch]$Asio
 )
@@ -21,14 +21,19 @@ $tagMatch = [regex]::Match($Tag, '^v(\d+\.\d+\.\d+)(?:-(?:rc|beta)\.(?:0|[1-9]\d
 if (!$tagMatch.Success) { throw 'Tag must be vMAJOR.MINOR.PATCH, vMAJOR.MINOR.PATCH-rc.N or vMAJOR.MINOR.PATCH-beta.N.' }
 $version = $tagMatch.Groups[1].Value
 if ($Asio -and ($Target -cne 'x86_64-pc-windows-msvc' -or !$IsWindows)) { throw '-Asio requires the native Windows server target.' }
+$taskProcessArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
 switch ($Target) {
     'x86_64-pc-windows-msvc' {
         if (!$IsWindows) { throw 'Validate the Windows package on Windows.' }
         $suffix = 'win-x64'; $binaryName = 'audiolib-server.exe'; $extension = 'zip'
     }
     'x86_64-unknown-linux-gnu' {
-        if (!$IsLinux) { throw 'Validate the Linux package on Linux.' }
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'Validate the Linux x64 package on Linux x64.' }
         $suffix = 'linux-x64'; $binaryName = 'audiolib-server'; $extension = 'tar.gz'
+    }
+    'aarch64-unknown-linux-gnu' {
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) { throw 'Validate the Linux arm64 package on Linux arm64.' }
+        $suffix = 'linux-arm64'; $binaryName = 'audiolib-server'; $extension = 'tar.gz'
     }
     'aarch64-apple-darwin' {
         if (!$IsMacOS) { throw 'Validate the macOS package on macOS.' }
@@ -289,20 +294,29 @@ try {
         Start-Sleep -Milliseconds 200
     } while ([datetime]::UtcNow -lt $deadline)
     if ($null -eq $health -or $health.status -cne 'ok' -or $health.version -cne $version -or
-        $health.api_version -cne 'v1' -or $health.schema_version -ne 6 -or $health.commit -cne $shortCommit) { throw 'Extracted server health identity/API/schema check failed.' }
+        $health.api_version -cne 'v1' -or $health.schema_version -ne 8 -or $health.commit -cne $shortCommit) { throw 'Extracted server health identity/API/schema check failed.' }
+    $capabilities = Read-Endpoint '/capabilities'
+    if ($capabilities.compatibility.features.album_entities -ne 1 -or
+        $capabilities.compatibility.features.album_entity_artwork -ne 1 -or
+        $capabilities.compatibility.features.Contains('metadata_storage')) {
+        throw 'Extracted server shared-album capabilities differ from the plain Metadata contract.'
+    }
     $library = Read-Endpoint '/library'
     if ($server.HasExited -or $library.library_id -isnot [string] -or !$library.library_id -or
-        $library.schema_version -ne 6 -or $library.identity_bound_writes -isnot [bool] -or !$library.identity_bound_writes -or
+        $library.schema_version -ne 8 -or $library.identity_bound_writes -isnot [bool] -or !$library.identity_bound_writes -or
         $library.stats.audio_files -ne 1 -or $library.database -cne [IO.Path]::GetFileName($database)) { throw 'Extracted server could not serve its isolated synthetic library.' }
-    if ($library.snapshot_format.id -cne 'ale-s6-cld1-t3-m2-p1' -or
-        $library.snapshot_format.format.features.play_history_retired -ne 2) {
-        throw 'Extracted server snapshot format does not declare playback-history retirement.'
+    if ($library.snapshot_format.id -cne 'ale-s8-cld1-t3-m2-p1-a1' -or
+        $library.snapshot_format.format.schema_version -ne 8 -or
+        $library.snapshot_format.format.features.play_history_retired -ne 2 -or
+        $library.snapshot_format.format.features.album_entities -ne 1 -or
+        $library.snapshot_format.format.features.Contains('metadata_storage')) {
+        throw 'Extracted server snapshot format differs from the current schema 8 contract.'
     }
     # Safe public result only: neither endpoint responses nor process logs are exported.
     [ordered]@{
         success=$true; tag=$Tag; version=$version; target=$Target; commit=$commit
         archive_sha256=$archiveHash; binary_sha256=$report.binary_sha256
-        checks=@('archive checksum/report schema', 'public archive contents', 'extracted binary version/hash', 'isolated health API v1/schema 6/commit', 'synthetic library available')
+        checks=@('archive checksum/report schema', 'public archive contents', 'extracted binary version/hash', 'isolated health API v1/schema 8/commit', 'schema 8 shared albums/plain Metadata format', 'synthetic library available')
         shutdown=$(if ($IsWindows) { 'owned test process termination; graceful drain not tested' } else { 'owned test process SIGTERM with bounded termination fallback' })
     } | ConvertTo-Json -Depth 4
 } finally {

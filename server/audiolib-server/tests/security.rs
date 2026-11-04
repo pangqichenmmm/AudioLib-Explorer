@@ -347,3 +347,81 @@ fn management_defaults_reject_external_tokens_but_explicit_all_is_preserved() {
         .unwrap();
     security.authorize_manage(&headers, Some(&peer)).unwrap();
 }
+
+/// Raw HTTP/1.1 exchange against a real listener; returns the lowercase header block.
+async fn raw_reply(address: std::net::SocketAddr, method: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{}: {}\r\nConnection: close\r\n\r\n",
+        audiolib_core::compatibility::ACCEPT_FORMATS_HEADER,
+        audiolib_core::compatibility::PLAN_B_FORMAT,
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).await.unwrap();
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+fn content_length(reply: &str) -> Option<usize> {
+    reply.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().unwrap())
+    })
+}
+
+#[tokio::test]
+async fn head_401_has_the_same_headers_as_get_over_a_real_listener() {
+    for mode in ["all", "external"] {
+        head_matches_get(mode).await;
+    }
+}
+
+async fn head_matches_get(mode: &str) {
+    let (_directory, _security, service) = fixture(&format!("auth_mode = '{mode}'\n"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(audiolib_server::serve(
+        listener,
+        router(service.clone()),
+        async {
+            let _ = stopped.await;
+        },
+        audiolib_server::ServeOptions::default(),
+    ));
+    for path in ["/api/v1/capabilities", "/api/v1/library/snapshot"] {
+        let get = raw_reply(address, "GET", path).await;
+        let head = raw_reply(address, "HEAD", path).await;
+        assert!(get.starts_with("HTTP/1.1 401"), "{get}");
+        assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+        let (get_head, get_body) = get.split_once("\r\n\r\n").unwrap();
+        let (head_head, head_body) = head.split_once("\r\n\r\n").unwrap();
+        assert!(head_body.is_empty(), "HEAD carries no body: {head_body:?}");
+        let length = content_length(get_head).expect("GET 401 has Content-Length");
+        assert_eq!(length, get_body.len());
+        assert_eq!(content_length(head_head), Some(length), "{head_head}");
+        let names = |block: &str| {
+            let mut names: Vec<String> = block
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':').map(|(n, _)| n.to_ascii_lowercase()))
+                .filter(|name| name != "date")
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(get_head), names(head_head));
+        // Loopback is never a trusted LAN peer; the message must say so, not "outside the LAN".
+        let expected = if mode == "external" {
+            "A bearer token is required: this request is not from a trusted direct LAN peer"
+        } else {
+            "A valid bearer token is required"
+        };
+        let body: serde_json::Value = serde_json::from_str(get_body).unwrap();
+        assert_eq!(body["message"], expected, "{get_body}");
+    }
+    let _ = stop.send(());
+    task.await.unwrap();
+}

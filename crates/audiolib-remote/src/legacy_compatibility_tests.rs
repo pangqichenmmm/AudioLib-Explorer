@@ -63,8 +63,10 @@ fn legacy_snapshot(path: &Path) -> (Vec<u8>, AudioFile) {
     drop(conn);
     assert!(SqliteProvider::has_current_search_state(path).unwrap());
     let reader = SqliteProvider::open_read_only(path).unwrap();
-    assert_eq!(reader.database_path(), path);
-    let file = reader.get_audio(AUDIO_ID).unwrap();
+    assert_ne!(reader.database_path(), path);
+    let mut file = reader.get_audio(AUDIO_ID).unwrap();
+    file.album_id = None;
+    file.album_entity = None;
     drop(reader);
     (std::fs::read(path).unwrap(), file)
 }
@@ -184,12 +186,23 @@ fn marker_server_with_published_schema5_snapshot_syncs_polls_probes_patches_and_
         let synced =
             sync_library(&client, &cache, &mut |_| {}, &AtomicBool::new(false), false).unwrap();
         assert!(synced.downloaded, "{version}");
-        assert_eq!(synced.state.schema_version, 5, "{version}");
+        assert_eq!(
+            synced.state.schema_version,
+            audiolib_db::SCHEMA_VERSION,
+            "{version}"
+        );
         assert_eq!(synced.state.server_version, version);
         let format = synced.state.format.as_ref().unwrap();
-        assert_eq!(format.source.as_ref(), Some(&format.local));
-        assert_eq!(format.local.schema_version, 5);
-        assert_eq!(format.generation, 0);
+        assert_eq!(format.source.as_ref().unwrap().schema_version, 5);
+        assert_eq!(
+            format.local,
+            audiolib_core::compatibility::LibraryFormat::target()
+        );
+        assert_eq!(
+            format.local.schema_version,
+            audiolib_db::SCHEMA_VERSION as u32
+        );
+        assert_eq!(format.generation, 1);
         assert_eq!(
             check_revision(&client, Some(&cached_identity(&cache)), false),
             RevisionCheck::UpToDate {
@@ -309,7 +322,9 @@ fn marker_server_with_published_schema5_snapshot_syncs_polls_probes_patches_and_
                 .unwrap(),
             data_version
         );
-        let retained: (i64, String, i64) = observer
+        let original_reader =
+            Connection::open_with_flags(&original, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let retained: (i64, String, i64) = original_reader
             .query_row(
                 "SELECT play_count,last_played_at,(SELECT COUNT(*) FROM play_history)
                  FROM audio_files WHERE id=?1",
@@ -318,6 +333,17 @@ fn marker_server_with_published_schema5_snapshot_syncs_polls_probes_patches_and_
             )
             .unwrap();
         assert_eq!(retained, (HISTORICAL_PLAY_COUNT, LAST_PLAYED.into(), 1));
+        assert_eq!(observer.query_row("SELECT COUNT(*) FROM pragma_table_xinfo('audio_files') WHERE name IN ('play_count','last_played_at')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='play_history'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
         assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
         let state = observed.lock().unwrap();
         assert_eq!(state.downloads, 1, "{version}");

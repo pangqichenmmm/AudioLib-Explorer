@@ -79,6 +79,133 @@ impl WaveView {
         self.zoom = zoom;
         self.scroll = scroll;
     }
+
+    /// Pages a zoomed view so a playing `position` stays visible: once playback
+    /// passes [`FOLLOW_EDGE`] of the window (or lies outside it), the window moves
+    /// so the playhead sits [`FOLLOW_LEAD`] from its left edge. Returns whether the
+    /// view moved; an unzoomed view, the source end and invalid input never move it.
+    pub fn follow(&mut self, position: f64, duration: f64) -> bool {
+        if !position.is_finite()
+            || !duration.is_finite()
+            || duration <= 0.0
+            || !self.zoom.is_finite()
+            || !self.scroll.is_finite()
+            || self.zoom <= 1.0
+        {
+            return false;
+        }
+        let (start, end) = self.range(duration);
+        let span = end - start;
+        let travel = duration - span;
+        if travel <= 0.0 || (position >= start && position <= start + span * FOLLOW_EDGE) {
+            return false;
+        }
+        let scroll = (position - span * FOLLOW_LEAD).clamp(0.0, travel) / travel;
+        if (scroll - self.scroll).abs() < 1e-9 {
+            return false;
+        }
+        self.scroll = scroll;
+        true
+    }
+}
+
+/// Share of a zoomed window the playhead may cross before the view pages on.
+pub(crate) const FOLLOW_EDGE: f64 = 0.9;
+/// Where a paged window places the playhead, as a share of its width.
+pub(crate) const FOLLOW_LEAD: f64 = 0.05;
+
+/// One time-ruler tick: its position as a fraction of the visible range and, on
+/// major ticks, its time label.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RulerMark {
+    pub fraction: f64,
+    pub label: Option<String>,
+}
+
+/// Label steps in seconds, each with the minor divisions drawn between labels.
+const RULER_STEPS: &[(f64, u32)] = &[
+    (0.001, 5),
+    (0.002, 4),
+    (0.005, 5),
+    (0.01, 5),
+    (0.02, 4),
+    (0.05, 5),
+    (0.1, 5),
+    (0.2, 4),
+    (0.5, 5),
+    (1.0, 5),
+    (2.0, 4),
+    (5.0, 5),
+    (10.0, 5),
+    (15.0, 3),
+    (30.0, 6),
+    (60.0, 6),
+    (120.0, 4),
+    (300.0, 5),
+    (600.0, 5),
+    (900.0, 3),
+    (1800.0, 6),
+    (3600.0, 6),
+];
+/// At most this many labelled intervals fit the visible range.
+const RULER_MAX_LABELS: f64 = 10.0;
+
+/// Ticks on round times for the visible `start..end` seconds, so labels name
+/// the time under their tick exactly (`0:03`, `0:03.5`, `1:02:00`).
+pub(crate) fn ruler_marks(start: f64, end: f64) -> Vec<RulerMark> {
+    let span = end - start;
+    if !start.is_finite() || !end.is_finite() || span <= 0.0 || start < 0.0 {
+        return Vec::new();
+    }
+    let (step, divisions) = RULER_STEPS
+        .iter()
+        .copied()
+        .find(|(step, _)| span / step <= RULER_MAX_LABELS)
+        .unwrap_or_else(|| ((span / RULER_MAX_LABELS / 3600.0).ceil() * 3600.0, 6));
+    let minor = step / f64::from(divisions);
+    // A small tolerance keeps ticks that land on the edges despite rounding.
+    let first = (start / minor - 1e-9).ceil() as i64;
+    let last = (end / minor + 1e-9).floor() as i64;
+    let decimals = if step < 0.01 {
+        3
+    } else if step < 0.1 {
+        2
+    } else if step < 1.0 {
+        1
+    } else {
+        0
+    };
+    let hours = end >= 3600.0;
+    (first..=last)
+        .map(|index| {
+            let time = index as f64 * minor;
+            let major = index.rem_euclid(i64::from(divisions)) == 0;
+            RulerMark {
+                fraction: ((time - start) / span).clamp(0.0, 1.0),
+                label: major.then(|| ruler_label(time, decimals, hours)),
+            }
+        })
+        .collect()
+}
+
+fn ruler_label(seconds: f64, decimals: usize, hours: bool) -> String {
+    let scale = 10_u64.pow(decimals as u32);
+    let units = (seconds.max(0.0) * scale as f64).round() as u64;
+    let whole = units / scale;
+    let mut text = if hours {
+        format!(
+            "{}:{:02}:{:02}",
+            whole / 3600,
+            (whole / 60) % 60,
+            whole % 60
+        )
+    } else {
+        format!("{}:{:02}", whole / 60, whole % 60)
+    };
+    if decimals > 0 {
+        text.push_str(&format!(".{:0width$}", units % scale, width = decimals));
+    }
+    text
 }
 
 pub(crate) fn render_waveform(
@@ -167,6 +294,37 @@ pub(crate) fn render_waveform(
     rgba
 }
 
+/// Neutral alpha coverage of the same source peaks, channel lanes and display gain.
+/// Studio recolors and clips this layer on playback ticks without reading audio or
+/// rerendering peaks; the default and spectral frequency renderers remain unchanged.
+pub(crate) fn render_waveform_mask(
+    data: &WaveformData,
+    width: u32,
+    height: u32,
+    view: WaveView,
+) -> Vec<u8> {
+    let mut pixels = render_waveform(
+        data,
+        width,
+        height,
+        WaveView {
+            spectral: false,
+            ..view
+        },
+    );
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = if pixel == NORMAL_BACKGROUND {
+            0
+        } else if pixel[..3] == [55, 66, 72] {
+            45
+        } else {
+            255
+        };
+        pixel.copy_from_slice(&[255, 255, 255, alpha]);
+    }
+    pixels
+}
+
 pub(crate) fn db_from_gain(gain: f32) -> f32 {
     if gain <= 0.001 {
         -60.0
@@ -185,6 +343,85 @@ pub(crate) fn gain_from_db(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_pages_only_when_playback_leaves_the_zoomed_window() {
+        let duration = 100.0;
+        let mut view = WaveView {
+            zoom: 4.0,
+            ..Default::default()
+        };
+        // Inside the first 90% of 0..25: no move.
+        assert!(!view.follow(10.0, duration));
+        assert!(!view.follow(22.5, duration));
+        // Past the edge: the playhead lands 5% into the next window.
+        assert!(view.follow(22.6, duration));
+        let (start, end) = view.range(duration);
+        assert!((start - (22.6 - 25.0 * FOLLOW_LEAD)).abs() < 1e-9);
+        assert!((end - start - 25.0).abs() < 1e-9);
+        // A position behind the window (repeat wrap, seek) brings it back.
+        assert!(view.follow(1.0, duration));
+        assert_eq!(view.range(duration).0, 0.0);
+        // At the source end the window cannot move further.
+        view.scroll = 1.0;
+        assert!(!view.follow(99.0, duration));
+        // Unzoomed and invalid input never move.
+        let mut full = WaveView::default();
+        assert!(!full.follow(50.0, duration));
+        assert!(!view.follow(f64::NAN, duration));
+        assert!(!view.follow(10.0, 0.0));
+    }
+
+    #[test]
+    fn ruler_marks_use_round_times_and_label_major_ticks() {
+        let labels = |start: f64, end: f64| {
+            ruler_marks(start, end)
+                .into_iter()
+                .filter_map(|mark| mark.label)
+                .collect::<Vec<_>>()
+        };
+        // 30.21 s: 5 s labels, never the odd 3.021 s steps of an even split.
+        assert_eq!(
+            labels(0.0, 30.21),
+            ["0:00", "0:05", "0:10", "0:15", "0:20", "0:25", "0:30"]
+        );
+        // Zoomed into 5.2..5.9 s: tenths.
+        assert_eq!(
+            labels(5.2, 5.9),
+            [
+                "0:05.2", "0:05.3", "0:05.4", "0:05.5", "0:05.6", "0:05.7", "0:05.8", "0:05.9"
+            ]
+        );
+        assert_eq!(
+            labels(0.0, 0.004),
+            ["0:00.000", "0:00.001", "0:00.002", "0:00.003", "0:00.004"]
+        );
+        assert_eq!(
+            labels(3540.0, 3720.0),
+            [
+                "0:59:00", "0:59:30", "1:00:00", "1:00:30", "1:01:00", "1:01:30", "1:02:00"
+            ]
+        );
+        // Every mark lies inside the range, in order, with minor ticks between labels.
+        let marks = ruler_marks(12.5, 62.5);
+        assert!(
+            marks
+                .windows(2)
+                .all(|pair| pair[0].fraction < pair[1].fraction)
+        );
+        assert!(
+            marks
+                .iter()
+                .all(|mark| (0.0..=1.0).contains(&mark.fraction))
+        );
+        assert!(marks.iter().filter(|mark| mark.label.is_none()).count() > marks.len() / 2);
+        let first = marks.iter().find(|mark| mark.label.is_some()).unwrap();
+        assert_eq!(first.label.as_deref(), Some("0:15"));
+        assert!((first.fraction - 0.05).abs() < 1e-9);
+        // Empty or invalid ranges draw nothing.
+        assert!(ruler_marks(5.0, 5.0).is_empty());
+        assert!(ruler_marks(0.0, f64::INFINITY).is_empty());
+    }
 
     #[test]
     fn mouse_zoom_keeps_source_anchor_when_zooming_in_and_out() {
@@ -364,5 +601,61 @@ mod tests {
         );
         assert_eq!(&normal[0..4], &NORMAL_BACKGROUND);
         assert_eq!(&normal[10 * 4..11 * 4], &[143, 174, 166, 255]);
+    }
+
+    #[test]
+    fn progress_mask_preserves_channel_geometry_gain_and_transparent_background() {
+        use audiolib_audio::WaveformPeak;
+
+        let data = WaveformData {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 128,
+            samples_per_pixel: 16,
+            peaks: vec![
+                vec![WaveformPeak {
+                    min: -0.6,
+                    max: 0.8,
+                    ..Default::default()
+                }],
+                vec![WaveformPeak {
+                    min: -0.2,
+                    max: 0.3,
+                    ..Default::default()
+                }],
+            ],
+        };
+        for gain_db in [-6.0, 0.0, 6.0] {
+            let view = WaveView {
+                gain_db,
+                ..Default::default()
+            };
+            let normal = render_waveform(
+                &data,
+                8,
+                40,
+                WaveView {
+                    spectral: false,
+                    ..view
+                },
+            );
+            let mask = render_waveform_mask(&data, 8, 40, view);
+            assert_eq!(mask.len(), normal.len());
+            for (original, masked) in normal.chunks_exact(4).zip(mask.chunks_exact(4)) {
+                assert_eq!(masked[..3], [255; 3]);
+                assert_eq!(masked[3] == 0, original == NORMAL_BACKGROUND);
+            }
+            assert!(
+                mask[..20 * 8 * 4]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] == 255)
+            );
+            assert!(
+                mask[20 * 8 * 4..]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] == 255)
+            );
+        }
+        assert!(render_waveform_mask(&data, 0, 40, WaveView::default()).is_empty());
     }
 }

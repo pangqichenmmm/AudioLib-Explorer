@@ -254,6 +254,18 @@ impl ApiError {
             )
         }
     }
+    /// 503 `BUSY` with `Retry-After: 1` when every cover decode slot stayed in use for
+    /// [`crate::artwork::ARTWORK_SLOT_WAIT`].
+    pub fn artwork_busy() -> Self {
+        Self {
+            retry_after: Some(STREAM_BUSY_RETRY_SECS),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BUSY",
+                "Artwork requests are busy; retry shortly",
+            )
+        }
+    }
     /// 503 `BUSY` with `Retry-After: 1` when every ffmpeg transcode slot stayed in use
     /// (`codec=flac`); the same status, code and header as [`ApiError::stream_busy`].
     pub fn transcode_busy() -> Self {
@@ -376,6 +388,14 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response();
+        use axum::body::HttpBody as _;
+        // State the JSON length explicitly instead of relying on the body's size hint:
+        // a `HEAD` reply drops the body but must keep the same `Content-Length` as `GET`.
+        if let Some(length) = response.body().size_hint().exact() {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+        }
         if let Some(seconds) = self.retry_after {
             response
                 .headers_mut()

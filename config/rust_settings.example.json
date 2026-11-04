@@ -3,9 +3,10 @@
   "active_database": null,
   "audition_play_on_single_click": true,
   "play_history_limit": 5000,
+  "show_album_artwork": true,
   "pregenerate_list_waveforms": true,
   "hold_list_waveform_batches_after_audition": false,
-  "max_search_tasks": 6,
+  "max_search_tasks": 30,
   "spectral_peaks": {
     "noise": 1.0,
     "variance": 0.38

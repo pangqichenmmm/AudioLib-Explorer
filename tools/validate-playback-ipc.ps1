@@ -4,6 +4,17 @@ param([string]$BinaryDirectory = 'target/x86_64-pc-windows-msvc/release', [switc
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'console-utf8.ps1')
 try {
+. (Join-Path $PSScriptRoot 'native-desktop-window.ps1')
+if (!('AudioLibPlaybackCloseNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class AudioLibPlaybackCloseNative {
+    [DllImport("user32.dll", EntryPoint = "PostMessageW", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+}
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $binaryRoot = if ([IO.Path]::IsPathRooted($BinaryDirectory)) { $BinaryDirectory } else { Join-Path $taskRoot $BinaryDirectory }
 $cli = Join-Path $binaryRoot 'AudioLibCli.exe'
@@ -136,7 +147,15 @@ function Close-OwnedDesktop($Process) {
     if (!$Process) { return $true }
     $Process.Refresh()
     if (!$Process.HasExited) {
-        $null = $Process.CloseMainWindow()
+        $window = [AudioLibDesktopWindowSelector]::FindApplicationWindow($Process.Id)
+        if ($window -eq [IntPtr]::Zero) {
+            $Process.Refresh()
+            if ($Process.HasExited) { return $true }
+            Write-Warning "Owned test process $($Process.Id) has no visible application window; it and its temporary data are retained."
+            return $false
+        }
+        [AudioLibDesktopWindowSelector]::AssertApplicationWindow($window,$Process.Id)
+        if (![AudioLibPlaybackCloseNative]::PostMessage($window,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)) { return $false }
         if (!$Process.WaitForExit(25000)) { return $false }
     }
     return $true

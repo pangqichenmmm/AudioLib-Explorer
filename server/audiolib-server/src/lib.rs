@@ -6,6 +6,7 @@
 //! LAN-only admin page (`/admin`) manages the public URL, authentication and library
 //! management modes, tokens and optional native TLS.
 pub mod admin;
+mod artwork;
 pub mod auth;
 pub mod browse;
 mod compatibility;

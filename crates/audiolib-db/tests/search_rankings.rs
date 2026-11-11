@@ -195,6 +195,7 @@ fn alternative_sorts_with_complex_filters_keep_counts_pages_and_metadata_exact()
                     descending,
                     offset,
                     limit: 7,
+                    ..Default::default()
                 };
                 assert_exact(&conn, &request, &provider.search(&request).unwrap());
             }

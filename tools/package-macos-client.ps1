@@ -18,6 +18,7 @@ if ($PSVersionTable.PSVersion -lt [version]'7.3' -or !$IsMacOS -or
     throw 'Package on an Apple Silicon Mac using native arm64 PowerShell 7.3+.'
 }
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
 $taskVersion = ([regex]::Match($Tag, '^v(\d+\.\d+\.\d+)')).Groups[1].Value
 function Read-Tool([string]$Tool, [string[]]$Arguments) {
     $text = (& $Tool @Arguments 2>&1 | Out-String).Trim()
@@ -140,58 +141,13 @@ try {
     # texts are copied; registry/source paths never enter the release manifest.
     Assert-Unlinked $taskBuild.metadata
     $metadata = [IO.File]::ReadAllText($taskBuild.metadata) | ConvertFrom-Json
-    $nodes = @{}
-    foreach ($node in $metadata.resolve.nodes) { $nodes[$node.id] = $node }
-    $included = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $queue = [Collections.Generic.Queue[string]]::new()
-    foreach ($name in @('audiolib-desktop', 'audiolib-cli')) {
-        $roots = @($metadata.packages | Where-Object { $_.name -ceq $name -and !$_.source })
-        if ($roots.Count -ne 1 -or $roots[0].version -cne $taskVersion) { throw 'Desktop/CLI metadata identity differs from tag.' }
-        $queue.Enqueue($roots[0].id)
-    }
-    while ($queue.Count) {
-        $id = $queue.Dequeue()
-        if (!$included.Add($id)) { continue }
-        if (!$nodes.ContainsKey($id)) { throw 'Dependency graph is incomplete.' }
-        foreach ($dependency in $nodes[$id].deps) {
-            if (@($dependency.dep_kinds | Where-Object { $_.kind -ne 'dev' }).Count) { $queue.Enqueue($dependency.pkg) }
-        }
-    }
-    $packages = @($metadata.packages | Where-Object { $included.Contains($_.id) } | Sort-Object name, version)
-    if ($packages.Count -ne $included.Count -or @($packages | Where-Object { $_.name -eq 'asio-sys' }).Count) { throw 'Invalid Mac dependency closure or ASIO dependency.' }
-    $notices = [Collections.Generic.List[object]]::new()
-    foreach ($package in $packages) {
-        if ($package.name -notmatch '^[A-Za-z0-9_-]+$' -or $package.version -notmatch '^[A-Za-z0-9.+_-]+$') { throw 'Unsafe dependency name/version.' }
-        $sourceRoot = Split-Path -Parent $package.manifest_path
-        Assert-Unlinked $sourceRoot
-        $prefix = 'Contents/Resources/licenses/' + $package.name + '-' + $package.version + '/'
-        $noticePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($notice in (Get-ChildItem -LiteralPath $sourceRoot -Force | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE)' })) {
-            Assert-Unlinked $notice.FullName
-            if ($notice.PSIsContainer) {
-                if ($notice.Name -match '^(LICENSES?|COPYING|NOTICE)$') {
-                    foreach ($file in (Get-ChildItem -LiteralPath $notice.FullName -File -Recurse -Force)) {
-                        Assert-Unlinked $file.FullName
-                        $relative = [IO.Path]::GetRelativePath($sourceRoot, $file.FullName).Replace('\', '/')
-                        if ($noticePaths.Add($relative)) { Add-File $file.FullName ($prefix + $relative) }
-                    }
-                }
-            } elseif ($noticePaths.Add($notice.Name)) { Add-File $notice.FullName ($prefix + $notice.Name) }
-        }
-        if ($package.license_file) {
-            $licenseSource = [IO.Path]::GetFullPath($package.license_file, $sourceRoot)
-            if (!$licenseSource.StartsWith($sourceRoot.TrimEnd('/') + '/', [StringComparison]::Ordinal)) { throw 'Dependency license escaped its source tree.' }
-            $relative = [IO.Path]::GetFileName($licenseSource)
-            if ($noticePaths.Add($relative)) { Add-File $licenseSource ($prefix + $relative) }
-        }
-        if ($package.name -eq 'soundtouch-ffi') {
-            Add-File (Join-Path $sourceRoot 'soundtouch-2_3_2/COPYING.TXT') ($prefix + 'SoundTouch-LGPL.txt')
-            $null = $noticePaths.Add('SoundTouch-LGPL.txt')
-        }
-        $repository = if ($package.repository -and $package.repository -match '^https://[^/@\s?#]+(?:/[^\s?#]*)?$') { $package.repository } else { $null }
-        $notices.Add([ordered]@{ name=$package.name; version=$package.version; license=$package.license; repository=$repository; files=@($noticePaths | Sort-Object) })
-    }
-    Write-File 'Contents/Resources/licenses/dependencies.json' (ConvertTo-Json -InputObject @($notices.ToArray()) -Depth 6)
+    $licenseGraph=Get-AudioLibLicenseGraph -Root $taskRoot -Packages @('audiolib-desktop','audiolib-cli') -Target 'aarch64-apple-darwin' -NoDefaultFeatures -Metadata $metadata
+    foreach($name in @('audiolib-desktop','audiolib-cli')){if(@($licenseGraph.packages|Where-Object {$_.name -ceq $name -and $_.version -ceq $taskVersion}).Count -ne 1){throw 'Desktop/CLI metadata identity differs from tag.'}}
+    if(@($licenseGraph.packages|Where-Object name -CEQ 'asio-sys').Count){throw 'ASIO dependency in native Mac client.'}
+    # Signing changes Mach-O bytes and seals this inventory as a bundle resource.
+    # The existing final signed-bundle report binds EXEs; avoid a circular self-hash.
+    foreach($relative in (Write-AudioLibLicenseBundle -Graph $licenseGraph -Root $taskRoot -PayloadRoot $taskBundle -Prefix 'Contents/Resources/licenses' -Artifacts @{} -MacManifest)){if(!$taskPlanned.Add($relative.Normalize([Text.NormalizationForm]::FormC))){throw 'Duplicate generated Mac dependency notice.'}}
+    $null=Test-AudioLibLicenseBundle -PayloadRoot $taskBundle -Prefix 'Contents/Resources/licenses' -ExpectedRoots @('audiolib-desktop','audiolib-cli') -Target 'aarch64-apple-darwin' -NoDefaultFeatures -ExpectedArtifacts @() -SignedBundle
     foreach ($file in (Get-ChildItem -LiteralPath $taskBundle -File -Recurse -Force)) {
         Assert-Unlinked $file.FullName
         $relative = [IO.Path]::GetRelativePath($taskBundle, $file.FullName).Replace('\', '/')

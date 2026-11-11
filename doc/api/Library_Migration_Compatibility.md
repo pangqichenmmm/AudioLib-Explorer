@@ -29,6 +29,8 @@ JSON 字节，共享专辑绑定纳入目标摘要。详见[共享专辑与 Meta
 
 ## 2. 多维版本描述
 
+新增音频源通过必需持久 feature `audio_sources:1` 声明，schema 数字仍为 8/9，对应精确格式 `ale-s8-cld1-t3-m2-p1-a1-af1` 和 `ale-s9-cld1-t3-m2-p1-a1-sd1-af1`。只在成功发布新格式记录的同一事务中启用；空库和原格式库保持既有 ID。新目录接受 base/af1，旧目录不能因 schema 数字相同而放行 af1。schema-9 的既有 WAV-only 派生快照移除该 feature 并恢复原 schema-8 ID，排除伪 `.wav` 名称下的新容器。迁移和回滚须保留已存在的 af1 能力要求。已经打开的旧本地实例（包括读写进程）不参与新的检查，启用新源前必须关闭旧实例。
+
 同一次发布的桌面客户端、CLI 和服务端继续采用同一个 workspace SemVer。已部署两端允许暂时处于不同程序版本，但现代握手须各自明确接纳对方的实际版本并共享 API 协议，不能只看两个版本区间是否有交集；实际格式另行检查。
 
 每个构建内置只读 compatibility manifest；当前 `/capabilities.compatibility` 的实际字段为：

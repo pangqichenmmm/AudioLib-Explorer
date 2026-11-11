@@ -1,0 +1,43 @@
+Upstream declaration record: no standalone upstream license file is supplied here.
+Package: 
+realfft
+Published version: 
+3.5.0
+Declared metadata license expression: MIT
+Pinned upstream commit: 
+d0d4eee0525fd27c96c8a046d6d107acd5ed84a6
+Published registry package SHA256: 
+f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677
+
+Exact upstream Cargo.toml declarations:
+version = "3.5.0"
+license = "MIT"
+authors = ["HEnquist <henrik.enquist@gmail.com>"]
+
+The authors line is original Cargo Authors metadata. It is not a copyright-holder or year claim.
+
+Exact upstream README license declaration:
+License: MIT
+
+The full non-truncated upstream tree contains no standalone LICENSE/LICENCE/NOTICE/COPYING/COPYRIGHT file.
+No copyright or license header was found in the published crate Rust files inspected locally.
+The accompanying LICENSE-MIT-STANDARD.txt contains the official SPDX MIT permission, conditions,
+and disclaimer verbatim, omitting its unassigned template copyright line. No attribution is invented.
+
+Source provenance:
+Role: Cargo.toml
+URL: https://raw.githubusercontent.com/HEnquist/realfft/d0d4eee0525fd27c96c8a046d6d107acd5ed84a6/Cargo.toml
+Original response SHA256: d72ddbadf9bb55ed21ae973ac97f0bb4e8df2064af628c54b802b2c7d764c8de
+
+Role: README.md
+URL: https://raw.githubusercontent.com/HEnquist/realfft/d0d4eee0525fd27c96c8a046d6d107acd5ed84a6/README.md
+Original response SHA256: 1e92c54e7fa08298d2a34ea9aa63b85626c47519873a91cd1028f234e1221608
+
+Role: published-crates-io-version
+URL: https://crates.io/api/v1/crates/realfft/3.5.0
+Original response SHA256: 0f37cc53e27256e87da35e16196a0298f261d4879ebcbf4af2eb5a80a10bd5ac
+
+Role: SPDX-original-MIT-with-template-placeholder
+URL: https://raw.githubusercontent.com/spdx/license-list-data/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/MIT.txt
+Original response SHA256: b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5
+

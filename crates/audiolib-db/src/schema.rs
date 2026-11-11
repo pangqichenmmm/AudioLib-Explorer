@@ -4,10 +4,16 @@ use audiolib_core::{Error, Result};
 use jieba_rs::Jieba;
 use rusqlite::{Connection, OptionalExtension, functions::FunctionFlags};
 use std::sync::Arc;
+mod audio_sources;
 mod current;
 pub(crate) mod definition;
 mod legacy;
 mod search_upgrade;
+#[cfg(feature = "scanner")]
+pub(crate) use audio_sources::metadata_requires_audio_sources;
+pub(crate) use audio_sources::{
+    imported_audio_sources_required, require_audio_sources, require_imported_audio_sources,
+};
 pub(crate) use current::{
     create_current, current_format_ready, mark_current, needs_upgrade, readable_format_ready,
 };
@@ -87,6 +93,10 @@ fn validate_feature_revisions(conn: &Connection, tokenization: i64) -> Result<()
                 "search_indexes",
                 "search_storage",
                 "play_history_retired",
+                "search_path",
+                "vorbis_tags",
+                "vendor_metadata",
+                "audio_sources",
             ]
             .contains(&name.as_str())
             {
@@ -105,6 +115,10 @@ fn validate_feature_revisions(conn: &Connection, tokenization: i64) -> Result<()
         ("search_indexes", 1),
         ("search_storage", 1),
         ("play_history_retired", 2),
+        ("search_path", 1),
+        ("vorbis_tags", 1),
+        ("vendor_metadata", 1),
+        ("audio_sources", 1),
     ] {
         if let Some(version) = feature_version(conn, feature)?
             && version > supported
@@ -117,7 +131,18 @@ fn validate_feature_revisions(conn: &Connection, tokenization: i64) -> Result<()
         }
     }
     for (key, supported) in [
-        (SOURCE_SEARCH_REV_KEY, 2),
+        (
+            SOURCE_SEARCH_REV_KEY,
+            if conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .map_err(db_error)?
+                == 9
+            {
+                3
+            } else {
+                2
+            },
+        ),
         ("source_tags_rev", 2),
         ("source_tags_progress_rev", 2),
     ] {
@@ -206,6 +231,9 @@ pub(crate) fn search_state_is_current(conn: &Connection) -> Result<bool> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
+    if version == 9 {
+        return crate::migration9::validate_ready(conn).map(|()| true);
+    }
     if version == SCHEMA_VERSION {
         return readable_format_ready(conn);
     }
@@ -396,7 +424,7 @@ const CREATE_LIBRARY_META: &str = "CREATE TABLE IF NOT EXISTS library_meta(
 
 /// Set whenever search text AND the derived tag column were both recomputed for every row
 /// (fresh library, legacy import, full search rebuild).
-const MARK_SOURCE_SEARCH: &str = "CREATE TABLE IF NOT EXISTS library_meta(
+pub(crate) const MARK_SOURCE_SEARCH: &str = "CREATE TABLE IF NOT EXISTS library_meta(
         key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
     INSERT OR REPLACE INTO library_meta(key,value) VALUES('source_search_rev','2');
     INSERT OR REPLACE INTO library_meta(key,value) VALUES('source_tags_rev','2');
@@ -557,7 +585,11 @@ fn json_has_source_tags(json: &str) -> bool {
 }
 
 pub(crate) fn source_search_marked(conn: &Connection) -> Result<bool> {
-    Ok(meta_value(conn, SOURCE_SEARCH_REV_KEY)?.as_deref() == Some(SOURCE_SEARCH_REV))
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(db_error)?;
+    Ok(meta_value(conn, SOURCE_SEARCH_REV_KEY)?.as_deref()
+        == Some(if version == 9 { "3" } else { SOURCE_SEARCH_REV }))
 }
 
 fn register_metadata_storage(conn: &Connection) -> Result<()> {
@@ -880,6 +912,7 @@ pub fn register_tokenizer(conn: &Connection, jieba: Arc<Jieba>) -> Result<()> {
         },
     )
     .map_err(db_error)?;
+    crate::dir_search::register_t3(conn)?;
     conn.create_scalar_function(
         "audiolib_path_key",
         1,
@@ -1016,6 +1049,7 @@ fn rebuild_search_in_transaction_with_progress(
     conn: &Connection,
     progress: &mut dyn FnMut(SnapshotUpgradeProgress) -> Result<()>,
 ) -> Result<()> {
+    crate::search_tracking::drop_owned(conn)?;
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS audio_files_ai; DROP TRIGGER IF EXISTS audio_files_au;
         DROP TRIGGER IF EXISTS audio_files_ad; DROP TABLE IF EXISTS audio_search;",

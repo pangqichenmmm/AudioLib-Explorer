@@ -132,7 +132,7 @@ fn current_derived_v3_v4_v5_snapshots_use_owned_album_projection_without_source_
         assert_eq!((&*file.tags, &*file.notes), ("private", "retain notes"));
         assert!(file.favorite);
         assert_eq!(file.attributes["private"], "keep");
-        assert_eq!(file.album_id, Some(file.album_entity.unwrap().id));
+        assert_eq!(file.album_id, Some(file.album_entity.as_ref().unwrap().id));
         assert!(matches!(
             provider.update_metadata(
                 42,

@@ -193,6 +193,9 @@ impl Controller {
         std::mem::replace(&mut *self.search_cancel.lock().unwrap(), cancel.clone())
             .store(true, Ordering::Release);
         *self.facet_job.lock().unwrap() = Some(SearchJob {
+            window: None,
+            backward_before: None,
+            path_probe: None,
             request,
             generation,
             not_before: Instant::now(),

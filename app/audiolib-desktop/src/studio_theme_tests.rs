@@ -1,9 +1,12 @@
 // app/audiolib-desktop/src/studio_theme_tests.rs
 //! Studio dock regressions use synthetic images and an isolated software backend.
 use crate::{AppWindow, AudioRow, FolderRow, theme::apply_theme};
-use audiolib_core::config::{DEFAULT_THEME, STUDIO_THEME};
+use audiolib_core::config::{DEFAULT_THEME, DEFAULT_V2_THEME, STUDIO_THEME};
 use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
-use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{
+    ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
+    platform::{Key, PointerEventButton, WindowEvent},
+};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 fn init_backend() {
@@ -75,6 +78,99 @@ fn activate(ui: &AppWindow, label: &str) {
         .unwrap_or_else(|| panic!("Missing action: {label}"));
     assert_eq!(action.accessible_enabled(), Some(true), "{label}");
     action.invoke_accessible_default_action();
+}
+
+fn player_actions(ui: &AppWindow, label: &str) -> Vec<ElementHandle> {
+    // In Chinese the menu bar's Playback entry is also named 播放. Scope the
+    // transport query to the audition panel rather than invoking that menu.
+    ElementHandle::find_by_element_type_name(ui, "AuditionPanel")
+        .flat_map(|panel| {
+            let label = label.to_owned();
+            panel
+                .query_descendants()
+                .match_predicate(move |element| {
+                    element
+                        .accessible_label()
+                        .is_some_and(|candidate| candidate == label)
+                })
+                .find_all()
+        })
+        .collect()
+}
+
+fn player_action(ui: &AppWindow, label: &str) -> ElementHandle {
+    let mut actions = player_actions(ui, label);
+    assert_eq!(actions.len(), 1, "One player action: {label}");
+    actions.remove(0)
+}
+
+fn confirm_transport(ui: &AppWindow, state: audiolib_audio::PlaybackState, position: f64) {
+    let status = audiolib_audio::PlaybackStatus {
+        state,
+        position,
+        duration: 100.0,
+        ..Default::default()
+    };
+    crate::controller::publish_playback_progress(ui, &status, false);
+    crate::controller::publish_player_state(ui, &status, false);
+    ui.set_audio_ready(!matches!(
+        state,
+        audiolib_audio::PlaybackState::Empty
+            | audiolib_audio::PlaybackState::Loading
+            | audiolib_audio::PlaybackState::Error
+    ));
+    // Drain the same property-change notifications as one real UI turn, including
+    // the cached start-boundary used by transport controls during playback.
+    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+}
+
+fn control_center(element: &ElementHandle) -> slint::LogicalPosition {
+    let origin = element.absolute_position();
+    let size = element.size();
+    slint::LogicalPosition::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0)
+}
+
+fn pointer_down(ui: &AppWindow, position: slint::LogicalPosition) {
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: PointerEventButton::Left,
+    });
+}
+
+fn pointer_up(ui: &AppWindow, position: slint::LogicalPosition) {
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: PointerEventButton::Left,
+    });
+}
+
+fn key(ui: &AppWindow, text: slint::SharedString) {
+    ui.window()
+        .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+    ui.window()
+        .dispatch_event(WindowEvent::KeyReleased { text });
+}
+
+fn control_pixels(ui: &AppWindow, element: &ElementHandle) -> Vec<u8> {
+    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    let pixels = ui.window().take_snapshot().unwrap();
+    let origin = element.absolute_position();
+    let size = element.size();
+    let left = (origin.x.ceil() as u32).min(pixels.width());
+    let top = (origin.y.ceil() as u32).min(pixels.height());
+    let right = ((origin.x + size.width).floor() as u32).min(pixels.width());
+    let bottom = ((origin.y + size.height).floor() as u32).min(pixels.height());
+    assert!(right > left && bottom > top, "Control must be visible");
+    let mut crop = Vec::new();
+    for y in top..bottom {
+        crop.extend_from_slice(
+            &pixels.as_bytes()[((y * pixels.width() + left) * 4) as usize
+                ..((y * pixels.width() + right) * 4) as usize],
+        );
+    }
+    crop
 }
 
 fn timeline(ui: &AppWindow) -> ElementHandle {
@@ -230,6 +326,453 @@ fn studio_dock_expands_without_transport_commands_and_restores_classic_frame() {
     }
 }
 
+#[test]
+fn default_v2_keeps_classic_transport_in_the_studio_workbench() {
+    init_backend();
+    for chinese in [false, true] {
+        let language = if chinese { "cn" } else { "en" };
+        let ui = fixture(chinese);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let observed = requests.clone();
+        let weak = ui.as_weak();
+        ui.on_start_requested(move || {
+            observed.borrow_mut().push("play");
+            let ui = weak.upgrade().unwrap();
+            ui.set_playback_state(3);
+            ui.set_playing(true);
+        });
+        let observed = requests.clone();
+        let weak = ui.as_weak();
+        ui.on_pause_requested(move || {
+            observed.borrow_mut().push("pause");
+            let ui = weak.upgrade().unwrap();
+            ui.set_playback_state(4);
+            ui.set_playing(false);
+        });
+        let observed = requests.clone();
+        ui.on_stop_requested(move || observed.borrow_mut().push("stop"));
+        let observed = requests.clone();
+        ui.on_transform_requested(move |_, _, _, _| observed.borrow_mut().push("transform"));
+        let observed = requests.clone();
+        ui.on_volume_db_requested(move |_| observed.borrow_mut().push("volume"));
+        apply_theme(&ui, DEFAULT_THEME);
+        ui.show().unwrap();
+        frame(&ui, &format!("default-v2-classic-reference-{language}"));
+        let classic_height = timeline(&ui).size().height;
+        let expected = AuditionState::capture(&ui);
+
+        // Switching between Studio and Default v2 keeps the workbench, but must
+        // replace its player without replaying transport or transform commands.
+        for id in [DEFAULT_V2_THEME, STUDIO_THEME, DEFAULT_V2_THEME] {
+            apply_theme(&ui, id);
+            frame(&ui, &format!("default-v2-switch-{id}-{language}"));
+            assert!(ui.global::<crate::Theme>().get_modern_style());
+            assert_eq!(AuditionState::capture(&ui), expected);
+            if id == DEFAULT_V2_THEME {
+                assert!(!ui.global::<crate::Theme>().get_modern_player());
+                assert!((timeline(&ui).size().height - classic_height).abs() < 1.0);
+                for label in if chinese {
+                    ["播放", "暂停"]
+                } else {
+                    ["Play", "Pause"]
+                } {
+                    assert_eq!(
+                        player_actions(&ui, label).len(),
+                        1,
+                        "Classic transport must expose separate {label} controls"
+                    );
+                }
+                assert!(
+                    ElementHandle::find_by_accessible_label(
+                        &ui,
+                        if chinese {
+                            "调整试听播放器高度"
+                        } else {
+                            "Resize audition dock"
+                        }
+                    )
+                    .next()
+                    .is_none(),
+                    "Default v2 retains the classic player's fixed-height layout"
+                );
+            } else {
+                assert!(ui.global::<crate::Theme>().get_modern_player());
+                assert!(timeline(&ui).size().height < classic_height);
+            }
+        }
+        assert!(
+            requests.borrow().is_empty(),
+            "Appearance changes must not issue audio commands"
+        );
+        for label in if chinese {
+            ["播放", "暂停"]
+        } else {
+            ["Play", "Pause"]
+        } {
+            player_actions(&ui, label)[0].invoke_accessible_default_action();
+        }
+        assert_eq!(*requests.borrow(), ["play", "pause"]);
+
+        // The modern sidebar remains operational alongside the classic player.
+        activate(
+            &ui,
+            if chinese {
+                "最近使用"
+            } else {
+                "Recent playback"
+            },
+        );
+        assert!(ui.get_library_visible());
+        assert_eq!(ui.get_history_kind(), 1);
+        ui.set_library_visible(false);
+        frame(&ui, &format!("default-v2-{language}"));
+        ui.hide().unwrap();
+    }
+}
+
+#[test]
+fn classic_transport_uses_confirmed_phases_and_guards_unavailable_actions() {
+    use audiolib_audio::PlaybackState;
+
+    init_backend();
+    for id in [DEFAULT_THEME, DEFAULT_V2_THEME] {
+        for chinese in [false, true] {
+            let ui = fixture(chinese);
+            apply_theme(&ui, id);
+            let actions = Rc::new(RefCell::new(Vec::new()));
+            let observed = actions.clone();
+            ui.on_start_requested(move || observed.borrow_mut().push("play"));
+            let observed = actions.clone();
+            ui.on_pause_requested(move || observed.borrow_mut().push("pause"));
+            let observed = actions.clone();
+            ui.on_stop_requested(move || observed.borrow_mut().push("stop"));
+            let observed = actions.clone();
+            ui.on_seek_requested(move |_| observed.borrow_mut().push("start"));
+            ui.show().unwrap();
+            frame(&ui, "classic-transport-phase-fixture");
+            let labels = if chinese {
+                ["播放", "暂停", "停止", "回到开头"]
+            } else {
+                ["Play", "Pause", "Stop", "Go to start"]
+            };
+            let mut play_hints = Vec::new();
+            for (state, position, enabled) in [
+                (PlaybackState::Empty, 0.0, [false; 4]),
+                (PlaybackState::Loading, 0.0, [false; 4]),
+                (PlaybackState::Ready, 0.0, [true, false, false, false]),
+                (PlaybackState::Playing, 25.0, [false, true, true, true]),
+                (PlaybackState::Paused, 25.0, [true, false, true, true]),
+                (PlaybackState::Playing, 25.0, [false, true, true, true]),
+                (PlaybackState::Ended, 100.0, [true, false, true, true]),
+                (PlaybackState::Stopped, 0.0, [true, false, false, false]),
+                (PlaybackState::Error, 0.0, [false; 4]),
+            ] {
+                confirm_transport(&ui, state, position);
+                for (index, active) in [
+                    state == PlaybackState::Playing,
+                    state == PlaybackState::Paused,
+                    state == PlaybackState::Stopped,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let action = player_action(&ui, labels[index]);
+                    assert_eq!(action.accessible_checkable(), Some(true));
+                    assert_eq!(
+                        action.accessible_checked(),
+                        Some(active),
+                        "{id}/{chinese:?}/{state:?}: {} reflects the confirmed phase",
+                        labels[index]
+                    );
+                }
+                actions.borrow_mut().clear();
+                for (index, label) in labels.iter().enumerate() {
+                    let action = player_action(&ui, label);
+                    assert_eq!(action.accessible_enabled(), Some(enabled[index]));
+                    let before = actions.borrow().len();
+                    action.invoke_accessible_default_action();
+                    assert_eq!(
+                        actions.borrow().len() - before,
+                        usize::from(enabled[index]),
+                        "{id}/{state:?}: {label} must guard its accessibility action"
+                    );
+                }
+                if matches!(
+                    state,
+                    PlaybackState::Ready | PlaybackState::Paused | PlaybackState::Ended
+                ) {
+                    let hint = player_action(&ui, labels[0])
+                        .accessible_description()
+                        .expect("Play exposes its current action hint");
+                    assert!(!hint.is_empty());
+                    play_hints.push(hint);
+                }
+            }
+            assert_ne!(play_hints[0], play_hints[1], "Paused offers resume");
+            assert_ne!(play_hints[1], play_hints[2], "Ended offers replay");
+
+            for gate in ["missing", "maintenance", "loading", "error"] {
+                confirm_transport(&ui, PlaybackState::Playing, 25.0);
+                ui.set_selected_missing(gate == "missing");
+                ui.set_library_busy(gate == "maintenance");
+                if matches!(gate, "loading" | "error") {
+                    // Confirmed transitional phases must win over a stale ready flag.
+                    confirm_transport(
+                        &ui,
+                        if gate == "loading" {
+                            PlaybackState::Loading
+                        } else {
+                            PlaybackState::Error
+                        },
+                        25.0,
+                    );
+                    ui.set_audio_ready(true);
+                }
+                actions.borrow_mut().clear();
+                for label in labels {
+                    let action = player_action(&ui, label);
+                    assert_eq!(action.accessible_enabled(), Some(false), "{gate}: {label}");
+                    assert!(
+                        !action
+                            .accessible_description()
+                            .unwrap_or_default()
+                            .is_empty(),
+                        "{gate}: disabled {label} explains why"
+                    );
+                    action.invoke_accessible_default_action();
+                }
+                assert!(actions.borrow().is_empty(), "{gate} dispatched transport");
+                ui.set_selected_missing(false);
+                ui.set_library_busy(false);
+            }
+            confirm_transport(&ui, PlaybackState::Ready, 0.0);
+            for (label, mono) in if chinese {
+                [("循环整个声音", false), ("单声道监听", true)]
+            } else {
+                [("Repeat sound", false), ("Mono monitoring", true)]
+            } {
+                let action = player_action(&ui, label);
+                assert_eq!(action.accessible_checkable(), Some(true));
+                for _ in 0..2 {
+                    let previous = action.accessible_checked().unwrap();
+                    action.invoke_accessible_default_action();
+                    assert_eq!(action.accessible_checked(), Some(!previous));
+                    assert_eq!(
+                        if mono {
+                            ui.get_audition_mono()
+                        } else {
+                            ui.get_audition_repeat()
+                        },
+                        !previous
+                    );
+                }
+            }
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn classic_transport_pointer_feedback_cancels_cleanly_and_preserves_input_focus() {
+    init_backend();
+    for id in [DEFAULT_THEME, DEFAULT_V2_THEME] {
+        for motion in [0.0, 1.0] {
+            let ui = fixture(false);
+            apply_theme(&ui, id);
+            ui.global::<crate::Theme>().set_motion(motion);
+            let plays = Rc::new(RefCell::new(0));
+            let observed = plays.clone();
+            ui.on_start_requested(move || *observed.borrow_mut() += 1);
+            ui.show().unwrap();
+            frame(&ui, "classic-pointer-fixture");
+            ui.set_perf_marker_enabled(true);
+            ui.invoke_perf_focus_search();
+            let action = player_action(&ui, "Play");
+            let origin = action.absolute_position();
+            let size = action.size();
+            let position = control_center(&action);
+            let away = slint::LogicalPosition::new(position.x, origin.y + size.height * 2.0);
+            ui.window()
+                .dispatch_event(WindowEvent::PointerMoved { position: away });
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+            let idle = control_pixels(&ui, &action);
+            ui.window()
+                .dispatch_event(WindowEvent::PointerMoved { position });
+            let _ = control_pixels(&ui, &action);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(150));
+            let hover = control_pixels(&ui, &action);
+            assert_ne!(idle, hover, "{id}/{motion}: hover is visible");
+            pointer_down(&ui, position);
+            assert_eq!(*plays.borrow(), 0, "Press waits for release");
+            let _ = control_pixels(&ui, &action);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(150));
+            assert_ne!(hover, control_pixels(&ui, &action), "Press is visible");
+            ui.window()
+                .dispatch_event(WindowEvent::PointerMoved { position: away });
+            pointer_up(&ui, away);
+            assert_eq!(*plays.borrow(), 0, "Release outside cancels activation");
+            pointer_down(&ui, position);
+            pointer_up(&ui, position);
+            assert_eq!(*plays.borrow(), 1, "One click invokes Play once");
+            assert_eq!(action.absolute_position(), origin);
+            assert_eq!(action.size(), size);
+            key(&ui, "x".into());
+            assert_eq!(
+                ui.get_query(),
+                "x",
+                "Player click retains search input focus"
+            );
+            ui.window()
+                .dispatch_event(WindowEvent::PointerMoved { position: away });
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
+            let settled = control_pixels(&ui, &action);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1000));
+            assert_eq!(settled, control_pixels(&ui, &action), "Feedback settles");
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn classic_transport_pointer_gesture_cannot_cross_disabled_state_transitions() {
+    use audiolib_audio::PlaybackState;
+
+    init_backend();
+    for id in [DEFAULT_THEME, DEFAULT_V2_THEME] {
+        for motion in [0.0, 1.0] {
+            let ui = fixture(false);
+            apply_theme(&ui, id);
+            ui.global::<crate::Theme>().set_motion(motion);
+            let plays = Rc::new(RefCell::new(0));
+            let observed = plays.clone();
+            ui.on_start_requested(move || *observed.borrow_mut() += 1);
+            ui.show().unwrap();
+            frame(&ui, "classic-pointer-transition-fixture");
+
+            for (disabled, position, enabled, next_position) in [
+                (PlaybackState::Loading, 0.0, PlaybackState::Ready, 0.0),
+                (PlaybackState::Playing, 25.0, PlaybackState::Ended, 100.0),
+            ] {
+                *plays.borrow_mut() = 0;
+                confirm_transport(&ui, disabled, position);
+                let action = player_action(&ui, "Play");
+                assert_eq!(action.accessible_enabled(), Some(false));
+                assert!(
+                    !action
+                        .accessible_description()
+                        .unwrap_or_default()
+                        .is_empty(),
+                    "A disabled control retains its explanatory hover hint"
+                );
+                let position = control_center(&action);
+                pointer_down(&ui, position);
+                confirm_transport(&ui, enabled, next_position);
+                assert_eq!(action.accessible_enabled(), Some(true));
+                pointer_up(&ui, position);
+                assert_eq!(
+                    *plays.borrow(),
+                    0,
+                    "{id}/{motion}/{disabled:?}: enabling during a held pointer cannot arm Play"
+                );
+                pointer_down(&ui, position);
+                pointer_up(&ui, position);
+                assert_eq!(
+                    *plays.borrow(),
+                    1,
+                    "A fresh enabled click fires exactly once"
+                );
+            }
+
+            *plays.borrow_mut() = 0;
+            confirm_transport(&ui, PlaybackState::Ready, 0.0);
+            let action = player_action(&ui, "Play");
+            let position = control_center(&action);
+            pointer_down(&ui, position);
+            confirm_transport(&ui, PlaybackState::Loading, 0.0);
+            assert_eq!(action.accessible_enabled(), Some(false));
+            confirm_transport(&ui, PlaybackState::Ready, 0.0);
+            assert_eq!(action.accessible_enabled(), Some(true));
+            pointer_up(&ui, position);
+            assert_eq!(
+                *plays.borrow(),
+                0,
+                "{id}/{motion}: disabling invalidates an already armed pointer gesture"
+            );
+            pointer_down(&ui, position);
+            pointer_up(&ui, position);
+            assert_eq!(
+                *plays.borrow(),
+                1,
+                "A fresh enabled click still fires exactly once"
+            );
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn classic_transport_keyboard_releases_once_and_cancels_on_focus_loss() {
+    init_backend();
+    for id in [DEFAULT_THEME, DEFAULT_V2_THEME] {
+        for chinese in [false, true] {
+            let ui = fixture(chinese);
+            apply_theme(&ui, id);
+            let changes = Rc::new(RefCell::new(Vec::new()));
+            let observed = changes.clone();
+            ui.on_transform_requested(move |_, _, _, repeat| {
+                observed.borrow_mut().push(repeat);
+            });
+            ui.show().unwrap();
+            frame(&ui, "classic-keyboard-fixture");
+            let field = player_action(
+                &ui,
+                if chinese {
+                    "变调半音，回车或离开时应用"
+                } else {
+                    "Pitch semitones, applied on Enter or focus loss"
+                },
+            );
+            let position = control_center(&field);
+            pointer_down(&ui, position);
+            pointer_up(&ui, position);
+            // Repeat immediately precedes Pitch in the transport's tab order.
+            key(&ui, Key::Backtab.into());
+            changes.borrow_mut().clear();
+            for activation in [slint::SharedString::from(" "), Key::Return.into()] {
+                let previous = ui.get_audition_repeat();
+                for _ in 0..3 {
+                    ui.window().dispatch_event(WindowEvent::KeyPressed {
+                        text: activation.clone(),
+                    });
+                }
+                assert_eq!(ui.get_audition_repeat(), previous, "Wait for key release");
+                let before = changes.borrow().len();
+                ui.window()
+                    .dispatch_event(WindowEvent::KeyReleased { text: activation });
+                assert_eq!(ui.get_audition_repeat(), !previous);
+                assert_eq!(
+                    changes.borrow().len(),
+                    before + 1,
+                    "Ignore repeated key-down"
+                );
+            }
+            let previous = ui.get_audition_repeat();
+            ui.window()
+                .dispatch_event(WindowEvent::KeyPressed { text: " ".into() });
+            pointer_down(&ui, position);
+            pointer_up(&ui, position);
+            ui.window()
+                .dispatch_event(WindowEvent::KeyReleased { text: " ".into() });
+            assert_eq!(
+                ui.get_audition_repeat(),
+                previous,
+                "Focus loss cancels the key"
+            );
+            ui.hide().unwrap();
+        }
+    }
+}
+
 fn image_from(color: [u8; 4], mask: bool) -> Image {
     let mut bytes = vec![0; 64 * 32 * 4];
     for y in 0..32 {
@@ -369,7 +912,14 @@ fn live_theme_switch_keeps_record_anchor_and_reports_only_the_active_viewport() 
     let observed = ranges.clone();
     ui.on_result_range_requested(move |direction| observed.borrow_mut().push(direction));
     let expected = AuditionState::capture(&ui);
-    for id in [STUDIO_THEME, DEFAULT_THEME, STUDIO_THEME, DEFAULT_THEME] {
+    for id in [
+        STUDIO_THEME,
+        DEFAULT_V2_THEME,
+        STUDIO_THEME,
+        DEFAULT_THEME,
+        DEFAULT_V2_THEME,
+        DEFAULT_THEME,
+    ] {
         windows.borrow_mut().clear();
         apply_theme(&ui, id);
         let scheduled_y = ui.get_task_result_scroll_y();
@@ -380,7 +930,7 @@ fn live_theme_switch_keeps_record_anchor_and_reports_only_the_active_viewport() 
         frame(&ui, &format!("studio-viewport-{id}"));
         let row_height = ui.get_task_result_row_height();
         let actual_y = ui.get_task_result_scroll_y();
-        if id == STUDIO_THEME {
+        if id != DEFAULT_THEME {
             assert!(row_height > classic_row_height);
         } else {
             assert_eq!(row_height, classic_row_height);

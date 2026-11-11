@@ -15,15 +15,22 @@ mod list_waveforms;
 mod mode_switch_scroll_tests;
 #[cfg(test)]
 mod pane_review_tests;
+mod panic_diagnostics;
 #[cfg(test)]
 mod playback_repaint_tests;
 mod progressive_waveform;
 #[cfg(test)]
 mod responsive_layout_tests;
 #[cfg(test)]
+mod search_scope_tests;
+#[cfg(test)]
 mod search_task_ui_tests;
 #[cfg(test)]
+mod search_v2_ui_tests;
+#[cfg(test)]
 mod sidebar_section_tests;
+mod slice_jobs;
+mod slice_staging;
 mod startup;
 #[cfg(test)]
 mod studio_review_tests;
@@ -40,6 +47,9 @@ mod ui_scale_tests;
 #[cfg(test)]
 mod ui_tests;
 mod updates;
+mod waveform_cursor;
+#[cfg(test)]
+mod waveform_selection_ui_tests;
 mod waveform_view;
 mod window_layout;
 mod window_repaint;
@@ -211,15 +221,24 @@ fn run() -> Result<()> {
         .with_writer(writer)
         .try_init()
         .ok();
-    // Release builds have no console: record every panic, worker threads' included,
-    // in the log before the default hook runs.
+    // Pre-open a best-effort synchronous sink before any audio/UI worker starts.
+    // A missing/unwritable diagnostic file must not prevent normal startup.
+    let panic_log = panic_diagnostics::PanicLog::open(&config.paths.logs).ok();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        if let Some(log) = &panic_log {
+            log.record(info, &thread, &backtrace);
+        }
+        let location = info.location();
         tracing::error!(
             thread = thread.name().unwrap_or("unnamed"),
-            backtrace = %std::backtrace::Backtrace::force_capture(),
-            "Panic: {info}"
+            source_file = location.map_or("unknown", |value| value.file()),
+            source_line = location.map_or(0, |value| value.line()),
+            source_column = location.map_or(0, |value| value.column()),
+            backtrace = %backtrace,
+            "Panic (payload omitted from diagnostics)"
         );
         default_hook(info);
     }));
@@ -276,7 +295,14 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    // Preserve the normal backend/renderer selection while allowing the winit
+    // event-loop owner to install native Waveform cursor images after input.
+    slint::BackendSelector::new()
+        .with_winit_custom_application_handler(waveform_cursor::application_handler())
+        .select()
+        .context("Initialize desktop cursor backend")?;
     let ui = AppWindow::new().context("Create desktop window")?;
+    waveform_cursor::install(&ui);
     #[cfg(target_os = "macos")]
     let _native_quit_guard = {
         let close_ui = ui.as_weak();

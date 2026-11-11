@@ -12,6 +12,7 @@ param(
     [switch]$TestBoundaries
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
 Set-StrictMode -Version Latest
 if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw 'Use PowerShell 7.3 or newer.' }
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -246,6 +247,8 @@ foreach ($mapping in $taskManifest.files) {
     if (!$taskAllowed.Add((Path-Key ('Contents/Resources/' + $mapping.destination)))) { throw 'Duplicate resource destination.' }
 }
 $taskNoticesPath = Join-Path $BundlePath 'Contents/Resources/licenses/dependencies.json'
+$null=$taskAllowed.Add((Path-Key 'Contents/Resources/licenses/inventory.json'))
+$null=Test-AudioLibLicenseBundle -PayloadRoot $BundlePath -Prefix 'Contents/Resources/licenses' -ExpectedRoots @('audiolib-desktop','audiolib-cli') -Target 'aarch64-apple-darwin' -NoDefaultFeatures -ExpectedArtifacts @() -SignedBundle
 $taskNotices = @([IO.File]::ReadAllText($taskNoticesPath) | ConvertFrom-Json)
 $noticeIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($notice in $taskNotices) {
@@ -266,8 +269,8 @@ foreach ($key in $taskExpected.Keys) {
     $canonicalPath = $null
     if (!$taskAllowed.TryGetValue($key, [ref]$canonicalPath) -or $key -cne $canonicalPath) { throw 'File report differs from the exact resource/license paths.' }
 }
-$soundNotices = @($taskNotices | Where-Object { $_.name -ceq 'soundtouch-ffi' -and 'SoundTouch-LGPL.txt' -cin $_.files })
-if (!$noticeIds.Contains('slint-1.17.1') -or !$noticeIds.Contains('soundtouch-0.5.4') -or $soundNotices.Count -ne 1 -or
+$soundNotices = @($taskNotices | Where-Object { $_.name -ceq 'soundtouch-ffi' -and $_.version -ceq '0.4.1' -and 'SoundTouch-LGPL.txt' -cin $_.files })
+if (!$noticeIds.Contains('slint-1.17.1') -or !$noticeIds.Contains('soundtouch-ffi-0.4.1') -or $soundNotices.Count -ne 1 -or
     !$taskExpected.ContainsKey('Contents/Resources/licenses/slint-1.17.1/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md')) { throw 'Required Slint/SoundTouch license materials are missing.' }
 function Assert-BundleFiles([string]$Root, [bool]$CheckModes = $true) {
     Assert-Tree $Root

@@ -11,9 +11,11 @@ Maintained by [Maomao (pangqichenmmm)](https://github.com/pangqichenmmm), based 
 开源免费的音效库管理软件（SFX 音效浏览、检索、试听、元数据管理），面向声音设计、游戏音频和影视拟音（Foley），可作为 Soundminer 的开源替代方案。
 
 - 三种部署方式：纯客户端单机、客户端加局域网服务端、客户端加公网域名服务端。
-- 针对公网音频流预览做了专门优化，试听做到 0 延迟。
-- 服务端数据库同步到本地，搜索 0 延迟。
-- 支持「基础目录 + 关键词」交叉索引搜索。
+- 公网音频流支持缓存和按需读取，减少试听等待。
+- 服务端数据库同步到本地快照，搜索直接在客户端执行。
+- 支持「主字段」「全部」「仅路径」「仅文件名」四种搜索范围，可与目录和筛选条件组合；路径范围需要准备目录索引。
+- 扫描与试听 WAV/BWF、MP3、AIFF、FLAC、Ogg Vorbis 和 OGA/Ogg FLAC；提取内嵌 Metadata。Opus 仅支持标签探测，不支持播放。
+- 本地和服务器模式支持厂商 CSV/TSV/TXT/XLS/XLSX Metadata 导入：先预览和确认匹配，再提交，可回滚导入。
 - 可承载 10 TB 以上的大规模音效素材库。
 
 **AudioLib Explorer helps sound designers build a sound-effects library of their own.**
@@ -21,19 +23,21 @@ Maintained by [Maomao (pangqichenmmm)](https://github.com/pangqichenmmm), based 
 A free, open-source sound effects (SFX) library manager for sound design, game audio and Foley: browse, search, preview and tag audio files. An open-source alternative to Soundminer.
 
 - Three deployment modes: standalone client, client with a LAN server, or client with a server on a public domain.
-- Audio streaming over the internet is specifically optimized for zero-latency preview.
-- The library database syncs to the client for zero-latency search.
-- Search combines a base folder with keywords as a cross index.
+- Internet audio streaming uses caching and on-demand reads to reduce preview waits.
+- The library database syncs to a local snapshot for client-side search.
+- Four search scopes—Main fields, All, Path and Filename—combine with folders and filters. Path requires a prepared directory index.
+- Scan and play WAV/BWF, MP3, AIFF, FLAC, Ogg Vorbis and OGA/Ogg FLAC, with embedded Metadata extraction. Opus supports tag probing only, without playback.
+- Import vendor CSV/TSV/TXT/XLS/XLSX Metadata locally or on the server: preview and confirm matches before committing, with import rollback.
 - Scales to sound libraries of 10 TB and more.
 
 ![AudioLib Explorer main window / 主界面](resources/screenshot-main.png)
 
-AudioLib Explorer is a fast, local-first sound-effects library manager written in Rust with a [Slint](https://slint.dev) desktop UI. It indexes large WAV libraries into SQLite (FTS5), previews sounds through WASAPI (optionally ASIO) on Windows, and can browse a remote library served by `audiolib-server`. The macOS arm64 client uses CoreAudio. Version 0.8.4 adds Linux x64 server and Docker amd64/arm64 deliverables.
+AudioLib Explorer is a fast, local-first sound-effects library manager written in Rust with a [Slint](https://slint.dev) desktop UI. It indexes WAV/BWF, MP3, AIFF, FLAC and Ogg libraries into SQLite (FTS5), previews sounds through WASAPI (optionally ASIO) on Windows, and can browse a remote library served by `audiolib-server`. The macOS arm64 client uses CoreAudio. Version 0.8.4 added Linux x64 server and Docker amd64/arm64 deliverables. This README describes the current development source; published packages retain the features and identity of their own release tag.
 
-- **Source development version:** 0.8.7 (workspace `Cargo.toml`)
-- **HTTP API:** `/api/v1/` (client and server)
-- **Database schema:** 8 (snapshot schema range 3..=8; only explicitly recognized complete formats are readable)
-- **Writable library format:** `ale-s8-cld1-t3-m2-p1-a1`; recognized schema 3–7 formats are read-only migration sources. Schema 8 shares albums and retains Metadata as original JSON TEXT. Metadata compression is deferred; snapshot transport still uses zstd.
+- **Published release:** [v0.9.5](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.9.5), published 2026-11-10. All seven packages, fourteen online assets and checksums, platform acceptance and fixed-install synchronization are recorded in the [0.9.5 release record](doc/Rust_Release_0.9.5.md). The payload source remains final main/tag `7d7a60b`; later documentation does not rebuild or replace those bytes.
+- **HTTP API:** `/api/v1/` for library/audio operations; `/api/vendor-import/` for managed vendor import
+- **Database schema:** ordinary local writers use 8; explicit server migration can publish 9. Known complete schema 3–9 snapshots are readable only after format validation.
+- **Writable library format:** base formats are `ale-s8-cld1-t3-m2-p1-a1` locally and `ale-s9-cld1-t3-m2-p1-a1-sd1` for the dedicated server writer. The first successful extended-source write atomically enables required `audio_sources:1` and the corresponding `-af1` format; older clients must upgrade, as described in the [compatibility contract](doc/api/Library_Migration_Compatibility.md). Client snapshots stay read-only. Shared albums and original Metadata JSON TEXT are retained; Metadata compression is deferred, while snapshot transport uses zstd.
 - **License:** [GPL-3.0-only](LICENSE)
 
 The program version is read from the workspace `Cargo.toml` and is shared by the client, CLI and server. Current formats are defined by the [compatibility catalog](crates/audiolib-core/src/compatibility.rs); the [historical schema v6 contract](doc/api/Schema_V6_Iteration.md) describes the earlier format.
@@ -88,7 +92,7 @@ if (!(Test-Path -LiteralPath $serverConfig)) {
 }
 ```
 
-Edit that configuration before starting: replace the Unix `library_db` and `[[roots]].server_path` examples with the existing Windows database and real audio directories. Use TOML literal strings for Windows paths, for example `library_db = 'C:\ProgramData\AudioLibServer\library.db'` and `server_path = 'D:\Sounds'`. Keep any existing configured library and data paths when upgrading. For FLAC previews, install ffmpeg separately and set an absolute path such as `ffmpeg_path = 'C:\Tools\ffmpeg\bin\ffmpeg.exe'`; the default is the macOS Homebrew path `/opt/homebrew/bin/ffmpeg`. Without ffmpeg, FLAC previews return 503 `TRANSCODER_UNAVAILABLE`; PCM previews and direct streams remain available.
+Edit that configuration before starting: replace the Unix `library_db` and `[[roots]].server_path` examples with the existing Windows database and real audio directories. Use TOML literal strings for Windows paths, for example `library_db = 'C:\ProgramData\AudioLibServer\library.db'` and `server_path = 'D:\Sounds'`. Keep any existing configured library and data paths when upgrading. Optional server-transcoded FLAC previews (`/audio/{id}/preview?codec=flac`) need a separate ffmpeg installation and an absolute path such as `ffmpeg_path = 'C:\Tools\ffmpeg\bin\ffmpeg.exe'`; the default is the macOS Homebrew path `/opt/homebrew/bin/ffmpeg`. Without ffmpeg, that transcoding endpoint returns 503 `TRANSCODER_UNAVAILABLE`. Native FLAC/Vorbis playback through direct streams uses the bundled decoder; it does not require ffmpeg.
 
 Start with the explicit configuration:
 
@@ -114,7 +118,7 @@ Register it as a LaunchAgent based on [`server/deploy/launchd/io.github.audiolib
 - `EnvironmentVariables` must set `AUDIOLIB_LAUNCHD_LABEL` to exactly the same value as `Label`, and `KeepAlive` must be enabled; otherwise the service is not relaunched after an automatic update.
 - The example runs `audiolib-launcher /bin/sh run.sh`. Create `run.sh` yourself: it reads the token from a file with `chmod 600` permissions, exports `AUDIOLIB_SERVER_TOKEN` and `exec`s `audiolib-server --config <config.toml>` (see the comment in the plist). Without the launcher, drop the first `ProgramArguments` entry.
 
-Check it with `GET /api/v1/health` (for example `curl http://<server-host>:8790/api/v1/health`); all API routes are under `/api/v1/` (bare `/health` returns 404).
+Check it with `GET /api/v1/health` (for example `curl http://<server-host>:8790/api/v1/health`); library/audio routes use `/api/v1/` (bare `/health` returns 404), while managed vendor imports use `/api/vendor-import/`.
 
 If the library is on an external or network volume, click Allow when macOS asks, or grant `audiolib-server` in System Settings → Privacy & Security → Full Disk Access. The release package does not include a launcher. To avoid granting access again after each binary swap, you can optionally build [`server/launcher`](server/launcher/README.md) from source (`server/launcher/build.sh`), make it the first `ProgramArguments` entry and grant the permission to the launcher instead. Full details: [server/README.md](server/README.md) and [server/deploy/README.md](server/deploy/README.md).
 
@@ -131,18 +135,45 @@ from a chmod 600 file and execs audiolib-server --config <config.toml>; drop the
 Confirm GET http://<server-host>:<port>/api/v1/health returns ok. Do not commit or print tokens.
 ```
 
+### Linux server and Docker
+
+Verify `AudioLibServer-<tag>-linux-x64.tar.gz` and extract it. `audiolib-server` and `audiolib-migrate` are at the archive root. Copy `server/audiolib-server/config.example.toml`, set `library_db` to an existing database, set each `[[roots]].server_path`, and set `bind` to the listen address. The example systemd unit is [`server/deploy/systemd/audiolib-server.service`](server/deploy/systemd/audiolib-server.service): user `audiolib`, token in `/etc/audiolib/audiolib.env`, config `/etc/audiolib/config.toml`. Its sandbox allows writes under `/var/lib/audiolib` and read-only access to `/srv/audiolib/music`; another path needs an override. Standalone Linux arm64 archives are not published.
+
+Docker releases use `AudioLibServer-<tag>-docker-linux-amd64.tar.gz` and `AudioLibServer-<tag>-docker-linux-arm64.tar.gz`. Verify the `.sha256`, `docker load` the image, and recreate the container from [`server/deploy/docker/docker-compose.release.yml`](server/deploy/docker/docker-compose.release.yml). Place an existing `library.db` at `/data/library.db` first. The image config uses `auth_mode = "all"`, `trust_lan_peers = false` and `manage_mode = "off"`, so set `AUDIOLIB_SERVER_TOKEN` and mount your own config when clients should scan. In-container updates are disabled; replace the image. The image health check calls `/api/v1/health` and requires `"status":"ok"`.
+
+### Upgrade, health and a client
+
+Stop the process after scans drain. Keep the config, library, tokens and audio directories. Native Windows, macOS arm64 and Linux x64 servers update from the admin page once the 0.9 layout (`audiolib-server` beside `audiolib-migrate`) is installed; the program directory must be writable. The first move off a pre-0.9 package is a manual extract, because that updater rejects the added migrator. Docker upgrades replace the image and keep the data volume.
+
+0.9.5 retains the 0.9.4 write-target schemas 8/9; the first successful extended-source write enables AF1, so upgrade clients before scanning new formats. Schema 9 is explicit: `audiolib-migrate status --db /path/to/library.db`, then `audiolib-migrate start --db /path/to/library.db` (`pause`, `resume`, `cancel` and `rollback` use the same `--db`). The tool keeps `audiolib-rollback-mig9-*.db` beside the library. Replacing the binary does not downgrade schema 9. Full steps: [Server deployment](doc/Server_Deployment.md).
+
+`GET /api/v1/health` needs no token and returns HTTP 200. `"status":"ok"` means the library is open; `"starting"` means other routes answer 503 `UNAVAILABLE`; `"error"` means open failed and the process keeps retrying. Bare `/health` is 404.
+
+```sh
+curl -fsS "http://<server-host>:<port>/api/v1/health"
+```
+
+In the desktop client open **Manage sound library** (Ctrl+D), add a server at `http://<server-host>:<port>` or `https://audiolib.example.com`, test the connection, then sync. A LAN-direct client can omit the token when `auth_mode` is `external`. Search uses the local snapshot.
+
+## Managing sound libraries on the server
+
+The server indexes one library. Add a root in `[[roots]]`, on the LAN admin page, or in the client's **Manage sound library** page (**+ Add sound root**) when `manage_mode` allows it. Removing a root deletes indexed records and leaves the audio files in place. Use an incremental scan for new and changed files; a clean full scan also marks files that are gone. The same scan imports sidecar CSV/TSV/XLS/XLSX Metadata, including a sheet that lives in `{stem}--Docs` or `{stem}--Sounds*` and matches WAV files in same-stem sibling directories. Clients see new rows after the snapshot sync. Embedded covers are requested separately and are not stored in the snapshot. A per-file failure such as `Audio: Truncated WAV chunk …` or `Audio: Unsupported Ogg audio identification packet` is kept on the scan and stops that full scan from marking other files missing.
+
+Steps, sibling-directory rules and troubleshooting: [Managing sound libraries on the server](doc/Server_Library_Guide.md).
+
 ## Features
 
 - Up to 30 independent search-task tabs (limit adjustable in Appearance; existing saved limits are retained), with separate folders, filters and list state, personal saved searches and restored sessions. Overflow arrows keep the new-task button visible. See [Search Tasks](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Search_Tasks.md).
-- Incremental and full folder scans with professional WAV metadata extraction (BWF `bext`, iXML, INFO, ID3, XMP, Soundminer SMED read-only compatibility). Source WAV files are never modified.
-- SQLite FTS5 search with letter fragments of at least two characters (`expl`, `plos` and `sion` match `explosion`), Chinese segmentation (jieba-rs), tag/category filters and a documented target of P95 < 500 ms for 1M+ records.
+- Incremental and full folder scans for WAV, FLAC, Ogg Vorbis and OGA/Ogg FLAC. WAV Metadata includes BWF `bext`, iXML, INFO, ID3, XMP and Soundminer SMED read-only compatibility; bounded Vorbis extraction retains Chinese text and repeated values. Rescans preserve user annotations. Source audio files are never modified. OpusTags can be probed separately, but `.opus` is not scanned by default and Opus playback is unsupported.
+- Four search scopes: **Main fields** searches filenames and Metadata; **All** also includes directory names; **Path** searches directory names and ancestors; **Filename** restricts the search to filenames. Path needs a prepared directory index; without one, All uses Main fields. SQLite FTS5 supports letter fragments of at least two characters (`expl`, `plos` and `sion` match `explosion`), Chinese segmentation (jieba-rs) and tag/category filters. The performance target remains **P95 latency <500ms for 1M+ records**.
+- Vendor Metadata import in local and server modes: CSV/TSV/TXT/XLS/XLSX parsing, mapping previews, explicit ambiguous-match confirmation, recoverable commits and rollback. Server sources can be uploaded tables or a relative directory under a configured server root. Original embedded Metadata and user annotations are preserved. See the [managed server preview API](doc/api/README.md#vendor-import-preview).
 - Playback with streaming decode, device-rate resampling, waveform and spectral views, independent pitch/rate audition (SoundTouch), WASAPI and optional ASIO output.
 - Library management: add folders, repair moved or renamed files, batch annotations, backup/restore, integrity checks, JSONL/CSV exchange.
 - Command-line tool `AudioLibCli` (JSON/table/CSV output, library management, remote playback control of a running desktop instance).
 - Server mode: `server/audiolib-server` exposes one library over `/api/v1/` (snapshots, range streaming, previews, waveforms, token authentication, LAN-only admin page). The client opens a validated read-only snapshot; annotations and management writes use identity-bound HTTP requests. Tested older servers (0.4.11 and 0.5.0) remain readable.
 - Bilingual (Chinese/English) user interface.
 
-Before migrating the server library to the current format, upgrade clients to versions that support that format, then migrate during a maintenance window. Real library writes require a valid modern compatibility catalog that explicitly supports the server's complete current format. Deprecated playback routes remain no-ops; HTTP 200 does not guarantee an old client's DTO can decode the response. Playback history stays on each client. See the [historical v6 contract](doc/api/Schema_V6_Iteration.md) for the playback-history transition.
+Plan an explicit server schema-8→9 migration during a maintenance window. Modern clients can read native9 snapshots; the default-enabled `legacy_snapshot_enabled` transition can serve older readers a separate WAV-only schema-8 snapshot. These older peers still cannot write the schema-9 source. Disabling the transition requires them to upgrade and preserves their last valid offline cache. Real library writes always require a compatibility catalog supporting the actual complete source format. Playback history stays on each client. See [server-mode compatibility](doc/Rust_Remote_Mode.md#sync-and-the-snapshot-cache) and the [historical v6 contract](doc/api/Schema_V6_Iteration.md).
 
 ## Build
 
@@ -166,7 +197,7 @@ Build the Mac client on an Apple Silicon Mac with Xcode command-line tools, the 
 $releaseCommit = (git rev-parse HEAD).Trim()
 $buildProof = Join-Path ([IO.Path]::GetTempPath()) ('audiolib-mac-build-' + [guid]::NewGuid().ToString('N') + '.json')
 pwsh ./tools/build-macos-client.ps1 -ExpectedCommit $releaseCommit -ReportPath $buildProof
-pwsh ./tools/package-macos-client.ps1 -Tag v0.8.7 -ExpectedCommit $releaseCommit -BuildReport $buildProof -ValidateRuntime
+pwsh ./tools/package-macos-client.ps1 -Tag v0.9.5 -ExpectedCommit $releaseCommit -BuildReport $buildProof -ValidateRuntime
 ```
 
 Run the Mac packaging command in a logged-in desktop session to complete structural and native acceptance together once. If that session is unavailable, omit `-ValidateRuntime` and complete runtime acceptance later. Run `validate-macos-client.ps1` separately only if runtime acceptance was deferred, artifacts changed or a different host must verify them; see the [Mac client guide](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/MACOS_README.md). Structural checks alone record runtime validation as `not-run`.
@@ -207,7 +238,7 @@ cp server/audiolib-server/config.example.toml /etc/audiolib/config.toml   # edit
 audiolib-server --config /etc/audiolib/config.toml
 ```
 
-**Deployment & usage guide:** [server/README.md](server/README.md) (build, first use, client connection, internet access) and [server/deploy/README.md](server/deploy/README.md) (systemd/launchd/Docker, upgrade, backup). See [server/README.md](server/README.md) for configuration, authentication and deployment (systemd, launchd, Docker examples) and [doc/api/README.md](doc/api/README.md) for the API contract. For internet access put the server behind a TLS reverse proxy and use tokens.
+**Deployment & usage guide:** [Server deployment](doc/Server_Deployment.md) and [Managing sound libraries on the server](doc/Server_Library_Guide.md). Platform units and the admin page remain in [server/README.md](server/README.md) and [server/deploy/README.md](server/deploy/README.md). The HTTP contract is [doc/api/README.md](doc/api/README.md). For internet access put the server behind a TLS reverse proxy and use tokens.
 
 ## Versioning
 

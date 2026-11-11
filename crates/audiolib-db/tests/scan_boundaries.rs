@@ -32,7 +32,7 @@ fn count(provider: &SqliteProvider, query: &str) -> u64 {
 }
 
 #[test]
-fn nonrecursive_reconciliation_keeps_descendants_and_legacy_non_wav_records() {
+fn nonrecursive_reconciliation_keeps_descendants_and_unsupported_records() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("audio");
     fs::create_dir_all(root.join("child")).unwrap();
@@ -51,8 +51,8 @@ fn nonrecursive_reconciliation_keeps_descendants_and_legacy_non_wav_records() {
     let conn = Connection::open(provider.database_path()).unwrap();
     audiolib_db::register_library_functions(&conn).unwrap();
     conn.execute(
-        "INSERT INTO audio_files(file_path,filename) VALUES(?1,'legacy.mp3')",
-        params![root.join("legacy.mp3").to_string_lossy()],
+        "INSERT INTO audio_files(file_path,filename) VALUES(?1,'legacy.opus')",
+        params![root.join("legacy.opus").to_string_lossy()],
     )
     .unwrap();
     fs::remove_file(root.join("direct.wav")).unwrap();

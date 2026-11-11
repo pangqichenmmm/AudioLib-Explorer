@@ -59,14 +59,19 @@ impl HiddenRecords {
                 .is_some_and(|folder| self.folders.contains(&folder))
     }
 
-    /// Drop hidden rows from a result page. The total only loses the rows of this page
-    /// (other pages are not read); the resync corrects it.
+    /// Drop hidden rows without pretending to know their query-wide membership.
+    /// Subtracting all known removals gives a conservative lower bound; the
+    /// currently visible rows remain a proven minimum even for unrelated removals.
     fn filter_page(&self, page: &mut SearchPage) {
         let before = page.results.len();
         page.results.retain(|file| !self.hides(file));
         let dropped = before - page.results.len();
         page.returned_count = page.returned_count.saturating_sub(dropped);
-        page.total_count = page.total_count.saturating_sub(dropped as u64);
+        page.total_count = page
+            .total_count
+            .saturating_sub(self.removed.max(self.ids.len() as u64))
+            .max(page.returned_count as u64);
+        page.total_count_exact = false;
     }
 
     fn filter_folders(&self, folders: &mut Vec<Folder>) {
@@ -79,6 +84,49 @@ impl HiddenRecords {
             && state.is_none_or(|state| {
                 state.library_id != self.library_id || state.revision > self.since
             })
+    }
+}
+
+/// Outcome of draining server-upgrade notices for one server library this session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct UpgradeNoticeOutcome {
+    pub text: Option<String>,
+    /// At least one drained notice should open the existing "check for updates" flow.
+    pub offer_update_check: bool,
+}
+
+/// Server upgrade notices not shown yet for `(url, library_id)` in this session
+/// (each kind once; migration progress every time), joined for the status line. Never starts
+/// a download or install: the user updates through the existing update check.
+pub(super) fn upgrade_notice(
+    url: &str,
+    library_id: &str,
+    status: &audiolib_core::server_upgrade::ServerUpgradeStatus,
+    chinese: bool,
+) -> UpgradeNoticeOutcome {
+    use audiolib_core::server_upgrade::NoticeSession;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SESSIONS: OnceLock<Mutex<HashMap<(String, String), NoticeSession>>> = OnceLock::new();
+    let mut sessions = SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let notices = sessions
+        .entry((url.to_string(), library_id.to_string()))
+        .or_default()
+        .take(status);
+    let current = env!("CARGO_PKG_VERSION");
+    let offer_update_check = notices
+        .iter()
+        .any(|notice| notice.offers_update_check_for(current));
+    let texts: Vec<String> = notices
+        .into_iter()
+        .map(|notice| notice.text(chinese))
+        .collect();
+    UpgradeNoticeOutcome {
+        text: (!texts.is_empty()).then(|| texts.join(" ")),
+        offer_update_check,
     }
 }
 
@@ -96,6 +144,18 @@ pub(super) struct ServerManage {
 }
 
 impl ServerManage {
+    /// Keep a pending capability lookup usable, then disable unsupported peers.
+    pub(super) fn path_search_offered(&self) -> bool {
+        self.capabilities.as_ref().is_none_or(|capabilities| {
+            capabilities.schema_migration.is_some()
+                || capabilities.compatibility.as_ref().is_some_and(|manifest| {
+                    manifest
+                        .features
+                        .get(audiolib_core::server_upgrade::SEARCH_PATH_FEATURE)
+                        == Some(&audiolib_core::server_upgrade::SEARCH_PATH_REVISION)
+                })
+        })
+    }
     #[cfg(test)]
     pub(super) fn allowed_for_test(url: &str) -> Self {
         Self {
@@ -104,6 +164,16 @@ impl ServerManage {
             note: String::new(),
             capabilities: None,
         }
+    }
+
+    /// §4 vendor import limits when this PC may manage and the server offers it.
+    pub(super) fn vendor_import(&self) -> Option<audiolib_core::server_upgrade::VendorImportInfo> {
+        if !self.can_manage {
+            return None;
+        }
+        self.capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.vendor_import.clone())
     }
 
     /// `/capabilities` of `server_url`, once read after the latest sync.
@@ -263,22 +333,38 @@ impl Controller {
         true
     }
 
-    /// Ask the active server's `/capabilities` for the menu gate (after each sync).
+    /// Ask the active server's `/capabilities` for the menu gate (after each sync
+    /// and after a cached snapshot is opened).
     pub(crate) fn refresh_server_manage(self: &Arc<Self>) {
         let settings = self.config.lock().unwrap().data_source.clone();
+        let generation = self.library_generation.load(Ordering::Acquire);
+        let library_id = self
+            .remote
+            .lock()
+            .unwrap()
+            .state
+            .as_ref()
+            .map(|state| state.library_id.clone());
         let secrets = self.secrets();
         let chinese = self.chinese.load(Ordering::Acquire);
         let c = self.clone();
         std::thread::spawn(move || {
+            let mut upgrade = None;
             let manage = match RemoteClient::new(&settings.server_url, &secrets.token)
-                .and_then(|client| client.capabilities())
+                .and_then(|client| client.capabilities().map(|reply| (client, reply)))
             {
-                Ok(capabilities) => ServerManage {
-                    url: settings.server_url.clone(),
-                    can_manage: capabilities.may_manage(),
-                    note: capabilities_note(&capabilities, chinese),
-                    capabilities: Some(capabilities),
-                },
+                Ok((client, capabilities)) => {
+                    upgrade = Some(audiolib_remote::server_upgrade_status(
+                        &client,
+                        &capabilities,
+                    ));
+                    ServerManage {
+                        url: settings.server_url.clone(),
+                        can_manage: capabilities.may_manage(),
+                        note: capabilities_note(&capabilities, chinese),
+                        capabilities: Some(capabilities),
+                    }
+                }
                 Err(error) => ServerManage {
                     url: settings.server_url.clone(),
                     can_manage: false,
@@ -295,6 +381,32 @@ impl Controller {
             };
             let c2 = c.clone();
             post(c.ui.clone(), move |ui| {
+                if c2.library_generation.load(Ordering::Acquire) != generation
+                    || !c2.remote_read_only()
+                    || c2.config.lock().unwrap().data_source.server_url != settings.server_url
+                    || c2
+                        .remote
+                        .lock()
+                        .unwrap()
+                        .state
+                        .as_ref()
+                        .map(|state| &state.library_id)
+                        != library_id.as_ref()
+                {
+                    return;
+                }
+                // Until the library is identified, do not consume another library's
+                // notice session. The normal sync refusal still supplies its error.
+                if let (Some(library_id), Some(status)) = (library_id.as_deref(), upgrade.as_ref())
+                {
+                    let notice = upgrade_notice(&settings.server_url, library_id, status, chinese);
+                    if let Some(message) = notice.text.clone() {
+                        ui.set_status(message.into());
+                    }
+                    if notice.offer_update_check {
+                        crate::updates::offer_client_upgrade_check(notice.text.unwrap_or_default());
+                    }
+                }
                 c2.apply_server_manage(&ui, &settings.server_url, manage);
             });
         });
@@ -342,6 +454,24 @@ impl Controller {
         self.remote.lock().unwrap().manage.for_server(&url)
     }
 
+    /// Path reads use the active peer's capabilities independently of write admission.
+    pub(in crate::controller) fn server_path_search_offered(&self) -> bool {
+        let url = self.config.lock().unwrap().data_source.server_url.clone();
+        self.remote
+            .lock()
+            .unwrap()
+            .manage
+            .for_server(&url)
+            .path_search_offered()
+    }
+
+    /// Vendor import limits of the active server when this PC may manage it.
+    pub(crate) fn current_vendor_import(
+        &self,
+    ) -> Option<audiolib_core::server_upgrade::VendorImportInfo> {
+        self.current_server_manage().vendor_import()
+    }
+
     /// Show the gate on the menus (server mode only; local removals are not gated).
     pub(crate) fn publish_server_manage(&self, ui: &AppWindow) {
         let manage = if self.remote_read_only() {
@@ -349,6 +479,15 @@ impl Controller {
         } else {
             ServerManage::default()
         };
+        ui.set_vendor_import_available(if self.remote_read_only() {
+            manage.vendor_import().is_some()
+        } else {
+            self.provider().vendor_import_available().unwrap_or(false)
+        });
+        ui.set_path_search_available(
+            self.provider().path_search_ready().unwrap_or(false)
+                || (self.remote_read_only() && self.server_path_search_offered()),
+        );
         ui.set_server_can_manage(manage.can_manage);
         ui.set_server_manage_note(manage.note.into());
     }
@@ -401,6 +540,15 @@ pub(super) fn removal_folder_text(path: &str, chinese: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migration_peers_remain_selectable_while_known_legacy_peers_disable_path_search() {
+        let mut manage = super::ServerManage::default();
+        assert!(manage.path_search_offered());
+        manage.capabilities = Some(audiolib_remote::Capabilities::default());
+        assert!(!manage.path_search_offered());
+        manage.capabilities.as_mut().unwrap().schema_migration = Some(Default::default());
+        assert!(manage.path_search_offered());
+    }
     use super::*;
 
     fn state(library: &str, revision: u64) -> CacheState {
@@ -412,11 +560,11 @@ mod tests {
     }
 
     fn file(id: i64, folder: Option<i64>) -> AudioFile {
-        AudioFile {
+        AudioFile::from(audiolib_core::AudioFileData {
             id,
             folder_id: folder,
-            ..AudioFile::default()
-        }
+            ..audiolib_core::AudioFileData::default()
+        })
     }
 
     #[test]
@@ -442,7 +590,8 @@ mod tests {
         hidden.filter_page(&mut page);
         let ids: Vec<i64> = page.results.iter().map(|file| file.id).collect();
         assert_eq!(ids, [1, 5]);
-        assert_eq!((page.returned_count, page.total_count), (2, 117));
+        assert_eq!((page.returned_count, page.total_count), (2, 111));
+        assert!(!page.total_count_exact);
         let folder = |id| Folder {
             id,
             path: format!("/f{id}"),
@@ -467,6 +616,29 @@ mod tests {
         hidden.add(&state("other", 1), &[9], &HashSet::new(), 1);
         assert!(!hidden.ids.contains(&2) && hidden.ids.contains(&9));
         assert_eq!((hidden.since, hidden.removed), (1, 1));
+    }
+
+    #[test]
+    fn unrelated_removals_never_reduce_the_bound_below_visible_rows_or_change_the_cursor() {
+        let mut hidden = HiddenRecords::default();
+        hidden.add(
+            &state("lib", 12),
+            &(100..140).collect::<Vec<_>>(),
+            &HashSet::new(),
+            40,
+        );
+        let mut page = SearchPage {
+            results: vec![file(1, None), file(2, None), file(3, None)],
+            total_count: 4,
+            total_count_exact: false,
+            returned_count: 3,
+            next_cursor: Some("provider-owned-position".into()),
+            ..Default::default()
+        };
+        hidden.filter_page(&mut page);
+        assert_eq!((page.returned_count, page.total_count), (3, 3));
+        assert!(!page.total_count_exact);
+        assert_eq!(page.next_cursor.as_deref(), Some("provider-owned-position"));
     }
 
     #[test]
@@ -643,5 +815,101 @@ mod tests {
             english.contains("WAV files on the server are untouched"),
             "{english}"
         );
+    }
+}
+
+#[cfg(test)]
+mod upgrade_notice_tests {
+    use super::upgrade_notice;
+    use audiolib_core::server_upgrade::{Notice, PathSearch, ServerUpgradeStatus};
+
+    #[test]
+    fn upgrade_notices_show_once_per_session_and_progress_updates() {
+        let status = ServerUpgradeStatus {
+            path_search: PathSearch::NeedsClientUpgrade,
+            main_search: true,
+            vendor_import: None,
+            migration: None,
+            path_results_absent: false,
+            notices: vec![
+                Notice::PathSearchNeedsUpgrade,
+                Notice::Migrating { percent: Some(40) },
+            ],
+        };
+        let url = "http://upgrade-notice.test";
+        let first = upgrade_notice(url, "library-a", &status, true);
+        let first_text = first.text.as_deref().unwrap();
+        assert!(first_text.contains("路径搜索"));
+        assert!(first_text.contains("40%"));
+        assert!(first.offer_update_check);
+        let again = upgrade_notice(url, "library-a", &status, true);
+        let again_text = again.text.as_deref().unwrap();
+        assert!(!again_text.contains("路径搜索"));
+        assert!(again_text.contains("40%"));
+        assert!(!again.offer_update_check);
+        let another = upgrade_notice(url, "library-b", &status, true);
+        assert!(
+            another.offer_update_check,
+            "another library at the same URL has its own notices"
+        );
+        assert!(another.text.unwrap().contains("路径搜索"));
+    }
+
+    #[test]
+    fn current_client_does_not_open_the_update_dialog_for_its_own_minimum() {
+        let current = env!("CARGO_PKG_VERSION");
+        let status = ServerUpgradeStatus {
+            path_search: PathSearch::Available,
+            main_search: true,
+            vendor_import: None,
+            migration: None,
+            path_results_absent: false,
+            notices: vec![Notice::ClientUpgradeAvailable {
+                version: Some(current.into()),
+                level: audiolib_core::server_upgrade::ClientUpgradeLevel::Recommended,
+            }],
+        };
+        let notice = upgrade_notice(
+            "http://upgrade-notice-current.test",
+            "library-current",
+            &status,
+            false,
+        );
+        assert!(notice.text.unwrap().contains(current));
+        assert!(!notice.offer_update_check);
+        let newer = ServerUpgradeStatus {
+            notices: vec![Notice::ClientUpgradeAvailable {
+                version: Some("99.0.0".into()),
+                level: audiolib_core::server_upgrade::ClientUpgradeLevel::Recommended,
+            }],
+            ..status
+        };
+        let prompted = upgrade_notice(
+            "http://upgrade-notice-newer.test",
+            "library-newer",
+            &newer,
+            false,
+        );
+        assert!(prompted.offer_update_check);
+    }
+
+    #[test]
+    fn migration_only_notice_does_not_offer_update_check() {
+        let status = ServerUpgradeStatus {
+            path_search: PathSearch::PausedForMigration,
+            main_search: true,
+            vendor_import: None,
+            migration: None,
+            path_results_absent: false,
+            notices: vec![Notice::Migrating { percent: Some(10) }],
+        };
+        let notice = upgrade_notice(
+            "http://upgrade-notice-mig.test",
+            "library-migration",
+            &status,
+            true,
+        );
+        assert!(notice.text.unwrap().contains("10%"));
+        assert!(!notice.offer_update_check);
     }
 }

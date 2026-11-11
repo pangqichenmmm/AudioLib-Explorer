@@ -15,9 +15,10 @@ use audiolib_core::{
     Error, LIST_WAVEFORM_COLUMNS, LIST_WAVEFORM_I8_MAX_BYTES, ListWaveformI8, Result,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 
 /// File name of the compact list Waveform store.
 pub const WAVEFORMS_DB_FILE: &str = "waveforms.db";
@@ -49,10 +50,192 @@ pub struct WaveformsDbRow {
     pub peaks: ListWaveformI8,
 }
 
-/// Handle of one `waveforms.db` file (a single serialized connection).
+/// Handle of one `waveforms.db` file. Live handles of the same canonical path
+/// share one serialized connection, including its close/replace/reopen boundary.
 pub struct WaveformsDb {
     path: PathBuf,
+    conn: Arc<SharedConnection>,
+}
+
+type ConnectionRegistry = HashMap<PathBuf, Arc<ConnectionEntry>>;
+
+#[derive(Default)]
+enum ConnectionState {
+    #[default]
+    Closed,
+    Opening,
+    Live(Weak<SharedConnection>),
+}
+
+#[derive(Default)]
+struct ConnectionEntry {
+    state: Mutex<ConnectionState>,
+    changed: Condvar,
+    #[cfg(test)]
+    waiter: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+struct SharedConnection {
+    // Field declaration order is part of the lifetime contract: SQLite and its
+    // cached statements close before the marker permits another native open.
     conn: Mutex<Connection>,
+    _release: ReleaseMarker,
+    #[cfg(test)]
+    before_close: Mutex<Option<BeforeConnectionClose>>,
+}
+
+impl Deref for SharedConnection {
+    type Target = Mutex<Connection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+struct ReleaseMarker(Arc<ConnectionEntry>);
+
+impl Drop for ReleaseMarker {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = ConnectionState::Closed;
+        self.0.changed.notify_all();
+    }
+}
+
+/// Reset a failed or panicking constructor before any caller can be stranded
+/// waiting on Opening. Successful construction hands ownership to the marker.
+struct OpeningGuard {
+    entry: Arc<ConnectionEntry>,
+    armed: bool,
+}
+
+impl OpeningGuard {
+    fn release_marker(&mut self) -> ReleaseMarker {
+        let marker = ReleaseMarker(self.entry.clone());
+        self.armed = false;
+        marker
+    }
+}
+
+impl Drop for OpeningGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self
+                .entry
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *state = ConnectionState::Closed;
+            self.entry.changed.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+struct BeforeConnectionClose {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl Drop for SharedConnection {
+    fn drop(&mut self) {
+        if let Some(hook) = self
+            .before_close
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = hook.entered.send(());
+            let _ = hook.release.recv_timeout(std::time::Duration::from_secs(5));
+        }
+        // Automatic field drops still close conn before _release, as in production.
+    }
+}
+
+/// Native canonical parents resolve relative/dot and filesystem case aliases.
+/// Keep the lossless path: distinct non-UTF-8 POSIX entries must not collide.
+fn connection_key(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| Error::Database(format!("waveforms.db canonical parent: {error}")))?;
+    Ok(parent.join(WAVEFORMS_DB_FILE))
+}
+
+fn shared_connection(path: &Path) -> Result<Arc<SharedConnection>> {
+    static CONNECTIONS: OnceLock<Mutex<ConnectionRegistry>> = OnceLock::new();
+    let key = connection_key(path)?;
+    let entry = {
+        let mut connections = CONNECTIONS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A dead Weak alone is insufficient: its SQLite destructor may still
+        // be running. Only the marker-confirmed Closed/map-only entry is idle.
+        connections.retain(|_, entry| {
+            Arc::strong_count(entry) > 1
+                || !matches!(
+                    &*entry.state.lock().unwrap_or_else(PoisonError::into_inner),
+                    ConnectionState::Closed
+                )
+        });
+        connections
+            .entry(key)
+            .or_insert_with(|| Arc::new(ConnectionEntry::default()))
+            .clone()
+    };
+    loop {
+        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let ConnectionState::Live(connection) = &*state
+            && let Some(connection) = connection.upgrade()
+        {
+            return Ok(connection);
+        }
+        if matches!(&*state, ConnectionState::Closed) {
+            *state = ConnectionState::Opening;
+            drop(state);
+            let mut opening = OpeningGuard {
+                entry: entry.clone(),
+                armed: true,
+            };
+            // No global or per-entry mutex is held during filesystem/SQLite I/O.
+            remove_stale_bundle_files(path);
+            let connection = open_connection(path)?;
+            let connection = Arc::new(SharedConnection {
+                conn: Mutex::new(connection),
+                // conn has already moved into the first field before the guard
+                // hands off. Every subsequent unwind closes it before notify.
+                _release: opening.release_marker(),
+                #[cfg(test)]
+                before_close: Mutex::new(None),
+            });
+            let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+            *state = ConnectionState::Live(Arc::downgrade(&connection));
+            entry.changed.notify_all();
+            return Ok(connection);
+        }
+        // Opening is single-flight. An expired Live Weak waits for the native
+        // close marker, rather than racing that destructor with a new open.
+        #[cfg(test)]
+        if let Some(waiter) = entry
+            .waiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = waiter.send(());
+        }
+        drop(
+            entry
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {
@@ -122,10 +305,9 @@ impl WaveformsDb {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::Database(format!("{}: {error}", parent.display())))?;
         }
-        remove_stale_bundle_files(path);
         Ok(Self {
             path: path.to_path_buf(),
-            conn: Mutex::new(open_connection(path)?),
+            conn: shared_connection(path)?,
         })
     }
 
@@ -289,7 +471,9 @@ impl WaveformsDb {
                 .map_err(db_error)?;
             merged?;
         }
-        // Closing the only connection checkpoints the WAL and removes its sidecars.
+        // Every live handle of this path uses this slot and mutex. Closing the
+        // only connection checkpoints the WAL and removes its sidecars; old
+        // provider generations wait here and then observe the reopened store.
         close_or_restore(&mut conn, Connection::close)?;
         let renamed = std::fs::rename(validated, &self.path);
         *conn = open_connection(&self.path)?;
@@ -545,6 +729,162 @@ mod tests {
         assert_eq!(db.get(1).unwrap().unwrap().etag, "page");
         assert_eq!(db.get(2).unwrap().unwrap().etag, "bundle");
         assert_eq!(db.get(3).unwrap().unwrap().etag, "page");
+    }
+
+    #[test]
+    fn surviving_stores_observe_bundle_replacement_through_canonical_parent_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cacheMixed");
+        std::fs::create_dir(&cache).unwrap();
+        let old = WaveformsDb::open(&cache.join(WAVEFORMS_DB_FILE)).unwrap();
+        old.upsert(&row(1, "page", vec![-2, 2])).unwrap();
+        old.upsert(&row(3, "page", vec![])).unwrap();
+        let upper = directory.path().join("CACHEMIXED");
+        #[cfg(windows)]
+        let alias = if upper.exists() {
+            // Only cacheMixed was created in this owned root. An existing
+            // uppercase spelling is its native case-insensitive alias.
+            assert_eq!(upper.canonicalize().unwrap(), cache.canonicalize().unwrap());
+            cache.join("..").join("CACHEMIXED").join(WAVEFORMS_DB_FILE)
+        } else {
+            // Case-sensitive Windows directories have no uppercase alias.
+            cache.join("..").join("cacheMixed").join(WAVEFORMS_DB_FILE)
+        };
+        #[cfg(not(windows))]
+        let alias = cache.join("..").join("cacheMixed").join(WAVEFORMS_DB_FILE);
+        let current = WaveformsDb::open(&alias).unwrap();
+        // Different directory entries stay independent, including uppercase
+        // on a case-sensitive filesystem. Case-insensitive volumes use another name.
+        let other = if upper.exists() {
+            directory.path().join("different-cache")
+        } else {
+            upper
+        };
+        let unrelated = WaveformsDb::open(&other.join(WAVEFORMS_DB_FILE)).unwrap();
+        unrelated
+            .upsert(&row(90, "unrelated", vec![-9, 9]))
+            .unwrap();
+        let staged = current.path().with_file_name("waveforms.db.bundle-0-0.tmp");
+        {
+            let bundle = open_connection(&staged).unwrap();
+            for (id, etag) in [(1, "old-bundle"), (2, "bundle")] {
+                bundle
+                    .execute(
+                        "INSERT INTO list_waveforms VALUES(?1,?2,0,0,'i8-minmax-base64',1,?3)",
+                        rusqlite::params![
+                            id,
+                            etag,
+                            padded_blob(&ListWaveformI8::new(vec![-1, 1]).unwrap())
+                        ],
+                    )
+                    .unwrap();
+            }
+            bundle
+                .execute(
+                    "INSERT INTO meta VALUES('library_id','owned-shared-store')",
+                    [],
+                )
+                .unwrap();
+            bundle.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        }
+        assert_eq!(
+            validate_bundle(&staged, LIST_WAVEFORM_ENCODING_I8, "owned-shared-store").unwrap(),
+            2
+        );
+        // Keep old alive throughout the actual close/rename/reopen. Before the
+        // fix Windows denies rename; POSIX leaves old on the replaced inode.
+        current.replace_with(&staged).unwrap();
+        assert!(!staged.exists());
+        for store in [&old, &current] {
+            assert_eq!(store.len().unwrap(), 3);
+            assert_eq!(store.get(1).unwrap().unwrap().etag, "page");
+            assert_eq!(store.get(2).unwrap().unwrap().etag, "bundle");
+            assert!(store.get(3).unwrap().is_some());
+            assert!(store.get(90).unwrap().is_none());
+        }
+        old.upsert(&row(4, "after-replace", vec![-4, 4])).unwrap();
+        assert_eq!(current.get(4).unwrap().unwrap().etag, "after-replace");
+        assert_eq!(unrelated.len().unwrap(), 1);
+        assert_eq!(unrelated.get(90).unwrap().unwrap().etag, "unrelated");
+    }
+
+    #[test]
+    fn reopening_waits_for_the_last_native_connection_to_close_before_replacing_a_bundle() {
+        use std::sync::mpsc::{self, TryRecvError};
+        use std::time::Duration;
+
+        struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        let deadline = Duration::from_secs(5);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(WAVEFORMS_DB_FILE);
+        let old = WaveformsDb::open(&path).unwrap();
+        old.upsert(&row(1, "page", vec![-2, 2])).unwrap();
+        let entry = old.conn._release.0.clone();
+        let (entered, did_enter) = mpsc::channel();
+        let (release, can_close) = mpsc::channel();
+        // Releases the destructor even if a later assertion unwinds.
+        let release_on_unwind = ReleaseOnDrop(Some(release));
+        *old.conn.before_close.lock().unwrap() = Some(BeforeConnectionClose {
+            entered,
+            release: can_close,
+        });
+        let (waiter, did_wait) = mpsc::channel();
+        *entry.waiter.lock().unwrap() = Some(waiter);
+        let (closed, did_close) = mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            drop(old);
+            let _ = closed.send(());
+        });
+        // The final strong owner expired, but the real native connection is
+        // deliberately still alive before its declared first field drops.
+        did_enter.recv_timeout(deadline).unwrap();
+        let (opened, did_open) = mpsc::channel();
+        let opening = std::thread::spawn(move || {
+            let result = WaveformsDb::open(&path);
+            let _ = opened.send(result);
+        });
+        // This notification comes from the actual lifecycle wait, rather than
+        // assuming that an unstarted or slow worker has already called open.
+        did_wait.recv_timeout(deadline).unwrap();
+        assert!(matches!(did_open.try_recv(), Err(TryRecvError::Empty)));
+        drop(release_on_unwind);
+        did_close.recv_timeout(deadline).unwrap();
+        dropping.join().unwrap();
+        let current = did_open.recv_timeout(deadline).unwrap().unwrap();
+        opening.join().unwrap();
+        let staged = directory.path().join("waveforms.db.bundle-0-0.tmp");
+        {
+            let bundle = open_connection(&staged).unwrap();
+            bundle
+                .execute(
+                    "INSERT INTO list_waveforms VALUES(2,'bundle',0,0,'i8-minmax-base64',1,?1)",
+                    [padded_blob(&ListWaveformI8::new(vec![-1, 1]).unwrap())],
+                )
+                .unwrap();
+            bundle
+                .execute(
+                    "INSERT INTO meta VALUES('library_id','owned-retired-store')",
+                    [],
+                )
+                .unwrap();
+            bundle.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        }
+        assert_eq!(
+            validate_bundle(&staged, LIST_WAVEFORM_ENCODING_I8, "owned-retired-store").unwrap(),
+            1
+        );
+        current.replace_with(&staged).unwrap();
+        assert_eq!(current.get(1).unwrap().unwrap().etag, "page");
+        assert_eq!(current.get(2).unwrap().unwrap().etag, "bundle");
+        assert!(!staged.exists());
     }
 
     #[test]

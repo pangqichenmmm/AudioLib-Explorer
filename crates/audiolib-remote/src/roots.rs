@@ -57,6 +57,9 @@ pub struct RemoteDirectory {
     /// WAV files immediately within the directory, excluding subdirectories.
     #[serde(default)]
     pub wav_files: u64,
+    /// New servers report all supported source formats; old servers omit this field.
+    #[serde(default)]
+    pub audio_files: Option<u64>,
     #[serde(default)]
     pub other_files: u64,
     #[serde(default)]

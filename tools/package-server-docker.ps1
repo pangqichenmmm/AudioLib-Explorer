@@ -22,6 +22,8 @@ Set-StrictMode -Version Latest
 if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw 'Docker packaging requires PowerShell 7.3 or newer.' }
 Add-Type -AssemblyName System.Formats.Tar
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
+. (Join-Path $PSScriptRoot 'server-package-layout.ps1')
 $match = [regex]::Match($Tag, '^v(\d+\.\d+\.\d+)(?:-(?:beta|rc)\.(?:0|[1-9]\d*))?$')
 if (!$match.Success) { throw 'Invalid release tag.' }
 $version = $match.Groups[1].Value
@@ -191,16 +193,17 @@ if ($sidecar -cnotmatch ('^[0-9a-fA-F]{64}  ' + [regex]::Escape([IO.Path]::GetFi
 $report = Read-Json $ServerReport
 $validation = Read-Json $ServerValidation
 foreach ($proof in @($report, $validation)) {
+    Assert-ServerLayoutMetadata $proof
     if ($proof.success -isnot [bool] -or !$proof.success -or $proof.tag -cne $Tag -or $proof.version -cne $version -or
         $proof.commit -cne $ExpectedCommit -or $proof.target -cne $target -or
-        $proof.archive_sha256.ToLowerInvariant() -cne $archiveHash -or $proof.binary_sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        $proof.archive_sha256.ToLowerInvariant() -cne $archiveHash -or $proof.binary_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $proof.migrator_sha256 -notmatch '^[0-9a-fA-F]{64}$') {
         throw 'Native Linux acceptance proof identity mismatch.'
     }
 }
 foreach ($check in @('version', 'allowlist', 'unlinked_paths', 'privacy', 'archive_contents', 'executable_mode')) {
     if ($report.checks[$check] -isnot [bool] -or !$report.checks[$check]) { throw 'Native package boundary proof is incomplete.' }
 }
-if ($validation.binary_sha256 -ine $report.binary_sha256 -or $validation.checks -isnot [array] -or !$validation.checks.Count) { throw 'Native runtime proof is incomplete.' }
+if ($validation.binary_sha256 -ine $report.binary_sha256 -or $validation.migrator_sha256 -ine $report.migrator_sha256 -or $validation.checks -isnot [array] -or !$validation.checks.Count -or 'owned migrator status/start/status/rollback/status 8/9/8' -cnotin $validation.checks) { throw 'Native runtime proof is incomplete.' }
 # Pin the tiny public context to the requested source revision. No .git directory is copied.
 Push-Location $taskRoot
 try {
@@ -216,9 +219,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Docker context sources differ from the expected commit.' }
 } finally { Pop-Location }
 function Expand-PublicPayload {
-$publicFiles = @(Get-Content -LiteralPath (Join-Path $taskRoot 'tools/server-files.json') -Raw | ConvertFrom-Json)
+$publicFiles = @(Get-ServerPublicDocuments)
 $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-foreach ($name in @($publicFiles) + @('audiolib-server', 'update-channel.txt', 'update-version.txt', 'licenses/dependencies.json')) { Assert-Relative $name; $null = $allowed.Add($name) }
+foreach ($name in @($publicFiles) + @('audiolib-server','audiolib-migrate','update-channel.txt','update-version.txt','licenses/dependencies.json','licenses/inventory.json')) { Assert-Relative $name; $null = $allowed.Add($name) }
 $null = New-Item -ItemType Directory -Path $payload -Force
 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $files = [Collections.Generic.List[string]]::new()
@@ -247,7 +250,7 @@ try {
         if ($entry.Length -gt 1073741824) { throw 'Unexpectedly large public package entry.' }
         if (!$allowed.Contains($name) -and !$name.StartsWith('licenses/', [StringComparison]::Ordinal)) { throw 'Non-public file in native server archive.' }
         $mode = [int]$entry.Mode -band 511
-        $wantedMode = if ($name -in @('audiolib-server', 'server/deploy/redeploy-server.sh')) { 493 } else { 420 }
+        $wantedMode = if ($name -in @('audiolib-server','audiolib-migrate','server/deploy/redeploy-server.sh')) { 493 } else { 420 }
         if ($mode -ne $wantedMode) { throw 'Native package file mode mismatch.' }
         $null = New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($destination)) -Force
         $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew)
@@ -276,8 +279,11 @@ foreach ($directory in $directories) {
     if (!@($files | Where-Object { $_.StartsWith($directory + '/', [StringComparison]::Ordinal) }).Count) { throw 'Unexpected empty/non-public package directory.' }
 }
 if ((Get-Hash (Join-Path $payload 'audiolib-server')) -cne $report.binary_sha256.ToLowerInvariant() -or
+    (Get-Hash (Join-Path $payload 'audiolib-migrate')) -cne $report.migrator_sha256.ToLowerInvariant() -or
     (Get-Content -LiteralPath (Join-Path $payload 'update-version.txt') -Raw).Trim() -cne $fullVersion -or
     (Get-Content -LiteralPath (Join-Path $payload 'update-channel.txt') -Raw).Trim() -cne $(if ($Tag.Contains('-')) { 'beta' } else { 'stable' })) { throw 'Native payload binary/update identity mismatch.' }
+$null=Test-AudioLibLicenseBundle -PayloadRoot $payload -ExpectedRoots @('audiolib-server','audiolib-db') -Target $target -NoDefaultFeatures -ExpectedArtifacts @('audiolib-server','audiolib-migrate')
+$null=Test-ServerPackageLayout -Entries @($files) -ServerBinaryName 'audiolib-server'
 }
 Expand-PublicPayload
 Copy-Item -LiteralPath (Join-Path $taskRoot 'server/deploy/docker/Dockerfile.release') -Destination (Join-Path $context 'Dockerfile')
@@ -301,9 +307,9 @@ $image = Get-Image $imageTag
 if ($null -eq $image -or ($ExistingImageId -and $image[0] -cne $ExistingImageId) -or $image[0] -cnotmatch '^sha256:[0-9a-f]{64}$' -or $image[1] -cne 'linux' -or $image[2] -cne $arch -or
     $image[3] -cne '10001:10001' -or $image[4] -cne $fullVersion -or $image[5] -cne $ExpectedCommit -or
     @($image[6]).Count -ne 1 -or $image[6][0] -cne '/opt/audiolibserver/audiolib-server' -or $image[7] -cne 'disabled') { throw 'Built image identity/security boundary mismatch.' }
-if ($ExistingImageId) {
-    $hashProbe = Invoke-Docker @('run','--rm','--name',('audiolib-package-hash-'+[guid]::NewGuid().ToString('N')),'--label','io.audiolib.task=package-hash','--platform',$Platform,'--read-only','--network','none','--security-opt','no-new-privileges','--user','10001:10001','--tmpfs','/data:rw,nosuid,nodev','--entrypoint','/usr/bin/sha256sum',$ExistingImageId,'/opt/audiolibserver/audiolib-server')
-    if (($hashProbe.Text -split '\s+')[0] -cne $report.binary_sha256.ToLowerInvariant()) { throw 'Resumed image binary differs from the accepted native package.' }
+foreach($component in @(@{name='audiolib-server';sha256=$report.binary_sha256},@{name='audiolib-migrate';sha256=$report.migrator_sha256})){
+    $hashProbe = Invoke-Docker @('run','--rm','--name',('audiolib-package-hash-'+[guid]::NewGuid().ToString('N')),'--label','io.audiolib.task=package-hash','--platform',$Platform,'--read-only','--network','none','--security-opt','no-new-privileges','--user','10001:10001','--tmpfs','/data:rw,nosuid,nodev','--entrypoint','/usr/bin/sha256sum',$image[0],('/opt/audiolibserver/'+$component.name))
+    if (($hashProbe.Text -split '\s+')[0] -cne $component.sha256.ToLowerInvariant()) { throw 'Image executable differs from the accepted native package.' }
 }
 $originalTar = Join-Path $ownedRoot 'image-original.tar'
 $rawTar = Join-Path $ownedRoot 'image.tar'
@@ -320,7 +326,8 @@ $privateReport = Join-Path $ownedRoot 'package-report.json'
 [ordered]@{
     success=$true; tag=$Tag; version=$version; commit=$ExpectedCommit; platform=$Platform; target=$target
     image_tag=$imageTag; image_id=$image[0]; archive_sha256=$hash; native_archive_sha256=$archiveHash
-    binary_sha256=$report.binary_sha256.ToLowerInvariant(); with_ffmpeg=(!$WithoutFfmpeg)
+    binary_sha256=$report.binary_sha256.ToLowerInvariant();migrator_sha256=$report.migrator_sha256.ToLowerInvariant();with_ffmpeg=(!$WithoutFfmpeg)
+    layout_revision=2;automatic_upgrade_compatible=$false;manual_bootstrap_required=$true;minimum_updater_version='0.9.0';old_updater_policy='refused'
     checks=@('matching native Linux acceptance','public tiny context','image OS/architecture/version/revision/user/entrypoint/update boundary','image save')
     image_build=$(if ($ExistingImageId) { 'reused explicit immutable image; accepted native binary hash reverified' } else { 'built' })
     archive_format='closed classic docker-save manifest/config/DiffID-verified layers'

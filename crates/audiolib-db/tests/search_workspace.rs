@@ -173,13 +173,13 @@ fn workspace_round_trips_signed_audio_and_folder_identities_from_an_existing_lib
     }];
     current.view.selected_audio = Some(SearchAudioRef {
         id: selected.id,
-        file_path: selected.file_path,
+        file_path: selected.into_data().file_path,
     });
     current.view.checked_audio = [zero, minimum]
         .into_iter()
         .map(|file| SearchAudioRef {
             id: file.id,
-            file_path: file.file_path,
+            file_path: file.into_data().file_path,
         })
         .collect();
     current.view.selection_anchor = current.view.checked_audio.first().cloned();

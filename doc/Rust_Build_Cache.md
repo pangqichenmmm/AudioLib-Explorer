@@ -11,7 +11,7 @@ pwsh tools/clean-build-artifacts.ps1 -Action Run
 # 开发检查成功后自动执行同一维护步骤。
 pwsh tools/check-local.ps1 -Package audiolib-db -CleanBuildArtifacts
 # 发布管线完成交付后维护；不要再在其 ChecksFile 内嵌一次清理。
-pwsh tools/release-pipeline.ps1 -Action Run -Tag v0.8.7 -CleanBuildArtifacts
+pwsh tools/release-pipeline.ps1 -Action Run -Tag v0.9.0 -CleanBuildArtifacts
 ```
 
 统一入口的 `-BuildCacheLimitGiB` 可调整预算，默认 40。维护失败时保留已通过的检查/交付证据，日志说明清理未完成；重试先复用仍有效的结果。`check-local.ps1` 的维护开关要求使用 PowerShell 7.3+，不带该开关的既有 PowerShell 5.1 用法保持兼容。

@@ -27,6 +27,78 @@ fn single<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     (values.next().is_none() && value.len() <= MAX_COMPATIBILITY_HEADER_BYTES).then_some(value)
 }
 
+/// Select the transmitted read format without weakening actual-library write admission.
+///
+/// A peer explicitly accepting schema 9 must receive it. Only peers that declare
+/// the exact plain schema-8 format can use the derived compatibility representation.
+/// Historical `/library` requests carry no markers at all, so that information-only
+/// endpoint may default to schema 8; downloading still requires a valid catalog.
+pub(crate) fn read_format(
+    headers: &HeaderMap,
+    actual: &SnapshotFormat,
+    allow_unmarked_info: bool,
+) -> Result<SnapshotFormat, ApiError> {
+    use audiolib_core::compatibility::{LibraryFormat, PLAN_B_FORMAT};
+    if actual.format.schema_version != 9 {
+        if !allow_unmarked_info || headers.contains_key(CLIENT_COMPATIBILITY_HEADER) {
+            admit(headers, actual)?;
+        }
+        return Ok(actual.clone());
+    }
+    let legacy = SnapshotFormat {
+        id: PLAN_B_FORMAT.into(),
+        format: LibraryFormat::target(),
+    };
+    if allow_unmarked_info
+        && !headers.contains_key(CLIENT_COMPATIBILITY_HEADER)
+        && !headers.contains_key(ACCEPT_FORMATS_HEADER)
+        && !headers.contains_key(SNAPSHOT_SCHEMA_MAX_HEADER)
+    {
+        return Ok(legacy);
+    }
+    // Validate the marker even when the accept list is missing/malformed. Never
+    // turn a blocked client or an invalid catalog into a compatibility fallback.
+    admit_peer(headers)?;
+    if single(headers, ACCEPT_FORMATS_HEADER)
+        .is_some_and(|formats| formats.split(',').any(|id| id.trim() == actual.id))
+    {
+        admit(headers, actual)?;
+        return Ok(actual.clone());
+    }
+    admit(headers, &legacy)?;
+    Ok(legacy)
+}
+
+/// Shared capability/header advice for a schema-8 representation of a schema-9 source.
+pub(crate) fn legacy_upgrade_info() -> audiolib_core::server_upgrade::ClientUpgradeInfo {
+    use audiolib_core::{compatibility::PLAN_B_FORMAT, server_upgrade::*};
+    ClientUpgradeInfo {
+        level: ClientUpgradeLevel::Recommended,
+        reason: Some(
+            "A compatibility snapshot is being served; upgrade for the complete schema-9 features"
+                .into(),
+        ),
+        missing_features: vec![
+            "search_path".into(),
+            "vorbis_tags".into(),
+            "vendor_metadata".into(),
+        ],
+        min_client_version: Some(env!("CARGO_PKG_VERSION").into()),
+        served_snapshot_format: Some(PLAN_B_FORMAT.into()),
+    }
+}
+
+/// Upgrade header with the same recommendation/version/features as `/capabilities`.
+pub(crate) fn legacy_upgrade_header() -> Result<HeaderValue, ApiError> {
+    let advice = legacy_upgrade_info();
+    HeaderValue::from_str(&format!(
+        "recommended; min={}; features=\"{}\"",
+        advice.min_client_version.unwrap_or_default(),
+        advice.missing_features.join(",")
+    ))
+    .map_err(|_| ApiError::internal("Invalid legacy upgrade header"))
+}
+
 /// Enforce exact format support and both application ranges for schema 6.
 pub(crate) fn admit(headers: &HeaderMap, format: &SnapshotFormat) -> Result<(), ApiError> {
     // Peer markers are checked first so a blocked or pre-marker client is refused
@@ -236,6 +308,76 @@ mod tests {
                 format: LibraryFormat::target(),
             },
         )
+    }
+
+    #[test]
+    fn schema9_read_selection_never_downgrades_an_explicit_modern_peer() {
+        use audiolib_core::compatibility::{LibraryFormat, PLAN_B_V9_FORMAT};
+        let (mut headers, legacy) = fixture();
+        let actual = SnapshotFormat {
+            id: PLAN_B_V9_FORMAT.into(),
+            format: LibraryFormat::server_schema9(),
+        };
+        assert_eq!(read_format(&headers, &actual, false).unwrap(), legacy);
+        assert!(admit_library_mutation(&headers, &actual).is_ok());
+        let mut old = compatibility_manifest();
+        old.application_version = "0.8.7".into();
+        old.snapshot_read_formats
+            .retain(|id| id != PLAN_B_V9_FORMAT);
+        headers = with_catalog(&headers, &old);
+        assert_eq!(read_format(&headers, &actual, false).unwrap(), legacy);
+        assert!(admit_library_mutation(&headers, &actual).is_err());
+        headers.insert(
+            ACCEPT_FORMATS_HEADER,
+            HeaderValue::from_str(&format!("{},{}", legacy.id, actual.id)).unwrap(),
+        );
+        assert!(
+            read_format(&headers, &actual, false).is_err(),
+            "an inconsistent explicit s9 declaration must not silently downgrade"
+        );
+        let mut current = with_catalog(&headers, &compatibility_manifest());
+        assert_eq!(read_format(&current, &actual, false).unwrap(), actual);
+        current.insert(SNAPSHOT_SCHEMA_MAX_HEADER, HeaderValue::from_static("8"));
+        assert!(read_format(&current, &actual, false).is_err());
+        assert_eq!(
+            read_format(&HeaderMap::new(), &actual, true).unwrap(),
+            legacy
+        );
+        assert!(read_format(&HeaderMap::new(), &actual, false).is_err());
+    }
+
+    #[test]
+    fn extended_sources_refuse_old_schema8_peers_and_preserve_wav_only_schema9_fallback() {
+        use audiolib_core::compatibility::{PLAN_B_AUDIO_FORMAT, PLAN_B_V9_AUDIO_FORMAT};
+        let (mut headers, legacy) = fixture();
+        let mut old = compatibility_manifest();
+        old.snapshot_read_formats
+            .retain(|id| id != PLAN_B_AUDIO_FORMAT && id != PLAN_B_V9_AUDIO_FORMAT);
+        let old_headers = with_catalog(&headers, &old);
+        let actual8 = SnapshotFormat {
+            id: PLAN_B_AUDIO_FORMAT.into(),
+            format: LibraryFormat::target().with_audio_sources(),
+        };
+        assert!(read_format(&old_headers, &actual8, false).is_err());
+        assert!(admit_library_mutation(&old_headers, &actual8).is_err());
+        headers.insert(
+            ACCEPT_FORMATS_HEADER,
+            HeaderValue::from_static(PLAN_B_AUDIO_FORMAT),
+        );
+        assert_eq!(read_format(&headers, &actual8, false).unwrap(), actual8);
+        assert!(admit_library_mutation(&headers, &actual8).is_ok());
+        let actual9 = SnapshotFormat {
+            id: PLAN_B_V9_AUDIO_FORMAT.into(),
+            format: LibraryFormat::server_schema9().with_audio_sources(),
+        };
+        assert_eq!(read_format(&old_headers, &actual9, false).unwrap(), legacy);
+        assert!(admit_library_mutation(&old_headers, &actual9).is_err());
+        headers.insert(
+            ACCEPT_FORMATS_HEADER,
+            HeaderValue::from_static(PLAN_B_V9_AUDIO_FORMAT),
+        );
+        assert_eq!(read_format(&headers, &actual9, false).unwrap(), actual9);
+        assert!(admit_library_mutation(&headers, &actual9).is_ok());
     }
 
     #[test]

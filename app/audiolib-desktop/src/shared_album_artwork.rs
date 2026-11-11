@@ -515,7 +515,11 @@ impl Controller {
             return None;
         }
         if self.remote_read_only() {
-            let (client, state, capabilities) = self.remote_artwork_context()?;
+            // `/capabilities` may still be in flight after a cached snapshot opens.
+            // Keep the on-disk thumbnail until that reply can refresh the cover.
+            let Some((client, state, capabilities)) = self.remote_artwork_context() else {
+                return cached;
+            };
             let ids = members.iter().map(|file| file.id).collect::<Vec<_>>();
             // Folder IDs are resolved in this immutable client snapshot, off the
             // event loop. Echo validation also detects a server-side relink while

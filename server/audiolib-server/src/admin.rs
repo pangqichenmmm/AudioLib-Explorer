@@ -2,14 +2,15 @@
 //! LAN-only web admin page (`/admin`) and its JSON API (`/admin/api/...`): public URL,
 //! authentication mode, library management mode, generated tokens, the optional
 //! native TLS listener and the library roots (server disk browser, add / remove roots,
-//! scans of a root; none of these depend on `manage_mode` or the authentication mode:
-//! the admin guard below is the authority).
+//! scans of a root; the admin guard below is the authority).
 //!
-//! Guard (every admin request): the request must be LAN-direct (socket peer in a private
+//! The default guard requires LAN-direct access (socket peer in a private
 //! range and no forwarding header, see [`crate::auth::classify`]; public peers of the TLS
 //! listener are external) and its `Host` must be an IP address or a LAN name (DNS
 //! rebinding protection). Changing requests additionally need `X-AudioLib-Admin: 1` and,
 //! when the browser sends `Origin`, the same origin. Otherwise 403. There is no password.
+//! Native loopback migration requests with authentication explicitly off have the
+//! narrow exception documented by [`crate::migration::local_admin`].
 use crate::{
     ApiError, VERSION,
     auth::{
@@ -57,6 +58,11 @@ pub fn router(security: Arc<crate::Security>) -> Router<Service> {
         .route("/admin/admin.js", get(script))
         .route("/admin/api/status", get(status))
         .route("/admin/api/runtime", get(runtime))
+        .route("/admin/api/migration/status", get(crate::migration::status))
+        .route(
+            "/admin/api/migration/{action}",
+            post(crate::migration::action),
+        )
         .route("/admin/api/update", get(update_status))
         .route("/admin/api/update/check", post(check_update))
         .route("/admin/api/update/install", post(install_update))
@@ -93,13 +99,19 @@ async fn guard(
     if let Err(error) = check(&request, &security) {
         return with_admin_headers(error.into_response());
     }
+    if !request.uri().path().starts_with("/admin/api/migration/")
+        && let Some(response) = crate::migration::switching_write(&request)
+    {
+        return with_admin_headers(response);
+    }
     with_admin_headers(next.run(request).await)
 }
 
 fn check(request: &Request, security: &crate::Security) -> Result<(), ApiError> {
     let headers = request.headers();
     let connection = request.extensions().get::<ConnectionInfo>();
-    if security.classify(headers, connection) == RequestOrigin::External {
+    let local_migration = crate::migration::local_admin(request, security);
+    if !local_migration && security.classify(headers, connection) == RequestOrigin::External {
         return Err(ApiError::admin_lan_only(
             "The admin page is only available directly from the LAN (not through a proxy)",
         ));
@@ -113,7 +125,7 @@ fn check(request: &Request, security: &crate::Security) -> Result<(), ApiError> 
         }
     {
         return Err(ApiError::admin_lan_only(
-            "Open the admin page by IP address (e.g. http://192.0.2.10:8790/admin), localhost or a .local name",
+            "Open the admin page directly using the server's IP address, localhost or a LAN hostname, with the configured port",
         ));
     }
     let changing = !matches!(
@@ -125,7 +137,7 @@ fn check(request: &Request, security: &crate::Security) -> Result<(), ApiError> 
             .get(ADMIN_HEADER)
             .is_some_and(|value| value.as_bytes() == b"1");
         let same_origin = crate::auth::same_request_origin(request);
-        if !marked || !same_origin {
+        if (!marked && !local_migration) || !same_origin {
             return Err(ApiError::admin_header_required());
         }
     }

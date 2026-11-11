@@ -1,0 +1,43 @@
+Upstream declaration record: no standalone upstream license file is supplied here.
+Package: 
+simd_helpers
+Published version: 
+0.1.0
+Declared metadata license expression: MIT
+Pinned upstream commit: 
+ca1a2f84aa386d758e98f8a609d990263932fb85
+Published registry package SHA256: 
+95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6
+
+Exact upstream Cargo.toml declarations:
+version = "0.1.0"
+license = "MIT"
+authors = ["Luca Barbato <lu_zero@gentoo.org>"]
+
+The authors line is original Cargo Authors metadata. It is not a copyright-holder or year claim.
+
+Exact upstream README license declaration:
+No license declaration appears in the pinned README.
+
+The full non-truncated upstream tree contains no standalone LICENSE/LICENCE/NOTICE/COPYING/COPYRIGHT file.
+No copyright or license header was found in the published crate Rust files inspected locally.
+The accompanying LICENSE-MIT-STANDARD.txt contains the official SPDX MIT permission, conditions,
+and disclaimer verbatim, omitting its unassigned template copyright line. No attribution is invented.
+
+Source provenance:
+Role: Cargo.toml
+URL: https://raw.githubusercontent.com/lu-zero/simd_helpers/ca1a2f84aa386d758e98f8a609d990263932fb85/Cargo.toml
+Original response SHA256: b41497677a5498040f2eb3fc089e3c2c38c413dca64f41dc57a115e26480461d
+
+Role: README.md
+URL: https://raw.githubusercontent.com/lu-zero/simd_helpers/ca1a2f84aa386d758e98f8a609d990263932fb85/README.md
+Original response SHA256: e672b974ba905441c8eee630f10bc351f4e8e462c99d178b334ae3e48d8ca7f5
+
+Role: published-crates-io-version
+URL: https://crates.io/api/v1/crates/simd_helpers/0.1.0
+Original response SHA256: d0f0d28e1e607f2b4efe155ab9d9ef982f69cb8fbf2998729357292ebbc6b219
+
+Role: SPDX-original-MIT-with-template-placeholder
+URL: https://raw.githubusercontent.com/spdx/license-list-data/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/MIT.txt
+Original response SHA256: b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5
+

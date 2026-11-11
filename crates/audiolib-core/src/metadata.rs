@@ -3,8 +3,11 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-/// Preferred embedded description; BWF remains separately available without alteration.
+/// Preferred vendor description, then embedded description; BWF stays unaltered.
 pub fn source_description<'a>(bwf: &'a str, attributes: &'a Value) -> &'a str {
+    if let Some(value) = vendor_text(attributes, "description") {
+        return value;
+    }
     let value = &attributes["wav_metadata"]["fields"]["description"];
     value
         .as_str()
@@ -18,6 +21,9 @@ pub fn source_description<'a>(bwf: &'a str, attributes: &'a Value) -> &'a str {
 /// Metadata album. A shared folder fallback is represented separately by `Album`;
 /// it must not overwrite this declared Metadata value.
 pub fn album(attributes: &Value) -> String {
+    if let Some(value) = vendor_text(attributes, "library") {
+        return value.trim().to_owned();
+    }
     let value = &attributes["wav_metadata"]["fields"]["library"];
     let text = match value {
         Value::String(text) => text.as_str(),
@@ -25,6 +31,20 @@ pub fn album(attributes: &Value) -> String {
         _ => "",
     };
     text.trim().to_owned()
+}
+
+fn vendor_text<'a>(attributes: &'a Value, key: &str) -> Option<&'a str> {
+    let value = &attributes["vendor_metadata"]["fields"][key];
+    value
+        .as_str()
+        .or_else(|| {
+            value
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|v| !v.trim().is_empty())
+        })
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// `wav_metadata.fields` keys that feed `source_tags` and the derived search text.
@@ -36,32 +56,36 @@ pub const SOURCE_TAG_KEYS: [&str; 5] = [
     "cat_id",
 ];
 
-/// Read-only display tags derived from the extractor's canonical embedded fields.
+/// Read-only tags from controlled vendor fields, then canonical embedded fields.
 /// Keywords precede category labels; empty and case-insensitive duplicate values are
 /// omitted while retaining the first spelling. These values never replace library tags.
 pub fn source_tags(attributes: &Value) -> Vec<String> {
-    let fields = &attributes["wav_metadata"]["fields"];
     let mut tags = Vec::new();
     let mut seen = BTreeSet::new();
-    for key in SOURCE_TAG_KEYS {
-        let values = match &fields[key] {
-            Value::String(value) => vec![value.as_str()],
-            Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
-            _ => continue,
-        };
-        for value in values {
-            // Preserve multiword tags and category names; only keyword lists have separators.
-            let parts: Vec<_> = if key == "keywords" {
-                value
-                    .split([',', ';', '\r', '\n', '|', '，', '；', '、'])
-                    .collect()
-            } else {
-                vec![value]
+    for fields in [
+        &attributes["vendor_metadata"]["fields"],
+        &attributes["wav_metadata"]["fields"],
+    ] {
+        for key in SOURCE_TAG_KEYS {
+            let values = match &fields[key] {
+                Value::String(value) => vec![value.as_str()],
+                Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
+                _ => continue,
             };
-            for tag in parts {
-                let tag = tag.trim();
-                if !tag.is_empty() && seen.insert(tag.to_lowercase()) {
-                    tags.push(tag.to_owned());
+            for value in values {
+                // Preserve multiword tags and category names; only keyword lists have separators.
+                let parts: Vec<_> = if key == "keywords" {
+                    value
+                        .split([',', ';', '\r', '\n', '|', '，', '；', '、'])
+                        .collect()
+                } else {
+                    vec![value]
+                };
+                for tag in parts {
+                    let tag = tag.trim();
+                    if !tag.is_empty() && seen.insert(tag.to_lowercase()) {
+                        tags.push(tag.to_owned());
+                    }
                 }
             }
         }
@@ -96,9 +120,27 @@ pub fn source_metadata_search_text(bwf: &str, attributes: &Value) -> String {
     if !bwf.is_empty() {
         values.insert(bwf);
     }
-    for group in ["riff_info", "ixml", "axml", "xmp", "id3", "smed"] {
+    for group in [
+        "riff_info",
+        "ixml",
+        "axml",
+        "xmp",
+        "id3",
+        "id3v1",
+        "smed",
+        "vorbis",
+        "aiff",
+    ] {
         if let Some(fields) = attributes["wav_metadata"][group].as_object() {
-            for value in fields.values() {
+            for (key, value) in fields {
+                if group == "vorbis"
+                    && matches!(
+                        key.to_ascii_uppercase().as_str(),
+                        "METADATA_BLOCK_PICTURE" | "COVERART" | "COVERARTMIME"
+                    )
+                {
+                    continue;
+                }
                 if let Some(value) = value.as_str() {
                     values.insert(value);
                 } else if let Some(values_array) = value.as_array() {
@@ -106,6 +148,22 @@ pub fn source_metadata_search_text(bwf: &str, attributes: &Value) -> String {
                         values.insert(value);
                     }
                 }
+            }
+        }
+    }
+    // A separate, controlled vendor projection never rewrites embedded originals.
+    if let Some(fields) = attributes["vendor_metadata"]["fields"].as_object() {
+        for value in fields.values() {
+            match value {
+                Value::String(value) => {
+                    values.insert(value.as_str());
+                }
+                Value::Array(items) => {
+                    for value in items.iter().filter_map(Value::as_str) {
+                        values.insert(value);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -143,6 +201,47 @@ pub fn source_metadata_search_text(bwf: &str, attributes: &Value) -> String {
 mod tests {
     use super::{display_tags, source_tags};
     use serde_json::json;
+
+    #[test]
+    fn independent_vendor_fields_take_display_priority_without_hiding_search_sources() {
+        let attributes = json!({
+            "vendor_metadata":{"fields":{"description":"Vendor description","library":"Vendor album","keywords":["wind","vendor"]}},
+            "wav_metadata":{"fields":{"description":"Embedded description","library":"Embedded album","keywords":"wind,embedded"},
+                "vorbis":{"DESCRIPTION":"Embedded description","ARTIST":["Artist one","艺术家"],"COVERART":"binary-secret"}}
+        });
+        assert_eq!(
+            super::source_description("BWF original", &attributes),
+            "Vendor description"
+        );
+        assert_eq!(super::album(&attributes), "Vendor album");
+        assert_eq!(
+            display_tags("user, WIND", &attributes),
+            "user, WIND, vendor, embedded"
+        );
+        let text = super::source_metadata_search_text("BWF original", &attributes);
+        for value in [
+            "BWF original",
+            "Vendor description",
+            "Vendor album",
+            "Embedded description",
+            "Artist one",
+            "艺术家",
+            "wind,embedded",
+        ] {
+            assert!(text.contains(value), "{value}");
+        }
+        assert!(!text.contains("binary-secret"));
+    }
+
+    #[test]
+    fn wav_without_vendor_or_vorbis_retains_its_original_search_text_bytes() {
+        let attributes = json!({"wav_metadata":{"riff_info":{"INAM":"Alpha"},"smed":{"Description":"Zulu"},
+            "fields":{"keywords":"Beta","category":"Gamma","description":"not independently indexed"}}});
+        assert_eq!(
+            super::source_metadata_search_text("Delta", &attributes),
+            "Alpha\nBeta\nDelta\nGamma\nZulu"
+        );
+    }
 
     #[test]
     fn source_tags_preserve_order_and_deduplicate_canonical_fields() {
@@ -206,5 +305,27 @@ mod tests {
             assert!(text.contains(needle), "{needle} missing from {text:?}");
         }
         assert!(!text.contains("ignored here"));
+    }
+
+    #[test]
+    fn aiff_and_id3v1_text_is_searchable_without_indexing_layout_or_diagnostics() {
+        let attributes = json!({
+            "wav_metadata": {
+                "aiff": {"NAME":"aiff-title-token","ANNO":["aiff-description-token"]},
+                "id3v1": {"artist":"legacy-id3-artist-token"},
+                "warnings":["diagnostic-token"]
+            },
+            "source_audio_layout":{"untrusted":"layout-token"}
+        });
+        let text = super::source_metadata_search_text("", &attributes);
+        for value in [
+            "aiff-title-token",
+            "aiff-description-token",
+            "legacy-id3-artist-token",
+        ] {
+            assert!(text.contains(value));
+        }
+        assert!(!text.contains("diagnostic-token"));
+        assert!(!text.contains("layout-token"));
     }
 }

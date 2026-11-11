@@ -59,7 +59,7 @@ try {
         $known=if($entry.PSIsContainer){$entry.Name -in @('debug','release','doc','tmp') -or $entry.Name -match '^[A-Za-z0-9_]+-[A-Za-z0-9_-]+$'}else{$entry.Name -in @('CACHEDIR.TAG','.rustc_info.json','.audiolib-build-owner.json','.cargo-lock','.DS_Store') -or $entry.Name -match '^\.audiolib-.*\.lock$'}
         if(!$known){throw "Unrecognized build target entry: $($entry.Name)"}
     }
-    if((Test-Path -LiteralPath $ownerPath) -and (Get-Item -LiteralPath $ownerPath).Length -gt 16384){throw 'Invalid oversized cache ownership marker.'}
+    if((Test-Path -LiteralPath $ownerPath) -and (Get-Item -LiteralPath $ownerPath -Force).Length -gt 16384){throw 'Invalid oversized cache ownership marker.'}
     $owner=if(Test-Path -LiteralPath $ownerPath){Get-Content -LiteralPath $ownerPath -Raw|ConvertFrom-Json}else{$null}
     if($owner -and ($owner.schema_version -ne 1 -or $owner.owner_id -cne $ownerId -or $owner.host -cne [Environment]::MachineName)){throw 'Build cache belongs to a different workspace or host.'}
     $cargoTag=Join-Path $TargetDirectory 'CACHEDIR.TAG'

@@ -1,4 +1,5 @@
 // crates/audiolib-audio/src/wav.rs
+use crate::pcm_layout::{ByteOrder, PcmLayout, SampleKind};
 use crate::wav_metadata::{
     Artwork, EmbeddedMetadata, MAX_CHUNK_BYTES, MAX_ID3_BYTES, MAX_METADATA_BYTES, MAX_SMED_BYTES,
     text,
@@ -17,10 +18,12 @@ pub(crate) struct WavInfo {
     pub data_bytes: u64,
     pub block_align: u16,
     pub format_tag: u16,
+    pub pcm_layout: Option<PcmLayout>,
+    pub format_data: Vec<u8>,
     pub artwork: Option<Artwork>,
 }
 
-/// Read RIFF/RF64 headers and public embedded Metadata without decoding audio samples.
+/// Read supported source-audio headers and bounded public embedded Metadata.
 pub fn probe(path: &Path) -> Result<AudioMetadata> {
     Ok(read_info_impl(path, true, false)?.metadata)
 }
@@ -57,6 +60,49 @@ fn u64le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
+// The physical file may carry private trailers outside its declared RIFF parent.
+// RF64/BW64 store that parent's size in the mandatory first ds64 chunk instead
+// of the 32-bit header. Read only its fixed fields; never allocate its size table.
+fn container_bounds(
+    file: &mut (impl Read + Seek),
+    header: &[u8; 12],
+    file_len: u64,
+) -> Result<(u64, Option<u64>)> {
+    let (size, data_size, ds64_end) = if &header[..4] == b"RIFF" {
+        (u64::from(u32le(&header[4..8])), None, 12)
+    } else {
+        let mut chunk = [0_u8; 8];
+        file.read_exact(&mut chunk)?;
+        let size = u64::from(u32le(&chunk[4..]));
+        if &chunk[..4] != b"ds64" || size < 28 {
+            return Err(Error::Audio(
+                "RF64/BW64 requires a valid first ds64 chunk".into(),
+            ));
+        }
+        let end = 20_u64 + size + (size & 1);
+        if end > file_len {
+            return Err(Error::Audio("Truncated ds64 chunk".into()));
+        }
+        let mut data = [0_u8; 28];
+        file.read_exact(&mut data)?;
+        let table_bytes = u64::from(u32le(&data[24..])) * 12;
+        if 28 + table_bytes > size {
+            return Err(Error::Audio("Truncated ds64 size table".into()));
+        }
+        (u64le(&data), Some(u64le(&data[8..])), end)
+    };
+    let end = size
+        .checked_add(8)
+        .ok_or_else(|| Error::Audio("WAV container size overflow".into()))?;
+    if end < ds64_end {
+        return Err(Error::Audio("Invalid WAV container size".into()));
+    }
+    if end > file_len {
+        return Err(Error::Audio("Truncated WAV container".into()));
+    }
+    Ok((end, data_size))
+}
+
 /// Playback layout only: stops at the `data` chunk once `fmt ` is known, so a network
 /// source never fetches the file's tail (trailing metadata chunks) to start playing.
 pub(crate) fn read_info(path: &Path) -> Result<WavInfo> {
@@ -64,11 +110,17 @@ pub(crate) fn read_info(path: &Path) -> Result<WavInfo> {
 }
 
 fn read_info_impl(path: &Path, include_metadata: bool, include_artwork: bool) -> Result<WavInfo> {
-    let (file, file_len) = crate::source::open_source(path)?;
+    let (mut file, file_len) = crate::source::open_source(path)?;
+    if !include_metadata
+        && let Some(metadata) = crate::source::registered_metadata(path)
+        && metadata.attributes["container"] == "MP3"
+    {
+        return crate::mp3_metadata::cached_info(&mut file, file_len, metadata);
+    }
     read_info_reader(file, file_len, include_metadata, include_artwork)
 }
 
-fn read_info_reader(
+pub(crate) fn read_info_reader(
     mut file: impl Read + Seek,
     file_len: u64,
     include_metadata: bool,
@@ -76,32 +128,58 @@ fn read_info_reader(
 ) -> Result<WavInfo> {
     let mut header = [0_u8; 12];
     file.read_exact(&mut header)?;
+    if matches!(&header[..4], b"fLaC" | b"OggS") {
+        return crate::vorbis_metadata::read_info(file, file_len, include_metadata);
+    }
+    if &header[..4] == b"FORM" {
+        return crate::aiff_metadata::read_info(file, file_len, include_metadata, include_artwork);
+    }
+    if &header[..3] == b"ID3" || header[0] == 0xff && header[1] & 0xe0 == 0xe0 {
+        return crate::mp3_metadata::read_info(file, file_len, include_metadata, include_artwork);
+    }
     if !matches!(&header[..4], b"RIFF" | b"RF64" | b"BW64") || &header[8..] != b"WAVE" {
         return Err(Error::Audio(
             "Expected little-endian RIFF/RF64/BW64 WAV".into(),
         ));
     }
     let rf64 = &header[..4] != b"RIFF";
+    let (container_end, rf64_data_size) = container_bounds(&mut file, &header, file_len)?;
     let mut attrs = Map::new();
     let mut embedded = EmbeddedMetadata::default();
+    if include_metadata && container_end < file_len {
+        embedded.warning(format!(
+            "Ignored {} trailing bytes outside the WAV container",
+            file_len - container_end
+        ));
+    }
     let mut metadata_bytes = 0_u64;
     let mut sample_rate = 0;
     let mut channels = 0;
     let mut bits = 0;
     let mut block_align = 0;
     let mut format_tag = 0;
+    let mut format_data = Vec::new();
     let mut data_offset = 0;
     let mut data_bytes = 0;
-    let mut rf64_data_size = None;
     let mut fact_frames = None;
     let mut position = 12_u64;
-    while position.checked_add(8).is_some_and(|end| end <= file_len) {
+    while position < container_end {
+        let payload = position
+            .checked_add(8)
+            .filter(|end| *end <= container_end)
+            .ok_or_else(|| Error::Audio("Truncated WAV chunk header".into()))?;
         file.seek(SeekFrom::Start(position))?;
         let mut chunk = [0_u8; 8];
         file.read_exact(&mut chunk)?;
         let raw_size = u32le(&chunk[4..]);
-        let payload = position + 8;
-        let size = if &chunk[..4] == b"data" && raw_size == u32::MAX && rf64 {
+        let size = if raw_size == u32::MAX && rf64 {
+            if &chunk[..4] != b"data" {
+                // Other sentinel-sized chunks need ds64 table resolution, which
+                // this reader does not support. Do not treat the sentinel as a size.
+                return Err(Error::Audio(
+                    "Unsupported RF64/BW64 size-table chunk".into(),
+                ));
+            }
             rf64_data_size
                 .ok_or_else(|| Error::Audio("RF64 data requires a preceding ds64 chunk".into()))?
         } else {
@@ -110,12 +188,16 @@ fn read_info_reader(
         let end = payload
             .checked_add(size)
             .ok_or_else(|| Error::Audio("WAV chunk size overflow".into()))?;
-        if end > file_len {
+        if end > container_end {
             return Err(Error::Audio(format!(
                 "Truncated WAV chunk {:?}",
                 &chunk[..4]
             )));
         }
+        let next = end
+            .checked_add(size & 1)
+            .filter(|end| *end <= container_end)
+            .ok_or_else(|| Error::Audio("Truncated WAV chunk padding".into()))?;
         if include_metadata {
             embedded.chunk(&chunk[..4], size);
         }
@@ -157,9 +239,9 @@ fn read_info_reader(
                 if size < 28 {
                     return Err(Error::Audio("Invalid ds64 chunk".into()));
                 }
-                let mut data = [0_u8; 28];
-                file.read_exact(&mut data)?;
-                rf64_data_size = Some(u64le(&data[8..16]));
+                if rf64 && position != 12 {
+                    return Err(Error::Audio("Duplicate RF64/BW64 ds64 chunk".into()));
+                }
             }
             b"fmt " => {
                 if !(16..=65536).contains(&size) {
@@ -179,6 +261,9 @@ fn read_info_reader(
                     attrs.insert("valid_bits_per_sample".into(), json!(u16le(&data[18..])));
                     attrs.insert("channel_mask".into(), json!(u32le(&data[20..])));
                     format_tag = u16le(&data[24..]);
+                }
+                if !matches!(format_tag, 1 | 3) {
+                    format_data = data;
                 }
             }
             b"data" => {
@@ -241,9 +326,7 @@ fn read_info_reader(
             b"bext" if within_budget => embedded.warning("bext: chunk shorter than 602 bytes"),
             _ => {}
         }
-        position = end
-            .checked_add(size & 1)
-            .ok_or_else(|| Error::Audio("Chunk offset overflow".into()))?;
+        position = next;
         if !include_metadata && data_offset != 0 && block_align != 0 {
             // Playback needs nothing after the audio; Metadata (`probe`) walks on.
             break;
@@ -268,12 +351,18 @@ fn read_info_reader(
     attrs.insert("format_tag".into(), json!(format_tag));
     attrs.insert(
         "container".into(),
-        json!(if rf64 { "RF64" } else { "RIFF" }),
+        json!(std::str::from_utf8(&header[..4]).unwrap()),
     );
     // finish() consumes the collector, so take the cover first.
     let artwork = embedded.take_artwork();
     if include_metadata {
         embedded.finish(&mut attrs);
+        if &header[..4] != b"RIFF" {
+            attrs["wav_metadata"]
+                .as_object_mut()
+                .unwrap()
+                .insert("container_version".into(), json!(1));
+        }
     }
     Ok(WavInfo {
         metadata: AudioMetadata {
@@ -299,6 +388,20 @@ fn read_info_reader(
         data_bytes,
         block_align,
         format_tag,
+        pcm_layout: matches!(format_tag, 1 | 3).then_some(PcmLayout {
+            endian: ByteOrder::Little,
+            kind: if format_tag == 3 {
+                SampleKind::Float
+            } else if bits == 8 {
+                SampleKind::Unsigned
+            } else {
+                SampleKind::Signed
+            },
+            // Keep unsupported header values available to Metadata callers;
+            // zero is an invalid storage width and can never wrap to valid PCM.
+            bytes_per_sample: u8::try_from(bits / 8).unwrap_or(0),
+        }),
+        format_data,
         artwork,
     })
 }

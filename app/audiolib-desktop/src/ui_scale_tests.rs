@@ -60,6 +60,18 @@ const VIEWS: &[(&str, Setup)] = &[
         ui.set_settings_page(1);
         ui.set_settings_visible(true);
     }),
+    ("search-settings", |ui| {
+        ui.set_settings_page(2);
+        ui.set_settings_visible(true);
+    }),
+    ("sync-settings", |ui| {
+        ui.set_settings_page(3);
+        ui.set_settings_visible(true);
+    }),
+    ("cache-settings", |ui| {
+        ui.set_settings_page(4);
+        ui.set_settings_visible(true);
+    }),
     ("about", |ui| ui.set_about_visible(true)),
     ("help", |ui| ui.set_help_visible(true)),
     ("wide", |ui| ui.set_inspector_visible(false)),
@@ -148,6 +160,159 @@ fn save_snapshot(ui: &AppWindow, file: &str) {
             image::ColorType::Rgba8,
         )
         .unwrap();
+    }
+}
+
+fn long_remote_source_label(chinese: bool) -> &'static str {
+    if chinese {
+        "服务器模式 · 影视制作音效资料库 — 当前项目使用的远端扩展拟音合集 · 音效库：木门、机械装置与室内环境素材 · 同步状态：已更新完整资料与目录，可继续检索与试听 · 较长的无空格服务器标识：sound-archive-production-foley-current-project.example.test:8791"
+    } else {
+        "Server mode · Production archive — Extended Foley collection for the current project · Library: doors, mechanisms and interiors · Synchronization: complete metadata and directories, ready for search and audition · Long server identifier: sound-archive-production-foley-current-project.example.test:8791"
+    }
+}
+
+fn remote_toolbar_window(
+    theme: &str,
+    chinese: bool,
+    width: f32,
+    height: f32,
+    scale: f32,
+) -> AppWindow {
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::LogicalSize::new(width, height));
+    crate::theme::apply_theme(&ui, theme);
+    ui.global::<crate::Theme>().set_ui_scale(scale);
+    ui.set_chinese(chinese);
+    ui.set_remote_mode(true);
+    ui.set_data_source_label(long_remote_source_label(chinese).into());
+    ui.set_query("metal door".into());
+    ui.set_search_scope_index(1);
+    ui.set_rows(synthetic_rows());
+    ui.set_folders(synthetic_folders());
+    ui.show().unwrap();
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    ui
+}
+
+#[test]
+fn source_label_hover_reveals_full_remote_status_without_changing_search() {
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::WindowEvent;
+    use std::time::Duration;
+
+    init_software_backend();
+    for theme in audiolib_core::config::THEME_IDS {
+        for chinese in [false, true] {
+            let ui = remote_toolbar_window(theme, chinese, 1080.0, 700.0, 1.0);
+            ui.on_search_requested(|_| panic!("Source hover must not request a search"));
+            ui.on_search_scope_changed(|| panic!("Source hover must not change search scope"));
+            ui.on_sm_open_requested(|_| panic!("Source hover must not open source management"));
+            ui.on_library_action(|_| panic!("Source hover must not open library management"));
+            let label = long_remote_source_label(chinese);
+            let source = ElementHandle::find_by_accessible_label(&ui, label)
+                .find(|element| element.accessible_role() == Some(AccessibleRole::Button))
+                .expect("current remote source control");
+            let language = if chinese { "cn" } else { "en" };
+            save_snapshot(&ui, &format!("source-before-hover-{theme}-{language}.png"));
+            let before = ElementHandle::find_by_accessible_label(&ui, label).count();
+            let (origin, size) = (source.absolute_position(), source.size());
+            ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(
+                    origin.x + size.width / 2.0,
+                    origin.y + size.height / 2.0,
+                ),
+            });
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+            save_snapshot(&ui, &format!("source-after-hover-{theme}-{language}.png"));
+
+            // The badge already exposes this label. A newly visible copy proves
+            // that the tooltip also exposes the complete, unabridged summary.
+            assert!(
+                ElementHandle::find_by_accessible_label(&ui, label).count() > before,
+                "source tooltip must expose the complete summary: {theme}/{language}"
+            );
+            assert_eq!(ui.get_data_source_label(), label);
+            assert_eq!(ui.get_query(), "metal door");
+            assert_eq!(ui.get_search_scope_index(), 1);
+            assert!(!ui.get_library_visible());
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn search_and_library_actions_remain_reachable_with_long_source_labels() {
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::PointerEventButton;
+    use std::{cell::RefCell, rc::Rc};
+
+    init_software_backend();
+    for theme in audiolib_core::config::THEME_IDS {
+        for chinese in [false, true] {
+            for (layout, width, height) in [("compact", 1080.0, 700.0), ("wide", 1440.0, 900.0)] {
+                for scale in [1.0, 1.5, 2.0] {
+                    let ui = remote_toolbar_window(theme, chinese, width, height, scale);
+                    let language = if chinese { "cn" } else { "en" };
+                    save_snapshot(
+                        &ui,
+                        &format!("search-source-{theme}-{language}-{layout}-x{scale}.png"),
+                    );
+                    // Larger scales are inspected in the snapshots; exercise
+                    // pointer routing at the application's minimum window size.
+                    if layout == "compact" && scale == 1.0 {
+                        let searches = Rc::new(RefCell::new(Vec::new()));
+                        let observed = searches.clone();
+                        ui.on_search_requested(move |explicit| {
+                            observed.borrow_mut().push(explicit);
+                        });
+                        ui.on_search_scope_changed(|| {
+                            panic!("Toolbar actions must retain the search scope")
+                        });
+                        let managers = Rc::new(RefCell::new(Vec::new()));
+                        let observed = managers.clone();
+                        ui.on_sm_open_requested(move |page| observed.borrow_mut().push(page));
+                        let libraries = Rc::new(RefCell::new(Vec::new()));
+                        let observed = libraries.clone();
+                        ui.on_library_action(move |action| observed.borrow_mut().push(action));
+                        let search_label =
+                            match (ui.global::<crate::Theme>().get_modern_style(), chinese) {
+                                (false, false) => "Search",
+                                (false, true) => "搜索",
+                                (true, false) => "Run search",
+                                (true, true) => "执行搜索",
+                            };
+                        ElementHandle::find_by_accessible_label(&ui, search_label)
+                            .find(|element| {
+                                element.accessible_role() == Some(AccessibleRole::Button)
+                            })
+                            .expect("visible search action")
+                            .mock_single_click(PointerEventButton::Left);
+                        assert_eq!(&*searches.borrow(), &[true]);
+                        assert!(managers.borrow().is_empty());
+                        ElementHandle::find_by_accessible_label(
+                            &ui,
+                            if chinese {
+                                "管理音效库"
+                            } else {
+                                "Manage library"
+                            },
+                        )
+                        .find(|element| element.accessible_role() == Some(AccessibleRole::Button))
+                        .expect("visible library management action")
+                        .mock_single_click(PointerEventButton::Left);
+                        assert_eq!(&*managers.borrow(), &[1]);
+                        assert_eq!(&*libraries.borrow(), &[0]);
+                        assert!(ui.get_library_visible());
+                        assert_eq!(ui.get_query(), "metal door");
+                        assert_eq!(ui.get_search_scope_index(), 1);
+                    }
+                    ui.hide().unwrap();
+                }
+            }
+        }
     }
 }
 
@@ -251,12 +416,12 @@ fn main_view_at_2_0_in_1080x700_scrolls_to_its_last_control() {
 #[test]
 fn settings_pages_at_2_0_in_1080x700_scroll_to_their_last_controls() {
     init_software_backend();
-    for page in [0, 1] {
+    for page in 0..5 {
         for chinese in [false, true] {
             let ui = small_window_at_2_0(|ui| ui.set_settings_visible(true));
             ui.set_settings_page(page);
             ui.set_chinese(chinese);
-            let name = if page == 1 { "appearance" } else { "settings" };
+            let name = ["audio", "general", "search", "sync", "cache"][page as usize];
             let language = if chinese { "cn" } else { "en" };
             save_snapshot(&ui, &format!("{name}-{language}-x2-1080x700-scroll0.png"));
             let top = ui.get_settings_panel_top();
@@ -265,9 +430,6 @@ fn settings_pages_at_2_0_in_1080x700_scroll_to_their_last_controls() {
                 top >= 0.0 && panel_bottom <= 700.0,
                 "panel {top}..{panel_bottom}"
             );
-            if page == 0 {
-                assert!(ui.get_settings_last_bottom() > panel_bottom);
-            }
             ui.invoke_scroll_main_to_end();
             save_snapshot(&ui, &format!("{name}-{language}-x2-1080x700-scrollmax.png"));
             let last = ui.get_settings_last_bottom();
@@ -284,7 +446,7 @@ fn settings_pages_at_2_0_in_1080x700_scroll_to_their_last_controls() {
 fn tab_never_reaches_controls_on_the_hidden_settings_page() {
     use slint::platform::{Key, WindowEvent};
     init_software_backend();
-    for page in [0, 1] {
+    for page in 0..5 {
         let ui = AppWindow::new().unwrap();
         ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
         ui.set_settings_visible(true);
@@ -380,7 +542,9 @@ fn default_theme_applied_from_rust_is_pixel_identical() {
 #[test]
 fn theme_registry_round_trips_and_lists_both_languages() {
     use crate::theme::{apply_theme, theme_id, theme_index};
-    use audiolib_core::config::{DEFAULT_THEME, STUDIO_THEME, THEME_IDS};
+    use audiolib_core::config::{
+        BUILTIN_THEMES, DEFAULT_THEME, PlayerStyle, THEME_IDS, WorkbenchStyle,
+    };
 
     init_software_backend();
     let ui = AppWindow::new().unwrap();
@@ -391,7 +555,11 @@ fn theme_registry_round_trips_and_lists_both_languages() {
         assert_eq!(ui.get_theme_index(), index as i32);
         assert_eq!(
             ui.global::<crate::Theme>().get_modern_style(),
-            *id == STUDIO_THEME
+            BUILTIN_THEMES[index].workbench_style == WorkbenchStyle::Studio
+        );
+        assert_eq!(
+            ui.global::<crate::Theme>().get_modern_player(),
+            BUILTIN_THEMES[index].player_style == PlayerStyle::Studio
         );
         let english = ui.get_theme_names();
         let chinese = ui.get_theme_names_cn();
@@ -409,12 +577,13 @@ fn theme_registry_round_trips_and_lists_both_languages() {
     apply_theme(&ui, "removed-theme");
     assert_eq!(ui.get_theme_index(), theme_index(DEFAULT_THEME));
     assert!(!ui.global::<crate::Theme>().get_modern_style());
+    assert!(!ui.global::<crate::Theme>().get_modern_player());
 }
 
 #[test]
 fn theme_switch_preserves_transport_view_and_typography() {
     use crate::theme::{apply_font_sizes, apply_theme};
-    use audiolib_core::config::{DEFAULT_THEME, STUDIO_THEME};
+    use audiolib_core::config::{DEFAULT_THEME, DEFAULT_V2_THEME, STUDIO_THEME};
 
     init_software_backend();
     let ui = AppWindow::new().unwrap();
@@ -423,6 +592,10 @@ fn theme_switch_preserves_transport_view_and_typography() {
     ui.set_folders(synthetic_folders());
     ui.set_has_selection(true);
     ui.set_selected_id("42".into());
+    ui.set_query("rain in forest".into());
+    ui.set_edit_tags("rain, draft".into());
+    ui.set_edit_notes("Unsaved Metadata note".into());
+    ui.set_metadata_dirty(true);
     ui.set_audio_ready(true);
     ui.set_playing(false);
     ui.set_playback_state(4);
@@ -447,9 +620,19 @@ fn theme_switch_preserves_transport_view_and_typography() {
     ui.show().unwrap();
 
     let mut frames = Vec::new();
-    for id in [DEFAULT_THEME, STUDIO_THEME, DEFAULT_THEME] {
+    for id in [
+        DEFAULT_THEME,
+        STUDIO_THEME,
+        DEFAULT_V2_THEME,
+        STUDIO_THEME,
+        DEFAULT_THEME,
+    ] {
         apply_theme(&ui, id);
         assert_eq!(ui.get_selected_id().as_str(), "42");
+        assert_eq!(ui.get_query(), "rain in forest");
+        assert_eq!(ui.get_edit_tags(), "rain, draft");
+        assert_eq!(ui.get_edit_notes(), "Unsaved Metadata note");
+        assert!(ui.get_metadata_dirty());
         assert!(ui.get_audio_ready());
         assert!(!ui.get_playing());
         assert_eq!(ui.get_playback_state(), 4);
@@ -475,7 +658,7 @@ fn theme_switch_preserves_transport_view_and_typography() {
         "The theme must switch the player presentation"
     );
     assert!(
-        frames[0] == frames[2],
+        frames[0] == frames[4],
         "Switching back must restore the classic presentation"
     );
     ui.hide().unwrap();
@@ -484,7 +667,7 @@ fn theme_switch_preserves_transport_view_and_typography() {
 #[test]
 fn theme_switch_does_not_replay_expired_or_classic_input_rejections() {
     use crate::theme::apply_theme;
-    use audiolib_core::config::{DEFAULT_THEME, STUDIO_THEME};
+    use audiolib_core::config::{DEFAULT_THEME, DEFAULT_V2_THEME, STUDIO_THEME};
     use std::time::Duration;
 
     init_software_backend();
@@ -515,25 +698,27 @@ fn theme_switch_does_not_replay_expired_or_classic_input_rejections() {
     save_snapshot(&ui, "theme-feedback-expired.png");
     assert!(expired == baseline, "the rejection feedback must expire");
 
-    apply_theme(&ui, DEFAULT_THEME);
-    let _classic = frame(); // Commit destruction before selecting Studio again.
-    apply_theme(&ui, STUDIO_THEME);
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
-    save_snapshot(&ui, "theme-feedback-restored.png");
-    assert!(
-        frame() == baseline,
-        "switching must not replay an expired event"
-    );
+    for id in [DEFAULT_THEME, DEFAULT_V2_THEME] {
+        apply_theme(&ui, id);
+        let _classic = frame(); // Commit destruction before selecting Studio again.
+        apply_theme(&ui, STUDIO_THEME);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        save_snapshot(&ui, &format!("theme-feedback-restored-from-{id}.png"));
+        assert!(
+            frame() == baseline,
+            "switching from {id} must not replay an expired event"
+        );
 
-    apply_theme(&ui, DEFAULT_THEME);
-    let _classic = frame();
-    ui.invoke_audition_input_rejected(3);
-    apply_theme(&ui, STUDIO_THEME);
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
-    assert!(
-        frame() == baseline,
-        "a classic event must not reach a new Studio"
-    );
+        apply_theme(&ui, id);
+        let _classic = frame();
+        ui.invoke_audition_input_rejected(3);
+        apply_theme(&ui, STUDIO_THEME);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        assert!(
+            frame() == baseline,
+            "a classic event from {id} must not reach a new Studio"
+        );
+    }
 
     // Repeated events in the selected Studio still deliver after its reset.
     ui.invoke_audition_input_rejected(2);
@@ -543,10 +728,11 @@ fn theme_switch_does_not_replay_expired_or_classic_input_rejections() {
 }
 
 #[test]
-fn appearance_theme_keyboard_selection_applies_the_requested_style() {
+fn view_theme_menu_keyboard_selection_applies_the_requested_style() {
     use crate::theme::{apply_theme, theme_id, theme_index};
-    use audiolib_core::config::{DEFAULT_THEME, STUDIO_THEME};
-    use slint::platform::{Key, WindowEvent};
+    use crate::ui_tests::{open_menu, send_keys};
+    use audiolib_core::config::{DEFAULT_THEME, DEFAULT_V2_THEME, STUDIO_THEME};
+    use slint::platform::Key;
     use std::{cell::Cell, rc::Rc};
 
     init_software_backend();
@@ -554,8 +740,6 @@ fn appearance_theme_keyboard_selection_applies_the_requested_style() {
         let ui = AppWindow::new().unwrap();
         ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
         ui.set_chinese(chinese);
-        ui.set_settings_page(1);
-        ui.set_settings_visible(true);
         apply_theme(&ui, DEFAULT_THEME);
         let requests = Rc::new(Cell::new(0));
         ui.on_theme_requested({
@@ -567,32 +751,35 @@ fn appearance_theme_keyboard_selection_applies_the_requested_style() {
             }
         });
         ui.show().unwrap();
-        ui.invoke_focus_settings_first();
-        for key in [Key::Tab, Key::DownArrow] {
-            ui.window()
-                .dispatch_event(WindowEvent::KeyPressed { text: key.into() });
-            ui.window()
-                .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
-        }
-        assert_eq!(requests.get(), 1);
-        assert_eq!(ui.get_theme_index(), theme_index(STUDIO_THEME));
-        assert!(ui.global::<crate::Theme>().get_modern_style());
         let language = if chinese { "cn" } else { "en" };
-        save_snapshot(&ui, &format!("appearance-studio-{language}.png"));
-        for event in [
-            WindowEvent::KeyPressed {
-                text: Key::UpArrow.into(),
-            },
-            WindowEvent::KeyReleased {
-                text: Key::UpArrow.into(),
-            },
-        ] {
-            ui.window().dispatch_event(event);
+        for (step, id) in [STUDIO_THEME, DEFAULT_V2_THEME, DEFAULT_THEME]
+            .into_iter()
+            .enumerate()
+        {
+            open_menu(&ui, if chinese { "视图" } else { "View" });
+            // Theme is the first View command; Right enters its registered choices.
+            send_keys(&ui, &[Key::DownArrow.into()]);
+            send_keys(&ui, &[Key::RightArrow.into()]);
+            for _ in 0..=theme_index(id) {
+                send_keys(&ui, &[Key::DownArrow.into()]);
+            }
+            send_keys(&ui, &[Key::Return.into()]);
+            assert_eq!(requests.get(), step + 1);
+            assert_eq!(ui.get_theme_index(), theme_index(id));
+            assert_eq!(
+                ui.global::<crate::Theme>().get_modern_style(),
+                id != DEFAULT_THEME
+            );
+            assert_eq!(
+                ui.global::<crate::Theme>().get_modern_player(),
+                id == STUDIO_THEME
+            );
+            assert!(
+                !ui.get_settings_visible(),
+                "theme switching needs no dialog"
+            );
+            save_snapshot(&ui, &format!("menu-theme-{id}-{language}.png"));
         }
-        assert_eq!(requests.get(), 2);
-        assert_eq!(ui.get_theme_index(), theme_index(DEFAULT_THEME));
-        assert!(!ui.global::<crate::Theme>().get_modern_style());
-        save_snapshot(&ui, &format!("appearance-default-{language}.png"));
         ui.hide().unwrap();
     }
 }

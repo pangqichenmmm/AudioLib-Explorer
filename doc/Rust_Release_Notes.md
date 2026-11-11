@@ -1,4 +1,103 @@
-# 0.8.7（准备中）：30 个搜索任务、主题切换与播放重绘
+# 0.9.5：统一菜单与 Waveform 选区试听、切片
+
+程序 0.9.5 | API /api/v1/ | 本地写 schema 8 | 服务端迁移 schema 9 | 快照兼容 3..=9
+
+已于 2026-11-10 14:34:54 UTC（北京时间 22:34:54）正式发布 [v0.9.5](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.9.5)，以 `v0.9.4` 为基线使用 PATCH。经 [#267](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/267)、[#268](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/268) 完成 beta 验收和 main 提升；七份正式 payload 来自 main `7d7a60bad31d8640441b16de0d558d3a4211a0e0`。构建、本地验收、十四项线上资产与校验正文、发布后固定安装身份同步均通过，详见 [0.9.5 发布记录](Rust_Release_0.9.5.md)。API、写目标、快照读取范围及完整格式目录沿用 0.9.4，包括已有 `audio_sources:1` / af1 边界。
+
+- **菜单与设置**：三个主题使用统一的平台菜单栏，提供 View / 视图下的主题、语言和侧栏入口。全局设置按用途分组，音频与同步草稿分别管理；保留已有偏好与播放上下文。搜索工具栏和来源状态提示在窄窗口中保持可用。
+- **紧凑搜索标签**：关键词和目录使用同一行的紧凑文本，关键词优先，目录仅在不挤压关键词时出现；标签文本靠左，完整条件仍可悬停查看。
+- **Waveform 选区试听**：经典与现代播放器支持正向或反向框选、端点调整、Shift 重新框选与 Esc 取消。选区绑定当前显示的声音，按原素材采样帧保存；松开后试听该范围，Stop、播放结束后重播和循环遵循选区边界。
+- **原素材 WAV 切片**：拖出选区时后台准备 WAV，保留原采样率和全部源声道，忽略试听的 Pitch、Rate、Mono 与音量。原生目标接受复制后保留独立的编号文件，不覆盖已有输出；未交付的文件按拥有边界清理。输出仅重建必要音频结构，不复制源文件的描述、封面、cue、BEXT、iXML 或未知厂商块；源音频与资料库 Metadata、用户标注不变。
+- **来源与反馈**：远程切片使用与显示版本一致的原始音频，绑定强 ETag、长度和版本凭据；原件不可验证或已变化时拒绝切片，不使用低质量预览代替。Waveform 增加匹配操作状态的原生光标与准备进度，光标大小随系统 DPI，保持独立于应用缩放。
+- **音频与诊断**：配对销毁原生 SoundTouch 处理器，修复 Windows 包装层遗漏析构导致的缓冲积累；原生版本与试听算法保持不变。同步 Rust panic 记录省略 panic payload、配置和运行参数，原生崩溃仍需对应系统证据。
+- **发布工具**：在构建前预检实际目标及 feature 所选依赖的精确许可证材料，缺件时阻止继续构建；打包与运行验收保留各自的许可证检查。
+
+七个正式归档及其 SHA256 共十四项线上资产已核验；内部 Linux arm64 原生包仅供 Docker 输入。Mac 已新增严格 Clippy、180 项音频与 93 项 Waveform 测试，并通过最终包的原生运行及 Quit；Windows 固定安装 verified=907、copied=23，CLI 0.9.5 与隔离启动通过，发布后全文件身份再次复核。Windows server 真实服务优雅关闭、Explorer/Finder/DAW 跨程序拖出、真实 ASIO 硬件和声学起音延迟未测；Mac ad-hoc 签名不是 Apple 公证，Linux x64/Docker amd64 验收使用 ARM64 主机仿真。
+
+# 0.9.4：新音频源格式与自适应搜索任务标签
+
+程序 0.9.4 | API /api/v1/ | 本地写 schema 8 | 服务端迁移 schema 9 | 快照兼容 3..=9
+
+已于 2026-11-08 15:28:34 UTC 正式发布 [v0.9.4](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.9.4)，以 `v0.9.3` 为基线。功能来自 [#255](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/255)、[#256](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/256)，经 [#257](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/257)、[#258](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/258) 提升至 main `f6adb2bd777d4db78d43cbdcee626153592c1482`。七份正式 payload、十四项资产、线上 digest/校验正文和发布后固定安装同步通过，详见 [0.9.4 发布记录](Rust_Release_0.9.4.md)。后续文档提交不改变二进制源码或标签身份。
+
+- **扫描与 Metadata**：默认扫描新增 `.mp3`、`.aif`、`.aiff`、`.bwf`；根据实际容器字节识别格式。MP3 提取有界 ID3 文本、重复及未知字段、可选封面和 ID3v1 fallback；AIFF 提取 NAME/AUTH/ANNO/COMT/ID3，并支持明确的 AIFF/AIFC PCM/float 子集。用户标签、备注、收藏等标注保持独立。
+- **RIFF 边界**：子块遍历限制在 RIFF 或 RF64/BW64 的父容器声明范围内，容器外私有尾信息不再使合法音频误报截断；真正的音频块越界、内部结构异常及错误 PCM 布局仍拒绝。
+- **原文件试听**：非 WAV 远程试听使用原始 `/stream` 字节。MP3 采用实际完整帧计数与已验证的 gapless trim；解码器内存中的可信信息帧避免坏 Xing/Info 字段覆盖准确时长，不改写源文件、HTTP 内容或下载缓存。AIFF 使用明确的字节序、signed PCM 和 float 布局，seek 与 Waveform 共用解码路径。本版不承诺新的实际播放启动延迟或主观音质测量结果。
+- **兼容边界**：首次成功写入新增音频源时，同一事务启用必需 feature `audio_sources:1`。完整格式新增 `ale-s8-cld1-t3-m2-p1-a1-af1` / `ale-s9-cld1-t3-m2-p1-a1-sd1-af1`；未启用扩展源的库保持原格式，schema 数字不变。旧客户端不能凭 schema 8/9 放行 af1；既有 schema-9 WAV-only 兼容投影继续排除新增容器。共享本地库启用新源前须关闭旧版读写实例。
+- **搜索任务标签**：标签先均分可用宽度，最窄为 100% UI scale 下 144 逻辑像素，再进入横向滚动；滚动条保留独立底部空间。关键词优先显示，前缀和目录只在不挤压关键词时出现。
+- **构建缓存工具**：修正隐藏所有权标记的读取，并加入真实 Hidden 标记的预览、清理及 release 输出保留回归；不扩大清理权限或外部缓存的认领范围。
+
+升级前保留受支持的资料库备份；先升级需要访问新源的客户端和服务端，再进行扫描。启用 af1 后，回退旧程序须使用兼容的备份或受支持的只读投影，不能手工移除 feature 标记。旧 `v0.9.3` 的两份客户端替换身份继续按原发布记录保留，不在本版重新计算为新功能。
+
+# 0.9.3：Waveform、播放反馈与连续浏览修复
+
+程序 0.9.3 | API /api/v1/ | 本地写 schema 8 | 服务端迁移 schema 9 | 快照兼容 3..=9
+
+已于 2026-11-07 发布 [v0.9.3](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.9.3)，以 `v0.9.2` 为基线。完整格式保持 `ale-s8-cld1-t3-m2-p1-a1` / 服务端 `ale-s9-cld1-t3-m2-p1-a1-sd1`，不引入数据库迁移。正式资产、SHA256 及验收边界见 [0.9.3 发布记录](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/beta/doc/Rust_Release_0.9.3.md)。
+
+两个客户端于 2026-11-07 20:44:57（北京时间）按用户明确授权替换：Windows x64 / macOS arm64 客户端来自 main `81ac352fdd73a009197a1442887dc65256aca302`，原 tag `v0.9.3` 仍指向 `5ca7e59c7fcadc22043f0a030c8d496854809b23`。其余五份归档与各自校验文件（共十项资产）保持原始发布字节。已安装 `0.9.3` 的用户需手动重新下载客户端更新，同版本不会再次弹出更新提示；Mac 包继续为 ad-hoc 签名，未经 Apple 公证。新旧客户端 SHA256 和各平台实际验收结果见发布记录。
+
+- **Waveform（#239）**：修复已播放区域在不同 DPI 和缩放位置出现细接缝的问题，保持连续的播放进度着色。
+- **播放反馈（#239；客户端替换 #246 / #247）**：Classic 播放、暂停、停止、循环和 Mono 统一移除激活下划线，使用边框与底色表达状态；保留键盘、启用条件和无障碍选中状态。
+- **连续浏览（借鉴 #185 的空页处理）**：服务器移除记录后，连续浏览会越过被隐藏的整页结果，保留前后导航、任务切换与恢复位置。导航失败时保留当前结果；后台资料库变化时重新读取，避免续查遗漏或重复。
+- **备份与打包（#241 / #243）**：仅对新建的自有 WAL 备份完成独立镜像收尾，源库保持只读；补齐 Mac 实际依赖的精确版本许可证材料及校验出处。
+
+本次不改变源 WAV、Metadata 存储格式、HTTP API 或服务端写目标。发布范围包括 Windows x64 / Mac arm64 客户端，Windows x64 / Mac arm64 / Linux x64 服务端，以及 Docker linux/amd64 / linux/arm64，共七个归档及各自 SHA256。执行进度与平台覆盖见上述发布记录。
+
+# 0.9.2：服务器模式重启后保留封面，并避免对当前客户端误弹升级窗
+
+程序 0.9.2 | API /api/v1/ | 本地写 schema 8 | 服务端迁移 schema 9 | 快照兼容 3..=9
+
+已发布。以已发布的 `v0.9.1` 为基线。完整格式保持 `ale-s8-cld1-t3-m2-p1-a1` / 服务端 `ale-s9-cld1-t3-m2-p1-a1-sd1`，不引入数据库迁移。
+
+- **服务器模式封面与启动同步（#236）**：打开上次缓存快照后就会请求 `/capabilities`，不再只在点同步成功后才拉取。在 capabilities 尚未就绪时继续使用已经读到的磁盘封面，避免重启后封面空白、必须再同步一次。
+- **升级提示**：GET `/capabilities` 带上兼容头；当正在运行的客户端已经达到 `min_client_version` 时，不再弹出 Software update 窗口。
+
+本次不改变源 WAV、Metadata 存储格式、HTTP API 或服务端写目标。
+
+# 0.9.1：sidecar-v1 跨子目录与 Docs/Sounds 兄弟目录匹配
+
+程序 0.9.1 | API /api/v1/ | 本地写 schema 8 | 服务端迁移 schema 9 | 快照兼容 3..=9
+
+已发布。以已发布的 `v0.9.0` 为基线。完整格式保持 `ale-s8-cld1-t3-m2-p1-a1` / 服务端 `ale-s9-cld1-t3-m2-p1-a1-sd1`，不引入数据库迁移。
+
+- **扫描 sidecar-v1 表格匹配（#233）**：自动发现的 CSV/TSV/XLS/XLSX 在匹配 WAV 时，可覆盖表格目录子树，以及扫描根下同 stem 的 `{stem}--Docs` / `{stem}--Sounds*` 兄弟目录。
+- 仅当表格所在目录本身是 `{stem}--Docs` 或 `{stem}--Sounds*` 时，才扩展到同 stem 兄弟；并排不同 pack 不会交叉匹配。
+- 身份与文件名校验不变；范围内重名 basename 仍视为歧义；不会按 basename 搜索资料库根。
+
+本次不改变源 WAV、Metadata 存储格式、HTTP API 或服务端写目标。
+
+# 0.9.0：扩展搜索与 Metadata 来源
+
+程序 0.9.0 | API /api/v1/ | 本地写 schema 8 | 服务端迁移 schema 9 | 快照兼容 3..=9
+
+已发布。进度和证据见 [发布准备](Rust_Release_0.9.0.md)。下文已发布 0.8.7 的历史格式与身份保持原样。
+
+- **路径可搜（#204）**：新增目录段与祖先目录搜索，支持中文分词；提供主字段、
+  仅文件名、仅路径、全部四种范围。全部支持主字段与路径之间的 AND 组合；
+  仅路径中的每个词都必须命中目录。范围随搜索任务保存，筛选、排序和翻页保持一致。
+- **Vorbis 标签（#205）**：扫描 FLAC、Ogg Vorbis/FLAC 与 OGA，保留重复、中文及未知文本标签，
+  接通 Metadata 显示和搜索。存量文件可重新提取，保留用户标注；图片不进入 FTS5。
+  随包支持 FLAC/Ogg Vorbis 解码试听，Opus 仅支持标签探测。
+- **厂商表格（#206）**：导入 CSV/TSV、BIFF XLS 与 XLSX，支持编码/BOM、表头、多个 sheet、
+  列映射和模板。先预览，再按相对路径或文件名匹配；歧义候选可分页并明确确认。
+  提交提供批次、进度、取消/续传、历史和回滚；保留原始来源及用户标注，厂商文本可搜索。
+  本地和有管理权限的服务端导入使用同一业务契约。
+  扫描还会自动发现同目录CSV/TSV/XLS/XLSX，仅关联本轮成功扫描的唯一WAV；先完整解析，
+  再分批补充Metadata，按嵌入及手动来源去重并保留独立用户标注。完整关联的表格变更会更新自身贡献；
+  存在未匹配或歧义时保留该来源全部旧贡献并加入安全新值，修正表格或显式回滚后可收敛。
+  损坏、空表或暂时缺失不会自动删除最后有效Metadata，增量重扫支持仅表格变化及新WAV。
+- **客户端与服务端迁移**：普通本地库继续写 schema8，目录索引准备不冒充 schema9 转换。
+  服务端由显式迁移发布 schema9，提供备份、进度、取消/恢复和回滚；新客户端读取校验过的
+  schema8/9 快照，支持 Metadata 增量与离线重开。过渡期默认保留旧客户端的 WAV-only schema8 派生快照。
+- **配套界面**：现代主题提供迁移管理、厂商导入和刷新入口；升级提示按库身份去重。
+  保留 Default v2 与播放器反馈改进。
+
+迁移顺序为先更新可读 schema8/9 的客户端，再更新处于 deferred 状态的服务端，最后由管理员
+显式启动迁移。首个包含独立迁移工具的服务端包须手动引导安装，旧更新器会拒绝新布局。
+数据库回退必须配合匹配的备份及新写入保护；详情见发布准备中的操作和恢复方案。
+
+# 0.8.7：30 个搜索任务、主题切换与播放重绘
 
 程序 0.8.7 | API /api/v1/ | schema 8 | 快照兼容 3..=8
 
@@ -16,7 +115,9 @@
 - 本地 beta 安装使用独立开发身份，防止自动更新误跳转到已发布的旧稳定包；新增可续跑的本地发布管线与有预算的编译缓存维护。
 - 原生窗口重绘验证可分别选择 Default / Studio，Studio 使用独立报告，避免后运行的主题覆盖先前结果。
 
-当前所选源码检查已通过，既有滚动及 Studio 锚点失败已在保留原断言的定向复验中通过；尚未完成本轮交付、原生验收、beta 门禁和最终多平台产物验收。范围、历史失败及各项实测身份见 [0.8.7 发布准备](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/beta/doc/Rust_Release_0.8.7.md)。源 WAV、Metadata、资料库格式和服务端 API 沿用现有契约，正式资产仍为七个归档及各自 SHA256。
+本轮所选源码检查、交付、原生验收、beta 门禁及最终多平台产物验收已完成，[v0.8.7 正式 Release](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.8.7) 已发布七个归档及各自 SHA256，共十四项资产。标签与实际产物源码冻结为 `b5a98ff98fed501aafff0f6a4ef5015c8b4d435d`；后续 main `d0168f74182f52f493adb2a3b1fc9af0f3ec4eac` 仅整合验收工具和流程记录，没有移动标签或重建已验收产物。范围、历史失败及各项实测身份见 [0.8.7 发布记录](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Release_0.8.7.md)。源 WAV、Metadata、资料库格式和服务端 API 沿用现有契约。
+
+Mac 客户端使用 ad-hoc 签名，未经 Apple 公证；Linux x64 服务端与 Docker linux/amd64 在 ARM64 主机的 AMD64 仿真环境验收，未覆盖物理 x64 硬件。没有新增声学输出延迟测量或真实 ASIO 硬件试验。
 
 # 0.8.6：连续浏览与试听播放条
 

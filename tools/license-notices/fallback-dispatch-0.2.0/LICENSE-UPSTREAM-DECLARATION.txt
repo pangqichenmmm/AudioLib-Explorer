@@ -1,0 +1,43 @@
+Upstream declaration record: no standalone upstream license file is supplied here.
+Package: dispatch
+Published version: 0.2.0
+Declared metadata license expression: MIT
+Pinned upstream commit: 82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748
+Published registry package SHA256: bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b
+
+Exact upstream Cargo.toml declarations:
+name = "dispatch"
+version = "0.2.0"
+authors = ["Steven Sheldon"]
+repository = "http://github.com/SSheldon/rust-dispatch"
+license = "MIT"
+
+The authors line is original Cargo Authors metadata. It is not a copyright-holder or year claim.
+No license declaration appears in the pinned README.
+The full non-truncated upstream tree has 17 entries and contains no standalone
+LICENSE/LICENCE/NOTICE/COPYING/COPYRIGHT file. Its Rust files were inspected and contain
+no copyright or license header. The accompanying LICENSE-MIT-STANDARD.txt contains the
+official SPDX MIT permission, conditions, and disclaimer verbatim, omitting its unassigned
+template copyright line. No attribution is invented.
+
+Source provenance:
+Role: Cargo.toml
+URL: https://raw.githubusercontent.com/SSheldon/rust-dispatch/82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748/Cargo.toml
+Original response SHA256: 05c60b829931ef7f1f130735843c11f5cf9cc69546eca5fc941d014781c68e31
+
+Role: README.md
+URL: https://raw.githubusercontent.com/SSheldon/rust-dispatch/82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748/README.md
+Original response SHA256: 9e581e0edb3dcc8238feda4bc709c8c91d43c286ac91f42cf6b0004c9335da58
+
+Role: tree
+URL: https://api.github.com/repos/SSheldon/rust-dispatch/git/trees/82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748?recursive=1
+Original response SHA256: 80d7a1c412152e910f3346c99756e58fe89b5d55106eec4044bd11b16b8e14ae
+
+Role: published-crates-io-version
+URL: https://crates.io/api/v1/crates/dispatch/0.2.0
+Original response SHA256: 9fff59351de74be023e1c83bbda79a42df1c531da29c562b091b169a7b9dfa36
+
+Role: SPDX-original-MIT-with-template-placeholder
+URL: https://raw.githubusercontent.com/spdx/license-list-data/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/MIT.txt
+Original response SHA256: b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5
+

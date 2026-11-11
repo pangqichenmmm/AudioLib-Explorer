@@ -5,7 +5,8 @@
 //! with the interface scale.
 use crate::AppWindow;
 use audiolib_core::config::{
-    BUILTIN_THEMES, DEFAULT_THEME, PlayerStyle, THEME_IDS, clamp_font_size, normalize_theme,
+    BUILTIN_THEMES, DEFAULT_THEME, DEFAULT_V2_THEME, PlayerStyle, THEME_IDS, WorkbenchStyle,
+    clamp_font_size, normalize_theme,
 };
 use slint::{Color, ComponentHandle, Image, ModelRc, SharedString, VecModel};
 
@@ -102,6 +103,38 @@ pub(crate) const STUDIO_PALETTE: Palette = Palette {
     overlay: 0xa800_0000,
 };
 
+/// Neutral graphite workbench with soft sage actions, joining the Studio shell
+/// to the original player without the Studio theme's saturated cyan accents.
+pub(crate) const DEFAULT_V2_PALETTE: Palette = Palette {
+    bg: 0xff1c_2024,
+    panel: 0xff23_282d,
+    raised: 0xff2e_353c,
+    hover: 0xff3a_444c,
+    border: 0xff38_4149,
+    strong_border: 0xff6a_7881,
+    ink: 0xffdf_e5e7,
+    dim: 0xffaf_bbc1,
+    muted: 0xff96_a5ad,
+    accent: 0xff94_b5ad,
+    accent_hover: 0xffb0_cbc3,
+    mint: 0xffa0_c2b8,
+    apricot: 0xffce_bd9d,
+    coral: 0xffce_a39b,
+    on_accent: 0xff20_2c29,
+    selected: 0xff30_4442,
+    checked: 0xff39_504b,
+    alternate: 0xff26_2d33,
+    warning: 0xffce_bd9d,
+    trough: 0xff19_1e22,
+    segment: 0xff3c_484f,
+    danger: 0xffd2_a3a1,
+    danger_surface: 0xff3d_2e32,
+    player: DEFAULT_PALETTE.player,
+    player_border: DEFAULT_PALETTE.player_border,
+    tooltip: 0xff16_1b1f,
+    overlay: 0xa800_0000,
+};
+
 /// Appearance combo index for a theme identifier; unknown themes select the default.
 pub(crate) fn theme_index(id: &str) -> i32 {
     let id = normalize_theme(id);
@@ -136,13 +169,16 @@ pub(crate) fn apply_theme(ui: &AppWindow, id: &str) {
     let entry = &BUILTIN_THEMES[index as usize];
     // A new design gets its own palette and presentation. Preserve the original
     // default, while spectral frequency colors remain independent audio data.
-    let palette = match entry.player_style {
-        PlayerStyle::Classic => &DEFAULT_PALETTE,
-        PlayerStyle::Studio => &STUDIO_PALETTE,
+    let palette = match entry.id {
+        DEFAULT_V2_THEME => &DEFAULT_V2_PALETTE,
+        _ if entry.player_style == PlayerStyle::Studio => &STUDIO_PALETTE,
+        _ => &DEFAULT_PALETTE,
     };
     let theme = ui.global::<crate::Theme>();
-    let modern_style = entry.player_style == PlayerStyle::Studio;
-    let presentation_changed = theme.get_modern_style() != modern_style;
+    let modern_style = entry.workbench_style == WorkbenchStyle::Studio;
+    let modern_player = entry.player_style == PlayerStyle::Studio;
+    let presentation_changed =
+        theme.get_modern_style() != modern_style || theme.get_modern_player() != modern_player;
     if presentation_changed {
         ui.invoke_prepare_workbench_switch();
         // Clear transient events before Slint creates the new presenter and binds
@@ -153,6 +189,7 @@ pub(crate) fn apply_theme(ui: &AppWindow, id: &str) {
         install_studio_surfaces(&theme);
     }
     theme.set_modern_style(modern_style);
+    theme.set_modern_player(modern_player);
     let color = Color::from_argb_encoded;
     theme.set_bg(color(palette.bg));
     theme.set_panel(color(palette.panel));

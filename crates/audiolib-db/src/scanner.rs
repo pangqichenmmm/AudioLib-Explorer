@@ -2,7 +2,9 @@
 //! Bounded enumeration and parallel Metadata probing feed one cancellable batch writer.
 use crate::management::LibraryLease;
 use crate::{ScannedAudio, SqliteProvider, db_error, display_path, path_key};
+use audiolib_core::vendor_import::{VendorScanSummary, is_skipped_name};
 use audiolib_core::{Error, Result, ScanIssue, ScanProgress, ScanState, validate_scan_root};
+use rusqlite::{Connection, OpenFlags};
 use std::{
     collections::HashSet,
     fs,
@@ -180,6 +182,92 @@ pub struct ScanService {
 }
 
 const MAX_SCAN_ISSUES: usize = 100;
+const VENDOR_SPOOL_PAGES: u32 = 128 * 1024 * 1024 / 4096;
+
+/// Derived path queue only: source tables stay untouched and memory does not
+/// grow with the directory tree. Connection fields close before TempDir cleanup.
+struct VendorTableSpool {
+    connection: Connection,
+    directory: tempfile::TempDir,
+}
+
+impl VendorTableSpool {
+    fn new(scan_root: &Path) -> Result<Self> {
+        Self::with_page_limit(scan_root, VENDOR_SPOOL_PAGES)
+    }
+
+    fn with_page_limit(scan_root: &Path, pages: u32) -> Result<Self> {
+        if !(2..=VENDOR_SPOOL_PAGES).contains(&pages) {
+            return Err(Error::Validation(
+                "Invalid automatic table spool budget".into(),
+            ));
+        }
+        let parent = std::env::temp_dir().canonicalize()?;
+        if parent.starts_with(scan_root) {
+            return Err(Error::Validation(
+                "Automatic table staging requires a temporary directory outside the scan root"
+                    .into(),
+            ));
+        }
+        #[cfg(windows)]
+        if matches!(parent.components().next(), Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..)))
+        {
+            return Err(Error::Validation(
+                "Automatic table staging requires a local temporary directory".into(),
+            ));
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("audiolib-scan-tables-")
+            .tempdir_in(parent)?;
+        let connection = Connection::open(directory.path().join("paths.db")).map_err(db_error)?;
+        // The spool is disposable, never a business/recovery database. Each
+        // autocommitted path has a bounded memory journal and a 128 MiB file cap.
+        connection
+            .execute_batch(&format!(
+                "PRAGMA page_size=4096; PRAGMA max_page_count={pages};
+             PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA cache_size=-512;
+             CREATE TABLE paths(path TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID;"
+            ))
+            .map_err(db_error)?;
+        Ok(Self {
+            connection,
+            directory,
+        })
+    }
+
+    fn push(&self, path: &Path) -> Result<()> {
+        let path = path.to_str().ok_or_else(|| {
+            Error::Validation("Automatic table source path is not valid Unicode".into())
+        })?;
+        self.connection
+            .prepare_cached("INSERT OR IGNORE INTO paths(path) VALUES(?1)")
+            .map_err(db_error)?
+            .execute([path])
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn reader(&self) -> Result<Connection> {
+        Connection::open_with_flags(
+            self.directory.path().join("paths.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_error)
+    }
+}
+
+fn vendor_total(base: VendorScanSummary, table: VendorScanSummary) -> VendorScanSummary {
+    VendorScanSummary {
+        tables: base.tables.saturating_add(table.tables),
+        rows: base.rows.saturating_add(table.rows),
+        matched: base.matched.saturating_add(table.matched),
+        updated: base.updated.saturating_add(table.updated),
+        unchanged: base.unchanged.saturating_add(table.unchanged),
+        ambiguous: base.ambiguous.saturating_add(table.ambiguous),
+        unmatched: base.unmatched.saturating_add(table.unmatched),
+    }
+}
 
 fn record_issue(progress: &mut ScanProgress, path: String, message: String) {
     progress.errors += 1;
@@ -229,14 +317,33 @@ impl ScanService {
             progress_callback(progress.clone());
             return Ok(progress);
         }
-        let result = self.consume(
-            &root,
-            options,
-            cancellation,
-            &mut progress,
-            &mut progress_callback,
-        );
-        if let Err(error) = result {
+        let result: Result<()> = (|| {
+            let mut vendor_tables = None;
+            self.consume(
+                &root,
+                options,
+                cancellation,
+                &mut progress,
+                &mut progress_callback,
+                &mut vendor_tables,
+            )?;
+            // consume has flushed WAV batches and joined every probe reader.
+            // Keep the outer scan lease, but no main-database guard/transaction,
+            // while the independent importer takes its own short writer batches.
+            if let Some(tables) = &vendor_tables {
+                self.import_vendor_tables(
+                    tables,
+                    &root,
+                    cancellation,
+                    &mut progress,
+                    &mut progress_callback,
+                )?;
+            }
+            Ok(())
+        })();
+        if matches!(result, Err(Error::Cancelled)) {
+            cancellation.cancel();
+        } else if let Err(error) = result {
             // Errors must also wake the producer and must never wait for an external resume.
             cancellation.cancel();
             cancellation.begin_finish(&mut progress, &mut progress_callback);
@@ -311,12 +418,16 @@ impl ScanService {
         cancellation: &ScanCancellation,
         progress: &mut ScanProgress,
         callback: &mut impl FnMut(ScanProgress),
+        vendor_tables: &mut Option<VendorTableSpool>,
     ) -> Result<()> {
         let mut batch = Vec::with_capacity(options.batch_size);
         let mut seen = Vec::with_capacity(options.batch_size);
         let mut last_folder: Option<PathBuf> = None;
         let mut last_progress = Instant::now();
         let producer_stop = AtomicBool::new(false);
+        // Exclude only this provider's verified owned store, never a directory
+        // name pattern that could also identify the user's audio library.
+        let vendor_owned_root = self.provider.vendor_import_owned_root()?;
         std::thread::scope(|scope| -> Result<()> {
             let workers = options.worker_count();
             // Bound decoded Metadata independently of the transaction size. Each worker
@@ -348,6 +459,7 @@ impl ScanService {
                             }
                             let result = match entry {
                                 Entry::Failure(path, message) => Probed::Failure(path, message),
+                                Entry::Vendor(path) => Probed::Vendor(path),
                                 Entry::Audio(path) => {
                                     let result = probe_entry(
                                         &path,
@@ -378,7 +490,10 @@ impl ScanService {
                 let mut visited = HashSet::new();
                 walk_directory(
                     root,
-                    root,
+                    ScanTree {
+                        root,
+                        excluded: vendor_owned_root.as_deref(),
+                    },
                     options.recursive,
                     cancellation,
                     stop,
@@ -404,6 +519,12 @@ impl ScanService {
                         Probed::Failure(path, message) => {
                             record_issue(progress, display_path(&path), message);
                             callback(progress.clone());
+                        }
+                        Probed::Vendor(path) => {
+                            if vendor_tables.is_none() {
+                                *vendor_tables = Some(VendorTableSpool::new(root)?);
+                            }
+                            vendor_tables.as_ref().unwrap().push(&path)?;
                         }
                         Probed::Audio(path, result) => {
                             progress.discovered += 1;
@@ -461,6 +582,69 @@ impl ScanService {
         })
     }
 
+    fn import_vendor_tables(
+        &self,
+        tables: &VendorTableSpool,
+        root: &Path,
+        cancellation: &ScanCancellation,
+        progress: &mut ScanProgress,
+        callback: &mut impl FnMut(ScanProgress),
+    ) -> Result<()> {
+        // This cursor belongs only to the local disposable queue. It holds no
+        // main-library reader or writer and materializes one source path at a time.
+        let reader = tables.reader()?;
+        let mut statement = reader
+            .prepare("SELECT path FROM paths ORDER BY path")
+            .map_err(db_error)?;
+        let mut paths = statement.query([]).map_err(db_error)?;
+        let mut last_progress = Instant::now();
+        while let Some(row) = paths.next().map_err(db_error)? {
+            if !cancellation.checkpoint(progress, callback) {
+                return Err(Error::Cancelled);
+            }
+            let path = PathBuf::from(row.get::<_, String>(0).map_err(db_error)?);
+            progress.current_path = display_path(&path);
+            callback(progress.clone());
+            if !cancellation.checkpoint(progress, callback) {
+                return Err(Error::Cancelled);
+            }
+            let base = progress.vendor_metadata;
+            let session_id = progress.session_id;
+            let mut observed = base;
+            let mut checkpoint = |table: &VendorScanSummary| {
+                // Importer callbacks are cumulative for this table, including
+                // the latest durable batch on cancellation; never sum them twice.
+                progress.vendor_metadata = vendor_total(base, *table);
+                let durable_change = observed.updated != progress.vendor_metadata.updated
+                    || observed.unchanged != progress.vendor_metadata.unchanged;
+                let first_table = observed.tables != progress.vendor_metadata.tables;
+                observed = progress.vendor_metadata;
+                let keep_going = cancellation.checkpoint(progress, callback);
+                if first_table
+                    || durable_change
+                    || last_progress.elapsed() >= Duration::from_millis(100)
+                {
+                    callback(progress.clone());
+                    last_progress = Instant::now();
+                }
+                // The callback itself may request pause/cancel. Importer invokes
+                // us without a main-library guard, so acknowledge it now rather
+                // than admitting one more metadata batch.
+                keep_going && cancellation.checkpoint(progress, callback)
+            };
+            let result = self
+                .provider
+                .scan_vendor_table(&path, root, session_id, &mut checkpoint);
+            match result {
+                Ok(summary) => progress.vendor_metadata = vendor_total(base, summary),
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(error) => record_issue(progress, display_path(&path), error.to_string()),
+            }
+            callback(progress.clone());
+        }
+        Ok(())
+    }
+
     fn flush(
         &self,
         batch: &mut Vec<ScannedAudio>,
@@ -483,11 +667,13 @@ impl ScanService {
 
 enum Entry {
     Audio(PathBuf),
+    Vendor(PathBuf),
     Failure(PathBuf, String),
 }
 
 enum Probed {
     Audio(PathBuf, Result<ProbeOutcome>),
+    Vendor(PathBuf),
     Failure(PathBuf, String),
     Fatal(Error),
 }
@@ -498,9 +684,58 @@ enum ProbeOutcome {
 }
 
 const FINGERPRINT_SQL: &str = "SELECT file_path,id,COALESCE(file_size,0),source_mtime_ns,\
-    COALESCE(json_extract(CASE WHEN json_valid(audiolib_metadata_json(metadata_json)) \
-    THEN audiolib_metadata_json(metadata_json) ELSE '{}' END,\
-    '$.wav_metadata.version'),0) FROM audio_files WHERE path_key=?1";
+    json_extract(CASE WHEN json_valid(audiolib_metadata_json(metadata_json)) THEN audiolib_metadata_json(metadata_json) ELSE '{}' END,\
+    '$.container','$.wav_metadata.version','$.wav_metadata.vorbis_version',\
+    '$.wav_metadata.mp3_version','$.wav_metadata.aiff_version','$.wav_metadata.container_version')\
+    FROM audio_files WHERE path_key=?1";
+
+fn extractor_is_current(path: &Path, row: &rusqlite::Row<'_>) -> rusqlite::Result<bool> {
+    use audiolib_core::SourceAudioFormat;
+    // SQLite returns only these six fingerprint values. Decode that small array
+    // once rather than allocating or decoding the source's complete Metadata.
+    let Some(fields) = row
+        .get_ref(4)?
+        .as_str()
+        .ok()
+        .filter(|json| json.len() <= 512)
+        .and_then(|json| serde_json::from_str::<[serde_json::Value; 6]>(json).ok())
+    else {
+        return Ok(false);
+    };
+    let container = fields[0]
+        .as_str()
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_default();
+    // Only older RF64/BW64 records need the corrected magic identity. Ordinary
+    // RIFF keeps its existing extractor revision and unchanged fast path.
+    if matches!(container.as_str(), "RF64" | "BW64") && fields[5].as_i64() != Some(1) {
+        return Ok(false);
+    }
+    let wav = fields[1].as_i64();
+    let vorbis = fields[2].as_i64();
+    let mp3 = fields[3].as_i64();
+    let aiff = fields[4].as_i64();
+    let family = match container.as_str() {
+        "MP3" => Some(SourceAudioFormat::Mp3),
+        "AIFF" | "AIFC" => Some(SourceAudioFormat::Aiff),
+        "FLAC" => Some(SourceAudioFormat::Flac),
+        "OGG" | "OGG VORBIS" => Some(SourceAudioFormat::Ogg),
+        "WAV" | "RIFF" | "RF64" | "BW64" => Some(SourceAudioFormat::Wav),
+        _ if mp3.is_some() => Some(SourceAudioFormat::Mp3),
+        _ if aiff.is_some() => Some(SourceAudioFormat::Aiff),
+        _ if vorbis.is_some() => Some(SourceAudioFormat::Ogg),
+        _ => audiolib_core::source_audio_format(path),
+    };
+    Ok(match family {
+        Some(SourceAudioFormat::Wav) => wav == Some(audiolib_audio::WAV_METADATA_VERSION),
+        Some(SourceAudioFormat::Flac | SourceAudioFormat::Ogg) => {
+            vorbis == Some(audiolib_audio::VORBIS_METADATA_VERSION)
+        }
+        Some(SourceAudioFormat::Mp3) => mp3 == Some(audiolib_audio::MP3_METADATA_VERSION),
+        Some(SourceAudioFormat::Aiff) => aiff == Some(audiolib_audio::AIFF_METADATA_VERSION),
+        None => false,
+    })
+}
 
 fn probe_entry(
     path: &Path,
@@ -530,17 +765,16 @@ fn probe_entry(
                         row.get::<_, i64>(1)?,
                         crate::unsigned(row, 2)?,
                         row.get::<_, Option<i64>>(3)?,
-                        row.get_ref(4)?.as_i64().unwrap_or_default(),
+                        extractor_is_current(path, row)?,
                     ),
                 ))
             })
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        if let Some((id, prior_size, prior_mtime, metadata_version)) =
+        if let Some((id, prior_size, prior_mtime, current_extractor)) =
             crate::path_identity::choose(&text, candidates, true)?
-            && (prior_size, prior_mtime, metadata_version)
-                == (size, Some(mtime_ns), audiolib_audio::WAV_METADATA_VERSION)
+            && (prior_size, prior_mtime, current_extractor) == (size, Some(mtime_ns), true)
         {
             return Ok(ProbeOutcome::Unchanged(id));
         }
@@ -555,9 +789,15 @@ fn probe_entry(
     })))
 }
 
+#[derive(Clone, Copy)]
+struct ScanTree<'a> {
+    root: &'a Path,
+    excluded: Option<&'a Path>,
+}
+
 fn walk_directory(
     directory: &Path,
-    root: &Path,
+    tree: ScanTree<'_>,
     recursive: bool,
     cancellation: &ScanCancellation,
     stop: &AtomicBool,
@@ -568,7 +808,7 @@ fn walk_directory(
         return;
     }
     let canonical = match directory.canonicalize() {
-        Ok(path) if path.starts_with(root) => path,
+        Ok(path) if path.starts_with(tree.root) => path,
         Ok(_) => {
             let _ = sender.send(Entry::Failure(
                 directory.into(),
@@ -581,6 +821,9 @@ fn walk_directory(
             return;
         }
     };
+    if tree.excluded == Some(canonical.as_path()) {
+        return;
+    }
     if !visited.insert(canonical.clone()) {
         let _ = sender.send(Entry::Failure(
             directory.into(),
@@ -625,15 +868,15 @@ fn walk_directory(
                 }
             }
             Ok(kind) if kind.is_dir() && recursive => {
-                walk_directory(&path, root, true, cancellation, stop, sender, visited)
+                walk_directory(&path, tree, true, cancellation, stop, sender, visited)
             }
-            Ok(kind)
-                if kind.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav")) =>
-            {
+            Ok(kind) if kind.is_file() && audiolib_audio::is_supported_audio_extension(&path) => {
                 if sender.send(Entry::Audio(path)).is_err() {
+                    return;
+                }
+            }
+            Ok(kind) if kind.is_file() && is_vendor_table(&path) => {
+                if sender.send(Entry::Vendor(path)).is_err() {
                     return;
                 }
             }
@@ -647,6 +890,20 @@ fn walk_directory(
         }
     }
     visited.remove(&canonical);
+}
+
+fn is_vendor_table(path: &Path) -> bool {
+    !path
+        .file_name()
+        .is_some_and(|name| is_skipped_name(&name.to_string_lossy()))
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| {
+                ["csv", "tsv", "xls", "xlsx"]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
 }
 
 /// Whether `root` lists at least one visible entry; unreadable counts as empty (no
@@ -689,6 +946,35 @@ fn producer_ready(cancellation: &ScanCancellation, stop: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendor_path_spool_is_unique_bounded_and_failed_insert_preserves_queued_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let spool = VendorTableSpool::with_page_limit(source.path(), 2).unwrap();
+        let path = source.path().join("catalog.csv");
+        spool.push(&path).unwrap();
+        spool.push(&path).unwrap();
+        assert!(
+            spool
+                .push(&source.path().join("x".repeat(32 * 1024)))
+                .is_err()
+        );
+        let reader = spool.reader().unwrap();
+        let queued: String = reader
+            .query_row("SELECT path FROM paths", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued, path.to_str().unwrap());
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM paths", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            reader.execute("DELETE FROM paths", []).is_err(),
+            "iteration is read-only"
+        );
+    }
 
     #[test]
     fn cancel_during_finish_does_not_interrupt_and_interrupt_does() {

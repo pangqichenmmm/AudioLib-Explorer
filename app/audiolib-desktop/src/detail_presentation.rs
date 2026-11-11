@@ -121,7 +121,7 @@ mod tests {
     fn parameters_and_tags_follow_the_selected_owned_record_and_clear_together() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = AppWindow::new().unwrap();
-        let mut file = AudioFile {
+        let mut file = AudioFile::from(audiolib_core::AudioFileData {
             duration: 1.176,
             sample_rate: 192_000,
             bit_depth: 24,
@@ -129,7 +129,7 @@ mod tests {
             tags: "Metal, Field recording".into(),
             attributes: serde_json::json!({"wav_metadata":{"fields":{"keywords":"metal, Chain, Foley", "category":"Metal, heavy"}}}),
             ..Default::default()
-        };
+        });
         present(&ui, &file);
         assert_eq!(ui.get_selected_duration(), "00:01.176");
         assert_eq!(ui.get_selected_sample_rate(), "192 kHz");

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "audiolib/migration-http.schema.json",
+  "title": "AudioLib migration HTTP rules",
+  "description": "Admin endpoints: POST /admin/api/migration/{start,pause,resume,cancel,rollback}, GET /admin/api/migration/status; body per migration-report.schema.json. While a migration is not idle/done every response carries `x-audiolib-migration: <state>`. Reads (list, main search, playback, artwork) stay 200. A path-only search (scope=path) before the path table is ready → 503 {error_code: migration_in_progress}, Retry-After: 30. Scope all (`scope=all`) → 200 with main-table results only and `x-audiolib-path-search: unavailable`; this fallback retains the main search's exact total_count. Once ready, nonempty all/path searches use limit + 1 lookahead: total_count is an observed prefix lower bound without a cursor or a page-local suffix count with a cursor; next_cursor, omitted on the last page, is the authoritative continuation. Internal has_more is not an HTTP response field. These descriptions preserve the existing response shape and ale-s9-cld1-t3-m2-p1-a1-sd1 format. During `switching`, writes (vendor import, annotations) → 503 {error_code: migration_switching}, Retry-After: 30; reads 200. Second start while running → 409 with the report body (error_code already_running).",
+  "$defs": {
+    "error_body": {
+      "type": "object",
+      "required": [
+        "error_code"
+      ],
+      "properties": {
+        "error_code": {
+          "enum": [
+            "migration_in_progress",
+            "migration_switching"
+          ]
+        }
+      }
+    },
+    "headers": {
+      "type": "object",
+      "properties": {
+        "x-audiolib-migration": {
+          "$ref": "migration-report.schema.json#/properties/state"
+        },
+        "x-audiolib-path-search": {
+          "enum": [
+            "unavailable"
+          ]
+        },
+        "retry-after": {
+          "enum": [
+            "30"
+          ]
+        }
+      }
+    }
+  },
+  "rules": [
+    {
+      "when": "path-only search before path table ready",
+      "status": 503,
+      "error_code": "migration_in_progress",
+      "retry-after": "30"
+    },
+    {
+      "when": "scope all search before path table ready",
+      "status": 200,
+      "x-audiolib-path-search": "unavailable"
+    },
+    {
+      "when": "write during switching",
+      "status": 503,
+      "error_code": "migration_switching",
+      "retry-after": "30"
+    },
+    {
+      "when": "any response while migration state is not idle/done",
+      "header": "x-audiolib-migration"
+    },
+    {
+      "when": "POST start while running",
+      "status": 409,
+      "error_code": "already_running"
+    }
+  ]
+}

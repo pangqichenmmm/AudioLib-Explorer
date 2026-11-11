@@ -23,16 +23,71 @@ const MAX_SLOTS: usize = 16 * 1024 * 1024 / std::mem::size_of::<u32>();
 const MIN_SPLIT_ROWS: usize = 65_536;
 const MAX_NATIVE_LENGTH_MATCHES: u64 = 65_536;
 const MISSING: u32 = u32::MAX;
+const LENGTH_BLOCK_SLOTS: usize = 4096;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+struct LengthBlocks {
+    len: usize,
+    blocks: Vec<Arc<Vec<u32>>>,
+}
+
+impl LengthBlocks {
+    fn new(len: usize) -> Option<Self> {
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(len.div_ceil(LENGTH_BLOCK_SLOTS))
+            .ok()?;
+        let mut remaining = len;
+        while remaining != 0 {
+            let count = remaining.min(LENGTH_BLOCK_SLOTS);
+            let mut block = Vec::new();
+            block.try_reserve_exact(count).ok()?;
+            block.resize(count, MISSING);
+            blocks.push(Arc::new(block));
+            remaining -= count;
+        }
+        Some(Self { len, blocks })
+    }
+
+    fn get(&self, offset: usize) -> Option<&u32> {
+        if offset >= self.len {
+            return None;
+        }
+        self.blocks
+            .get(offset / LENGTH_BLOCK_SLOTS)?
+            .get(offset % LENGTH_BLOCK_SLOTS)
+    }
+
+    fn set(&mut self, offset: usize, value: u32) -> Option<()> {
+        if offset >= self.len {
+            return None;
+        }
+        let block = self.blocks.get_mut(offset / LENGTH_BLOCK_SLOTS)?;
+        if Arc::strong_count(block) != 1 || Arc::weak_count(block) != 0 {
+            let mut owned = Vec::new();
+            owned.try_reserve_exact(block.len()).ok()?;
+            owned.extend_from_slice(block);
+            *block = Arc::new(owned);
+        }
+        *Arc::get_mut(block)?.get_mut(offset % LENGTH_BLOCK_SLOTS)? = value;
+        Some(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Domain {
     first: i64,
-    values: Vec<u32>,
+    values: LengthBlocks,
 }
 
 /// Up to two dense row-ID domains, containing at most 16 MiB of owned lengths.
 /// A missing slot always asks SQLite for its original xColumnSize(-1) result.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Lengths {
     domains: [Option<Domain>; 2],
     split_points: Option<SplitPoints>,
@@ -67,9 +122,7 @@ fn domain(first: i64, last: i64) -> Option<Domain> {
     if count > MAX_SLOTS {
         return None;
     }
-    let mut values = Vec::new();
-    values.try_reserve_exact(count).ok()?;
-    values.resize(count, MISSING);
+    let values = LengthBlocks::new(count)?;
     Some(Domain { first, values })
 }
 
@@ -219,8 +272,10 @@ pub(crate) fn load_lengths(
         let mut stored = false;
         for domain in lengths.domains.iter_mut().flatten() {
             let offset = usize::try_from(i128::from(id) - i128::from(domain.first)).ok();
-            if let Some(slot) = offset.and_then(|offset| domain.values.get_mut(offset)) {
-                *slot = length;
+            if offset
+                .and_then(|offset| domain.values.set(offset, length))
+                .is_some()
+            {
                 stored = true;
                 break;
             }
@@ -231,6 +286,65 @@ pub(crate) fn load_lengths(
     }
     cancelled(cancel)?;
     Ok(Some(Arc::new(lengths)))
+}
+
+/// Apply a complete journal delta inside its caller's pinned transaction. Only
+/// changed document IDs are read; unchanged blocks remain shared with old readers.
+/// A row outside the cached domains requires the normal full-layout fallback.
+/// Missing/deleted/malformed sizes use native xColumnSize rather than a guessed
+/// length. Membership changes retire the previous exact quantile cuts; normal
+/// length-only changes preserve them without rescanning every document ID.
+pub(crate) fn apply_length_delta(
+    conn: &Connection,
+    previous: &Arc<Lengths>,
+    changed_ids: &[i64],
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<Arc<Lengths>>> {
+    cancelled(cancel)?;
+    if conn.is_autocommit() || changed_ids.len() > MAX_ROWS {
+        return Ok(None);
+    }
+    let mut next = (**previous).clone();
+    let mut statement = conn
+        .prepare_cached("SELECT sz FROM audio_search_docsize WHERE id=?1")
+        .map_err(db_error)?;
+    for (index, id) in changed_ids.iter().enumerate() {
+        if index.is_multiple_of(1024) {
+            cancelled(cancel)?;
+        }
+        let observed = statement
+            .query_row([id], |row| {
+                Ok(match row.get_ref(0)? {
+                    ValueRef::Blob(blob) => decode_docsize(blob).unwrap_or(MISSING),
+                    _ => MISSING,
+                })
+            })
+            .optional()
+            .map_err(db_error)?;
+        let present = observed.is_some();
+        let length = observed.unwrap_or(MISSING);
+        if !present || previous.get(*id).is_none() {
+            next.split_points = None;
+        }
+        let mut stored = false;
+        for domain in next.domains.iter_mut().flatten() {
+            let offset = usize::try_from(i128::from(*id) - i128::from(domain.first)).ok();
+            if offset
+                .and_then(|offset| domain.values.set(offset, length))
+                .is_some()
+            {
+                stored = true;
+                break;
+            }
+        }
+        // A deleted ID outside all previous domains needs no new storage.
+        // An inserted document outside those domains changes layout/quantiles.
+        if !stored && present {
+            return Ok(None);
+        }
+    }
+    cancelled(cancel)?;
+    Ok(Some(Arc::new(next)))
 }
 
 #[derive(Default)]
@@ -1325,6 +1439,84 @@ pub(crate) mod tests {
             load_lengths(&conn, Some(&cancel)),
             Err(Error::Cancelled)
         ));
+    }
+
+    #[test]
+    fn journal_lengths_copy_only_changed_blocks_and_preserve_old_snapshots() {
+        let conn = fixture();
+        let previous = load_lengths(&conn, None).unwrap().unwrap();
+        conn.execute_batch(
+            "UPDATE audio_search SET a='alpha alpha alpha' WHERE rowid=2;
+            DELETE FROM audio_search WHERE rowid=1;
+            INSERT INTO audio_search(rowid,a) VALUES(4,'zeta');",
+        )
+        .unwrap();
+        let next = apply_length_delta(&conn, &previous, &[1, 2, 4, 2], None)
+            .unwrap()
+            .unwrap();
+        let full = load_lengths(&conn, None).unwrap().unwrap();
+        for id in [1, 2, 3, 4, 5, 1800000000000000] {
+            assert_eq!(next.get(id), full.get(id), "{id}");
+        }
+        assert_eq!(previous.get(1), Some(4));
+        assert_eq!(previous.get(2), Some(3));
+        assert_eq!(previous.get(4), None);
+        assert_eq!(next.get(2), Some(5));
+        assert!(Arc::ptr_eq(
+            &previous.domains[1].as_ref().unwrap().values.blocks[0],
+            &next.domains[1].as_ref().unwrap().values.blocks[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &previous.domains[0].as_ref().unwrap().values.blocks[0],
+            &next.domains[0].as_ref().unwrap().values.blocks[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &next.domains[0].as_ref().unwrap().values.blocks[0],
+            &apply_length_delta(&conn, &next, &[], None)
+                .unwrap()
+                .unwrap()
+                .domains[0]
+                .as_ref()
+                .unwrap()
+                .values
+                .blocks[0]
+        ));
+        conn.execute(
+            "INSERT INTO audio_search(rowid,a) VALUES(1000000000,'new domain')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            apply_length_delta(&conn, &next, &[1000000000], None)
+                .unwrap()
+                .is_none()
+        );
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            apply_length_delta(&conn, &next, &[2], Some(&cancelled)),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn length_blocks_share_untouched_pages_and_fallback_on_unsupported_transactions() {
+        let mut original = LengthBlocks::new(LENGTH_BLOCK_SLOTS * 3).unwrap();
+        original.set(0, 7).unwrap();
+        let mut next = original.clone();
+        next.set(LENGTH_BLOCK_SLOTS + 4, 9).unwrap();
+        assert_eq!(original.get(LENGTH_BLOCK_SLOTS + 4), Some(&MISSING));
+        assert_eq!(next.get(LENGTH_BLOCK_SLOTS + 4), Some(&9));
+        assert!(Arc::ptr_eq(&original.blocks[0], &next.blocks[0]));
+        assert!(!Arc::ptr_eq(&original.blocks[1], &next.blocks[1]));
+        assert!(Arc::ptr_eq(&original.blocks[2], &next.blocks[2]));
+        let conn = fixture();
+        let lengths = load_lengths(&conn, None).unwrap().unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        assert!(
+            apply_length_delta(&conn, &lengths, &[1], None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -4,14 +4,14 @@ use super::{
     BusinessDigest, MigrationJob, MigrationPhase, SchemaChange,
     inspect::{
         business_digest, business_digest_matching, business_digest_retained, check_cancel,
-        table_exists,
+        digest_tables, table_exists,
     },
     job::{Observer, open_read, open_rw},
     plan::invalid,
 };
 use crate::{db_error, management, schema, search_storage};
-use audiolib_core::{Result, compatibility::LibraryFormat};
-use rusqlite::{Connection, OpenFlags, params};
+use audiolib_core::Result;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
 use std::{fs::File, path::PathBuf, sync::atomic::AtomicBool};
 
 const BATCH: u32 = 5000;
@@ -94,7 +94,110 @@ pub(super) fn normalize(
             _ => None,
         })
         .collect::<Vec<_>>();
-    business_digest_retained(&conn, Some(&projection), &retired, cancel)
+    let projection = business_digest_retained(&conn, Some(&projection), &retired, cancel)?;
+    project_audio_source_format(&conn, job, projection, cancel)
+}
+
+/// Apply the same narrow format publication to the reviewed expectation. Other
+/// library_meta rows, columns and SQLite value types remain fully authoritative.
+fn project_audio_source_format(
+    input: &Connection,
+    job: &MigrationJob,
+    mut projection: BusinessDigest,
+    cancel: &AtomicBool,
+) -> Result<BusinessDigest> {
+    use audiolib_core::compatibility::AUDIO_SOURCES_FEATURE;
+    // normalize reopens its owned input with a raw read-only connection. Source
+    // classification needs the same Metadata codec functions as library readers.
+    schema::register_casefold(input)?;
+    if schema::feature_version(input, AUDIO_SOURCES_FEATURE)?.is_some()
+        || !schema::imported_audio_sources_required(input)?
+    {
+        return Ok(projection);
+    }
+    let marker: Option<String> = input
+        .query_row(
+            "SELECT value FROM library_meta WHERE key='snapshot_format'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(marker) = marker {
+        let observed = super::inspect::observe_format(input)?
+            .0
+            .snapshot_format_id();
+        let original = job.plan.source.format.snapshot_format_id();
+        if observed.as_deref() != Some(marker.as_str())
+            && original.as_deref() != Some(marker.as_str())
+        {
+            return Err(invalid(
+                "Unknown source snapshot_format cannot be replaced during audio-source publication",
+            ));
+        }
+    }
+    // Copy only the two small format tables into a private, unpublished projection.
+    // Reusing the production publisher preserves defaults and unknown extra columns;
+    // source triggers are intentionally absent, so their side effects cannot be
+    // excused as part of this one admitted format-key transformation.
+    let mut expected = Connection::open_in_memory().map_err(db_error)?;
+    schema::register_tokenizer(&expected, crate::load_tokenizer())?;
+    let tx = expected.transaction().map_err(db_error)?;
+    for table in ["library_meta", "audiolib_schema_features"] {
+        check_cancel(cancel)?;
+        let sql: String = input
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        search_storage::execute_schema(&tx, &sql)?;
+        let (columns, _) = copy_columns(input, table)?;
+        let names = list(&columns);
+        let quoted = search_storage::quote_identifier(table);
+        let insert = format!(
+            "INSERT INTO {quoted}({names}) VALUES({})",
+            std::iter::repeat_n("?", columns.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut statement = input
+            .prepare(&format!("SELECT {names} FROM {quoted}"))
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            check_cancel(cancel)?;
+            let values = (0..columns.len())
+                .map(|index| row.get::<_, Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db_error)?;
+            tx.execute(&insert, params_from_iter(values))
+                .map_err(db_error)?;
+        }
+    }
+    // mark_current replaces these owned markers before publishing af1. Replaying
+    // that exact order also preserves the new row's implicit identity when an
+    // older library_meta uses ROWID rather than the modern WITHOUT ROWID layout.
+    tx.execute_batch(schema::MARK_SOURCE_SEARCH)
+        .map_err(db_error)?;
+    tx.pragma_update(None, "user_version", crate::SCHEMA_VERSION)
+        .map_err(db_error)?;
+    schema::require_audio_sources(&tx)?;
+    tx.commit().map_err(db_error)?;
+    let projected = business_digest(&expected, cancel)?;
+    let library_meta = projected
+        .tables
+        .into_iter()
+        .find(|table| table.table == "library_meta")
+        .ok_or_else(|| invalid("Missing expected library_meta format projection"))?;
+    let entry = projection
+        .tables
+        .iter_mut()
+        .find(|table| table.table == "library_meta")
+        .ok_or_else(|| invalid("Missing original library_meta business projection"))?;
+    *entry = library_meta;
+    digest_tables(projection.tables)
 }
 
 fn read_only_uri(path: &std::path::Path) -> String {
@@ -666,7 +769,7 @@ pub(super) fn verify_connection(
         false,
         cancel,
     )?;
-    if inspection.format != LibraryFormat::target() {
+    if !inspection.format.is_local_writable() {
         return Err(invalid(
             "Candidate format markers do not match the target catalog",
         ));

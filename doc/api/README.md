@@ -4,7 +4,16 @@
 
 ## 1. 目标与边界
 
-当前 0.8.1 候选使用 schema 8 / `ale-s8-cld1-t3-m2-p1-a1`（`album_entities: 1`），
+Search Metadata v2 隔离候选新增显式服务端 schema 8→9 迁移及完成态 schema 9 快照读取；
+普通本地可写库仍为 8，客户端按完整格式只读接收 schema 3–9。
+候选已实现 s9 原生快照与 WAV-only s8 兼容快照的分别协商、缓存和发放；
+真实旧客户端配对、迁移、Metadata 增量、离线重开及回滚仍须按本轮候选身份验收。
+业务能力以实际 `/capabilities` 和格式准入为准，不能只凭 feature 名称开放入口。
+迁移拒绝和切换拒写均按 `Retry-After: 30` 处理，正式响应头为 `x-audiolib-migration`。
+部署顺序与实际未完成项见[候选迁移方案](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/codex/release-090-prepare/doc/Rust_Release_0.9.0.md)；
+下文历史候选版本与测量保留原身份，不表示本候选已发布。
+
+此前 0.8.1 候选使用 schema 8 / `ale-s8-cld1-t3-m2-p1-a1`（`album_entities: 1`），
 专辑封面接口见 §8.2。新库、迁移输出及新服务端快照的 Metadata 物理列保持原始
 JSON TEXT，压缩暂缓；外层快照 zstd 传输保留。客户端与服务器须配套升级。
 旧实验 `a1-z1` 仅保留严格只读兼容，不作为可写目标。旧快照只在客户端自有副本迁移，
@@ -24,7 +33,7 @@ CR、修复及历次隔离证据见 [方案 B CR](Search_Storage_B_CR.md)；p1�
 - 服务器模式 = 一个实现 `audiolib_core::DataProvider` 的远程提供者（`crates/audiolib-remote`）+ 服务端进程（`server/audiolib-server`）。UI / CLI 不感知本地还是远程。
 - 服务端直接复用 `audiolib-core` 的 DTO（`AudioFile`、`Folder`、`SearchRequest`、`SearchPage`、`MetadataPatch`、`ScanProgress`、`LibraryStats`、`LibraryInfo` 等），JSON 字段名与 serde 序列化结果一致，remote 端可以直接反序列化。
 - 源音频永远只在服务端磁盘上；客户端通过 WebDAV（见 §7）或流端点（见 §8）读取，不直接打开服务端路径。
-- v1 不做：备份/还原、维护（integrity/FTS 重建）、relink、JSONL/CSV 导入导出、多用户权限。这些在远程模式下返回 `UNSUPPORTED`，留在服务端本机 CLI 操作。`GET /library/snapshot` 是只读导出，不属于上述备份/还原。
+- v1 不做：通用库备份/还原、维护（integrity/FTS 重建）、通用 JSONL/CSV 库导入导出、多用户权限。这些留在服务端本机受支持的库管理流程；普通 restore/maintenance 仍只写 schema 8。根目录改路径使用 §6.10 的专用 relink 路径，完成态 server schema 9 也可使用。厂商 Metadata 表导入是独立的受管理 API，不属于通用库导入。`GET /library/snapshot` 是只读导出，不是还原或降级源库。
 - 局域网内直接用 HTTP（`http://192.0.2.10:8790`，默认不需要 token）；外网经 HTTPS 反向代理访问（如 `https://audiolib.example.com:8443`，需要 token），见 §2.2–§2.4。token 在服务端管理页 `/admin` 生成和撤销（§2.3）。
 
 ## 2. 基础约定
@@ -35,6 +44,34 @@ CR、修复及历次隔离证据见 [方案 B CR](Search_Storage_B_CR.md)；p1�
 - 浏览器发来的修改请求（包括正文被忽略的 `POST /audio/{id}/plays`、根检查）若带 `Origin`，必须与请求 `Host` 的主机、端口及实际监听器协议一致，否则返回 403 `ORIGIN_FORBIDDEN`。HTTP 监听器只接受同源 `http`，原生 TLS 监听器只接受同源 `https`；不信任转发头的协议声明，无法验证监听器、重复/无效 Origin 也拒绝。管理页沿用 403 `ADMIN_HEADER_REQUIRED`。无 Origin 的原生客户端照常使用。
 - 鉴权：按**鉴权模式**（§2.2）决定，默认 `external`：**局域网直连不需要 token，请求里带的 `Authorization` 头被完全忽略**（有效、已撤销或乱写的 token 都不会导致 401）；经反向代理或来自公网的请求需要 `Authorization: Bearer <token>`。`GET /health` 永远不需要 token。客户端可以始终发送已保存的 token，各种模式都兼容。
 - 时间：Unix 秒（与现有 envelope 的 `timestamp` 一致）；时长 `duration` 为秒（f64）。
+
+### 格式与角色协商（Search Metadata v2 候选）
+
+候选的 `compatibility.catalog_revision` 为 **2**。该数字是目录修订，既不是实际库 schema，
+也不是必须相等的对端版本门槛；仍按 marker、协议、精确格式 ID 和完整 feature 校验。
+本次候选的程序版本已冻结为 **0.9.0**，尚未发布；升级提示的 `min` 取实际构建版本，
+当前示例 `recommended; min=0.9.0; features="search_path,vorbis_tags,vendor_metadata"` 不代表正式发布。
+
+- 客户端通用目录声明可只读接收 schema 3–9 的已知完整格式，普通本地 `database_write_formats`
+  仍为 `ale-s8-cld1-t3-m2-p1-a1`。完成态 s9 不进入客户端的 schema-8 修复或写入流程。
+- 服务端 `/capabilities.compatibility.database_write_formats` 按**实际源库**报告：源库 8 报 s8，
+  完成态源库 9 报 `ale-s9-cld1-t3-m2-p1-a1-sd1`。读到派生 s8 不赋予旧端对源库 9 的写权限。
+- `/capabilities` 输出 `library_schema.{current,source_search_rev,snapshot_formats_served}`、
+  `schema_migration.{state,endpoint}`、可用的 `vendor_import` 端点/真实限额，以及
+  `client_upgrade` 和 `search_scopes`（`main`、`all`、`path`、`filename`）。厂商导入限额为
+  每文件 52,428,800 bytes、200,000 行、每行文本 262,144 bytes；实际路由仍检查鉴权、管理权限和库身份。
+- 新端在 `GET /library` 与快照请求均发送 catalog、`x-audiolib-accept-snapshot-formats` 和三个
+  schema/storage/tokenization 最大修订头。明确接受 s9 的一致声明优先得到 s9，不静默降为 s8。
+  只接受 s8 的有效 peer 才取得兼容 s8。缺 catalog 的快照下载仍拒绝。
+- 正式 0.8.7 的 `/library` 请求没有这些头，因此**仅该信息读取**允许无标记请求在 s9 源库上看到
+  兼容 s8。响应 `schema_version`、`snapshot_format`、`stats` 描述协商结果，新增 `library_schema`
+  描述实际源库版本；`library_id` 和 `revision` 始终绑定实际源库。统计读取不先复制整库。
+- s9→s8 过渡默认开启，配置为 `legacy_snapshot_enabled = true`，计划供 0.9 过渡周期使用。
+  周期结束需显式设置 false，不按版本号自动到期。设置 false 后旧端收到 409 `SNAPSHOT_FORMAT_UNSUPPORTED`，capabilities 提示 `required`；
+  原生 s9 继续可用，旧端保留最后有效缓存。过渡 s8 的 `/library` 和快照响应带共享的
+  `X-AudioLib-Upgrade-Available: recommended; ...`，capabilities 同样建议升级；原生 s9 peer 不收降级提示。
+
+这些是当前候选的实现契约；具体测试、旧二进制配对、跨平台和大库成本须单独记录，不能由目录字段推断已验收。
 
 ### 2.1 成功与错误
 
@@ -286,7 +323,7 @@ audiolib.example.com:8443 {
 
 ### 3.1 历史：快照 schema 3 → 5
 
-以下记录已发布 v5 的演进与兼容行为。当前源码为 schema 7 / `ale-s7-cld1-t3-m2-p1`，读取边界为 3..=7，并核对全部 feature；v6 的备份、分批断点恢复、授权退役及部署顺序以[升级契约](Schema_V6_Iteration.md)和[兼容矩阵](Library_Migration_Compatibility.md)为准，v7 的派生专辑和封面边界见[封面契约](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Artwork.md)。下列旧索引、单事务升级与旧客户端写入描述不覆盖 v6/v7 的实际格式准入。
+以下记录已发布 v5 的演进与兼容行为，其中 schema 7 / `ale-s7-cld1-t3-m2-p1`、读取 3..=7 是此前源码阶段；当前候选的读3–9/普通写8/显式server写9边界见上文。v6 的备份、分批断点恢复、授权退役及部署顺序以[升级契约](Schema_V6_Iteration.md)和[兼容矩阵](Library_Migration_Compatibility.md)为准，v7 的派生专辑和封面边界见[封面契约](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Artwork.md)。下列旧索引、单事务升级与旧客户端写入描述不覆盖当前实际格式准入。
 
 - `SCHEMA_VERSION` = **5**（`crates/audiolib-db/src/schema.rs`，由 `audiolib_db::SCHEMA_VERSION` 导出）。`MIN_SNAPSHOT_SCHEMA_VERSION` = **3**（同文件，客户端的 `MIN_SNAPSHOT_SCHEMA` 直接引用它，不重复定义）。`GET /library` 的 `schema_version` 与快照响应头 `X-Schema-Version` 现在都是 `5`。
 - v4 **只新增索引**：不改任何表、列、触发器、FTS，不改行数据，所以 v3 与 v4 用同一套查询；`/library` 的 `stats` 条件由 `COALESCE(missing,0)=0` 改为 `missing=0`（`missing` 列是 `NOT NULL DEFAULT 0`），可命中部分索引。
@@ -333,9 +370,11 @@ audiolib.example.com:8443 {
 ## 5. 分页
 
 - 搜索输入按客户端快照上的 `SearchRequest` 校验：查询最多 500 个字符；独立的非 Han 字母词至少需要两个可搜索 Unicode grapheme（组合重音不另计）。这是已确认的产品行为。GUI 输入一个字母时取消旧请求、保留当前结果与目录并显示“字母搜索请至少输入 2 个字符”，不发送新搜索。直接调用 core/db 或 CLI 则返回 `Validation`，不会当作零命中或内部数据库错误。多词中的单字母代码（例如 `P-51`）、单个 Han 字和纯数字沿用原规则。
-- 两个字母以上支持词内连续片段：`expl`、`plos`、`sion` 匹配 `explosion`，多个词之间为 AND；用户文本中的标点、`OR` 等不作为 FTS5 运算符。当前服务端 **尚未实现**下表的 `POST /search` 与 `/search/folders`，正常服务器模式在本地快照查询，因此不存在当前 HTTP 搜索端点的单字母 400/500 响应；若未来开放端点，按 §2.1 的现有映射应为 HTTP 400 `VALIDATION`。
-- v1 沿用 `SearchRequest` 的 `limit` + `offset`（UI 现在每页 200），响应带 `total_count`。理由：与本地实现完全一致，remote 改动最小。
-- 游标分页（服务端提议）列为待定：如果服务端需要快照一致性，建议游标为不透明字符串 `next_cursor`，内部编码排序键 + 最后一个 id；`SearchRequest` 再加可选 `cursor` 字段，有游标时忽略 `offset`。
+- 两个字母以上支持词内连续片段：`expl`、`plos`、`sion` 匹配 `explosion`，多个词之间为 AND；用户文本中的标点、`OR` 等不作为 FTS5 运算符。服务端已有 `POST /search` 和 `GET /search?q=…&scope=…&limit=…&cursor=…`，无效搜索输入按 §2.1 返回 HTTP 400 `VALIDATION`，过期游标返回409 `CURSOR_STALE`。`POST /search/folders` 尚未实现；RemoteProvider 日常查询仍在本地校验后的只读快照执行。
+- v1 沿用 `SearchRequest` 的 `limit` + `offset`（UI 现在每页 200），响应带 `total_count` 和 `total_count_exact`。`scope` 省略或 `main` 时排序与 schema 8 主表一致；主表、`filename`、空查询浏览，以及目录索引不可用时 `all` 回退到主表的响应，均保持精确总数。
+- 非空 `scope=all|path` 使用目录段索引。格式 id 为 `ale-s9-cld1-t3-m2-p1-a1-sd1`（`sd1`，不是 `sp1`）。请求可带不透明 `cursor`（同时传 `offset`/`page` 时以 cursor 为准）和 1 起的 `page`。优化的目录相关性分页只取当前页和一条前瞻记录（`limit + 1`），无 cursor 时另实际遍历要跳过的前缀，不为总数扫描全部命中。`total_count` 无 cursor 时等于已观察前缀的数量：有下一页时是总数下界；无下一页时，第一页或含结果的页面才确认精确总数。无 cursor 的非零 offset 空页返回 0，未经短路证明全查询为空时 `total_count_exact=false`，不能直接把 offset 当成计数。
+- 带 cursor 的优化目录页只计该 cursor 之后当前页和前瞻记录，通常为 `returned_count + 1`，末页为 `returned_count`，**不是整个查询的总数**，不能累加或用于计算最终页数。有下一页时 `total_count_exact=false`，末页为 `true`；末页的标记只确认该游标范围已穷尽，不能把局部计数解释为全查询总数。短路证明整个查询为空时返回精确的 0。带筛选或非相关性排序的 SQL 目录查询则返回精确的全查询总数。
+- 目录搜索以非空 `next_cursor` 作为继续翻页的依据；末页省略该字段。内部 `has_more` 来自前瞻记录，不是 `SearchPage` 响应字段。界面在 `total_count_exact=false` 时显示“至少/≥”，导航结合已走过的位置与 `next_cursor`，不能把 cursor 局部计数当最终总数。游标绑定请求条件、provider 会话和数据库变更修订；`search_path_rev` 只描述目录格式版本，不能替代内容修订。范围、筛选、排序、库内容或 provider 会话变化后拒绝旧游标并从第一页重取。`POST /search` 见下表。
 - 扫描历史与客户端本机播放历史使用 `limit` + `offset`；服务端兼容 `/history/plays` 始终返回 `[]`。
 
 ## 6. 端点清单
@@ -350,7 +389,8 @@ audiolib.example.com:8443 {
 | ✅ | GET | `/roots` | `folders`（求 `file_count`）+ 根状态缓存 + 扫描历史 | — | `[{ "name", "server_path", "webdav_url": "…" \| null（功能未完善，见 §7）, "file_count": n \| null, "missing_count": n, "online": bool, "status": "checking" \| "online" \| "waking" \| "offline", "status_message": "…" \| null, "checked_at": unix秒 \| null, "last_scan": { … } \| null, "scanning": bool }]`，见 §6.4 |
 | ✅ | POST | `/roots/{name}/check` | 根状态 | 无请求体 | 立即重查该根（最多约 2 秒），返回该根的 `/roots` 条目；未知根名 404 `NOT_FOUND`，见 §6.4 |
 | ⏳ | GET | `/stats` | `stats` | — | `LibraryStats` |
-| ⏳ | POST | `/search` | `search` | `SearchRequest` | `SearchPage` |
+| ✅ | POST | `/search` | `search` | `SearchRequest`（`scope=main\|all\|path\|filename`，可选 `cursor`/`page`） | `SearchPage`（含 `next_cursor`） |
+| ✅ | GET | `/search` | `search` | `q`、`scope=main\|all\|path\|filename`、可选 `limit`/`cursor` | `SearchPage` |
 | ⏳ | POST | `/search/folders` | `search_folders` | `SearchRequest` | `Folder[]` |
 | ⏳ | GET | `/folders?parent_id=<id>` | `folders` | 不带 `parent_id` 为根 | `Folder[]` |
 | ✅ | GET | `/audio/{id}` | `get_audio` | — | `AudioFile`；无此记录 404 `NOT_FOUND`，非整数 id 400 `VALIDATION` |
@@ -390,6 +430,14 @@ audiolib.example.com:8443 {
 
 ### 6.1 `GET /library/snapshot`
 
+- 原生 s9 与兼容 s8 使用独立准备任务、plain/zstd 缓存和不可变表示。兼容版本只修改服务端自有的
+  一致性副本：过滤非 WAV 行及其已知关联、移除目录索引/capture 与正式 vendor 存储表，刷新文件夹统计，
+  保留 WAV 的主表、主 FTS 词项、用户标注、原始 Metadata 和扩展镜像，不重建主 FTS。
+  输出为 schema 8 / `ale-s8-cld1-t3-m2-p1-a1` / `source_search_rev=2`，保留原有 rev3 文本命中。
+  原生库、音频和源 schema 不变；无法安全过滤未知扩展关联时拒绝该兼容副本，原生快照仍可使用。
+- 两种格式都绑定源 `library_id`/`revision`；源 Metadata、导入或扫描提交推进 revision 后兼容副本也重新准备。
+  生成前检查空间，验证失败或取消不发布副本。下载、校验、格式协商或过渡关闭失败不能覆盖客户端旧缓存。
+  固定 `snapshot_id` 仍按该表示的实际格式检查准入，不能拿 s8 声明读取 s9 表示。
 - 服务端用现有 `backup_library`（SQLite backup API，单个读事务内的一致快照）写入 `snapshot_dir` 下的临时目录，再以 `application/octet-stream` 流式返回。
 - **按 revision 准备**：未指定 `snapshot_id` 时选择最新 `(library_id, revision)`，revision 未变复用准备结果，准备过程单飞。已发送的固定表示另受下述续传保留规则保护，不会因为播放或 Metadata 写入推进 revision 就失效。
 - **压缩（可选）**：请求带 `Accept-Encoding: zstd`（`q=0` 表示不接受）时返回 zstd 压缩（level 3，多线程）的同一个 SQLite 文件，`Content-Encoding: zstd`；压缩版也按 revision 缓存，第一次请求时生成。不带时照旧返回原始文件。
@@ -619,6 +667,7 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
   "session_id": 17, "state": "running", "paused": false, "finalizing": false,
   "discovered": 0, "processed": 0, "added": 0, "updated": 0, "unchanged": 0, "removed": 0,
   "errors": 0, "error_details": [], "errors_truncated": 0,
+  "vendor_metadata": { "tables": 0, "rows": 0, "matched": 0, "updated": 0, "unchanged": 0, "ambiguous": 0, "unmatched": 0 },
   "current_path": "/srv/audiolib/music/SFX_Main/Foley/Doors", "message": "",
   "root": "SFX_Main", "subpath": "Foley/Doors", "mode": "incremental",
   "active": true, "pause_requested": false, "cancel_requested": false, "revision": null
@@ -636,6 +685,14 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 
 `ScanProgress` 原有字段：`state`（`running` \| `completed` \| `cancelled` \| `failed`）、`finalizing`（已开始最终的原子对账，之后不再接受控制）、`discovered`/`processed`（找到/处理的 WAV 数）、`added`、`updated`、`unchanged`、`removed`（标为 missing 的记录数）、`errors` + `error_details`（最多 100 条 `{path, message}`，其余计入 `errors_truncated`）、`current_path`（服务端绝对路径，同 §3 的路径暴露约定）、`message`。
 
+新增 `vendor_metadata` 是同目录厂商表格自动扫描的独立计数，不改变音频头的上述计数：
+`tables` 为发现并检查的 CSV/TSV/XLS/XLSX 数，`rows` 为数据行数，`matched` 为唯一同目录 WAV 匹配行数，
+`updated`/`unchanged` 为各表处理后 Metadata 投影改变/不变的音频记录数，
+`ambiguous`/`unmatched` 为不自动写入的行数。多张表分别作用于同一个 WAV 时可分别计数。
+旧服务端缺少该对象或其中字段时全部按零读取，旧客户端忽略新增字段。
+本进程保留的完整会话提供这些计数；早期/重启后的 `ScanSession` 历史没有该细分信息，不据零值推断没有导入。
+自动来源与提交状态另随厂商导入历史持久保存。
+
 规则：
 
 - **返回时机与超时**：返回前服务端要解析根目录和 `subpath`（NAS 硬盘休眠时可能要 20–30 秒或更久），所以 `POST /scans` **不受 30 秒限制**。客户端放弃等待（断开）时扫描照常开始，用 `GET /scans/current` 找回。
@@ -643,6 +700,12 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 - **同一时间只有一个扫描**：本服务端已有扫描（运行或暂停中，含刚开始解析目录的）→ 409 `BUSY`（`message` 含会话 id）；另一个进程（CLI、本地模式桌面端）正在扫描或维护同一个库 → 409 `BUSY`。扫描期间 `POST /audio/metadata/batch` 返回 409 `BUSY`（§6.3，与本地模式相同）；单条 `PATCH /audio/{id}/metadata` 和 `POST /audio/{id}/plays` 照常可用。
 - **慢盘、空根、出错（§6.4 的规则不变）**：根目录不存在/不可读时扫描直接失败、不改记录；扫描途中目录读取出错（例如卷断开）、遇到符号链接（不跟随）、被取消或失败时都**不做 missing 对账**；全量扫描遇到完全为空的根（典型的未挂载挂载点）也不对账；慢只会让扫描变慢。单个文件读不出来记一条 `error_details`，扫描继续（但全量扫描只要有任何错误就不做 missing 对账）。
 - **子目录扫描**：扫描范围是 `subpath` 之下；它的文件夹记录挂在所属根的文件夹树下（必要时先建好从根到该子目录的文件夹记录），不会变成单独的顶层文件夹。全量子目录扫描只对该子目录范围做 missing 对账。
+- **同目录表格**：音频批次完成后处理遍历中发现的厂商表格，增量扫描也检查未变化 WAV 旁的表格。
+  只自动关联同目录唯一的 WAV，不做全库、stem 或 fuzzy 匹配；歧义/未匹配行保留给手动流程。
+  与内嵌字段比较去重，保留原始来源及用户标注；完整安全匹配的新表格替换自身旧贡献，其他来源不变。
+  表格存在未匹配或歧义时，先合并安全的新值并保留该表全部旧贡献，避免插行/重排导致来源误删；
+  修正到完整匹配或显式回滚该来源后再收敛旧值。
+  损坏、不可读或消失的表格不抹去上一次有效贡献。解析及分批提交继续接受暂停/取消，已提交批次保留。
 - **停机 / 重新部署**：服务端收到停止信号时立即取消正在进行（含暂停中）的扫描，最多等 10 秒让它把会话记为 `cancelled`（已提交的批次保留；每批一个事务，库不会损坏；不做 missing 对账）。停止期间新的 `POST /scans` → 503 `UNAVAILABLE`。若扫描线程卡在 NAS 上 10 秒内没结束，进程照常退出，库里该会话保持 `running`，直到下一次扫描开始时被标为 `failed`（`Previous scanning process exited before finalization`）；`GET /scans/{id}` 对这种会话返回 `active: false`，`message` 说明它不在本服务端运行。
 
 #### 进度：`GET /scans/{session_id}` 与 `GET /scans/current`
@@ -666,7 +729,7 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 #### revision 规则
 
 - **扫描期间 `revision` 冻结**：扫描分批提交（每批 128 个文件一个事务），但 `/library` 轮询不会每批递增，客户端不会在扫描中途反复下载整库快照。扫描期间请求的快照标的是冻结的 `revision`，内容不旧于它（可能已含部分扫描结果）。
-- **结束（完成、取消或失败）时最多递增一次**：扫描有改动（`added`、`updated`、`removed` 任一 > 0，或文件/文件夹/missing 统计变化），或扫描期间有其他进程写过库 → `revision` +1，按 revision 缓存的快照随之失效；否则**不递增**（扫描会话记录和“本次已见”标记的写入不算改动）。因此：**无改动的增量扫描不递增**；全量扫描会重写每条记录（`updated` = 文件数），**总会递增**。
+- **结束（完成、取消或失败）时最多递增一次**：扫描有改动（`added`、`updated`、`removed`、`vendor_metadata.updated` 任一 > 0，或文件/文件夹/missing 统计变化），或扫描期间有其他进程写过库 → `revision` +1，按 revision 缓存的快照随之失效；否则**不递增**（扫描会话记录和“本次已见”标记的写入不算改动）。因此：**无改动的增量扫描不递增**；只改变表格 Metadata 也会递增并通知客户端同步。全量扫描会重写每条记录（`updated` = 文件数），**总会递增**。
 - 结束后的 `revision` 在响应的 `revision` 字段里；与客户端缓存的 `revision` 不同就按 §4 同步快照（下一次 `/library` 轮询也会看到）。
 - 扫描期间成功的单条 metadata 写入照常递增：`revision_before` = 冻结值 + 1（已包含此前的扫描提交），`revision` = 冻结值 + 2；客户端按 §4 规则：`revision_before` 与本地不同就做快照同步。被拒绝的写入（例如 409 `BUSY` 的批量写入）不改变 `revision`。
 - 快照里也有扫描会话表，但无改动的扫描不递增 `revision`，所以本地快照里的扫描历史可能落后；**显示扫描历史请用 `GET /history/scans`**（§6.7）。
@@ -797,6 +860,54 @@ HTTP 200 视为 DTO 兼容保证；须先升级客户端，之后在维护窗口
 
 SQLite 事务与根设置使用持久化恢复日志配对：`admin-settings.json` 的 `root_relink` / `root_removal` 在事务前保存，成功后清除；进程中断或最后设置写盘失败时，重启及下一次根修改根据保存的文件夹 ID 与数据库已提交状态恢复正确根列表。根修改、恢复及普通管理设置写入共用设置目录的 `.admin-settings.lock` OS 锁，侧文件解锁后保留；占用时返回 409 `BUSY`，另一实例不会清除进行中操作的日志。持锁后重新读取最新根列表，避免旧实例覆盖新配置。即使恢复设置仍无法写盘，已运行服务器也按数据库提交状态更新根监控，日志保留供后续重试。PATCH 与 DELETE 没有通用 30 秒请求上限：大量记录的验证、备份或删除可耗时更长。PATCH 请求取消会在提交前回滚；DELETE 在开始数据库写入前检查取消，开始后排空已请求的移除。客户端对可能已提交的失败也重新同步当前服务器快照与根列表，不能将超时当作确定未写入。
 
+<a id="vendor-import-preview"></a>
+
+### 6.11 厂商 Metadata 预览：上传与服务端目录（候选）
+
+厂商导入使用 `/capabilities.vendor_import.endpoint`，当前为 **`/api/vendor-import`**，
+独立于 `/api/v1` 前缀。`POST /api/vendor-import/preview` 通过 Content-Type 区分两种来源，
+都返回 `VendorImportPreview`；不会自动提交或改写音频/主库 Metadata。
+服务端目录 JSON 来源及已打开句柄隔离已合入当前开发候选；本轮测试验收另行记录。
+下面是接口契约，不表示真实目录、跨平台或权限测试已通过。
+
+| Content-Type | 请求来源 | 请求正文 |
+|---|---|---|
+| `multipart/form-data; boundary=...` | 客户端上传表格 | `file` / `files` 文件 part，可附一个 `options` JSON part；全请求上限 512 MiB，options 上限 1 MiB |
+| `application/json`（可带 charset） | 已配置服务端库根下的表格目录 | 下列 JSON；正文上限 **1 MiB**，不接收任意服务器绝对路径 |
+
+```http
+POST /api/vendor-import/preview
+Content-Type: application/json
+X-AudioLib-Library-Id: <当前库身份>
+```
+
+```json
+{
+  "root": "SFX_Main",
+  "root_relative_dir": "metadata/vendor",
+  "options": { "fuzzy": false, "overwrite": false }
+}
+```
+
+- `root` 必须精确匹配当前配置的库根名称；`root_relative_dir` 是该根内的相对目录，空字符串或 `.`
+  表示整个根。反斜杠按目录分隔符处理；含 `..`、绝对/盘符路径、冒号或 NUL 的输入在文件系统访问前拒绝。
+  配置根解析为真实目录后，逐层以受限的目录句柄打开相对目录；链接组件不跟随，未知根或越界目录拒绝。
+- 在选定目录下递归发现普通 `.csv`、`.tsv`、`.txt`、`.xls`、`.xlsx` 文件（扩展名大小写不敏感），
+  跳过枚举时发现的符号链接，不读取其他类型。最多 **512 个表格文件**，最多检查 **100,000 个目录条目**；
+  超限或未找到支持的表格返回 400 `VALIDATION`，应缩小选择范围。
+- `options` 可省略，使用 `VendorImportOptions` 默认值。未显式指定 `options.vendor_root` 时，
+  以该**配置根的真实路径**作为音频行匹配根，而非选中的表格子目录；显式映射、编码、分隔符等仍使用共享 options 契约。
+- 预览只读取来源并创建自有的可恢复预览/解析副本，不向音频库提交 Metadata，不修改源表格或音频。
+  实际读取绑定已授权的打开句柄：Unix 使用目录 FD 和 `openat` no-follow；Windows 拒绝 reparse、
+  核对实际句柄路径并固定目录链。枚举后被替换的路径不会让解析器重新读取外部目标。
+  数据从验证后的文件句柄复制到自有暂存区，保留原文件名，再将这些暂存路径交共享导入器；
+  每文件最多复制大小上限加 1 byte，以便超大文件按原规则逐文件拒绝，其他有效文件继续预览；
+  整批暂存输入不超过 512 MiB，超限拒绝整批，不发布截断的有效预览。
+  文件大小、解析行数/文本、格式和匹配歧义仍由共享导入器校验；出现匹配候选不等于已写入。
+  修改库另走 `POST /api/vendor-import/{id}/commit`，要求 `Idempotency-Key`。
+- 两种来源均先检查鉴权、`manage_mode`、当前 `X-AudioLib-Library-Id` 和实际库格式的 peer 准入，
+  再解析正文/枚举来源；浏览器修改请求仍要求同源。JSON 未知字段、无效正文或超出 1 MiB 返回 400 `VALIDATION`。
+
 ## 7. WebDAV 与音频访问
 
 > **WebDAV：功能未完善。** 下面的约定和现有字段保持不变（`/roots.webdav_url` 仍可为 `null`，服务端只给建议默认值，地址由客户端用户填写），服务端不提供任何 WebDAV 端点，也不保证 WebDAV 路径可用；试听和拖出请走 §8 的服务端直连。
@@ -812,7 +923,7 @@ SQLite 事务与根设置使用持久化恢复日志配对：`admin-settings.jso
 `GET /audio/{id}/stream`（按 §2.2 鉴权；也支持 `HEAD`，只返回响应头）返回原始文件字节，不转码，客户端负责解码、重采样和输出（与本地模式一致）；低带宽试听用 §8.1 的 `/audio/{id}/preview`。客户端 Symphonia 解码器通过 HTTP Range 实现可 seek 的读取（RIFF/RF64 头部读取、ADPCM 按块 seek 都依赖随机访问）。WebDAV（§7）仍可继续使用。
 
 - **响应头**（200/206/304/416 都带）：`Accept-Ranges: bytes`、`ETag`、`Cache-Control: private, no-cache`。200/206 另带 `Content-Type`、`Content-Length`；206 带 `Content-Range: bytes <start>-<end>/<文件长度>`。
-- **`Content-Type`**：按扩展名，`.wav`/`.wave`/`.bwf`/`.rf64` → `audio/wav`（当前库只有 WAV）；`.aif(f)`/`.aifc` → `audio/aiff`、`.flac` → `audio/flac`、`.mp3` → `audio/mpeg`、`.ogg`/`.oga` → `audio/ogg`、`.m4a`/`.mp4` → `audio/mp4`；其他 `application/octet-stream`。
+- **`Content-Type`**：按扩展名，`.wav`/`.wave`/`.bwf`/`.rf64` → `audio/wav`；`.aif(f)`/`.aifc` → `audio/aiff`、`.flac` → `audio/flac`、`.mp3` → `audio/mpeg`、`.ogg`/`.oga` → `audio/ogg`、`.m4a`/`.mp4` → `audio/mp4`；其他 `application/octet-stream`。MIME 映射不等于 codec 支持声明；本轮默认扫描/原生播放新增 FLAC、Ogg Vorbis、OGA/Ogg FLAC，Opus 仅标签 probe，默认不扫描且播放明确 unsupported。
 - **Range**（只支持单个区间）：
   - `bytes=a-b` → 206，`b` 超出文件末尾时截到最后一个字节；`bytes=a-` → 206，从 `a` 到末尾；`bytes=-n` → 206，最后 `n` 个字节（`n` 大于文件长度时为整个文件）。
   - 起点 ≥ 文件长度、`bytes=-0`、或文件长度为 0 → **416** `RANGE_NOT_SATISFIABLE`，附 `Content-Range: bytes */<文件长度>`，JSON 错误体。

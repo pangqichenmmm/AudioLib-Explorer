@@ -532,14 +532,16 @@ fn real_boom_smed_metadata_fixtures() {
 #[test]
 fn playback_layout_stops_at_the_data_chunk() {
     // A network source must not fetch the file's tail to start playing: the playback
-    // layout ignores everything after the audio (here a trailing chunk claiming more bytes
-    // than the file has, which the full Metadata probe rejects).
+    // layout ignores everything after the audio (here a chunk inside the declared RIFF
+    // claiming more bytes than the file has, which the full Metadata probe rejects).
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("tail.wav");
     wav(&path);
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.extend_from_slice(b"LIST");
     bytes.extend_from_slice(&1_000_000_u32.to_le_bytes());
+    let riff_size = (bytes.len() - 8) as u32;
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     assert!(probe(&path).is_err());
     let playback = crate::wav::read_info(&path).unwrap();

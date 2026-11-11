@@ -17,6 +17,7 @@ Set-StrictMode -Version Latest
 if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw 'Docker validation requires PowerShell 7.3 or newer.' }
 Add-Type -AssemblyName System.Formats.Tar
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'server-package-layout.ps1')
 $match = [regex]::Match($Tag, '^v(\d+\.\d+\.\d+)(?:-(?:beta|rc)\.(?:0|[1-9]\d*))?$')
 if (!$match.Success) { throw 'Invalid release tag.' }
 $version = $match.Groups[1].Value; $fullVersion = $Tag.Substring(1); $arch = $Platform.Split('/')[1]
@@ -160,10 +161,12 @@ try {
     if ($sidecar -cnotmatch ('^[0-9a-fA-F]{64}  ' + [regex]::Escape($archiveName) + '$') -or
         $sidecar.Substring(0,64).ToLowerInvariant() -cne $archiveHash) { throw 'Docker archive checksum mismatch.' }
     $report = Get-Content -LiteralPath $PackageReport -Raw | ConvertFrom-Json -AsHashtable
+    Assert-ServerLayoutMetadata $report
     if ($report.success -isnot [bool] -or !$report.success -or $report.tag -cne $Tag -or $report.version -cne $version -or
         $report.commit -cne $ExpectedCommit -or $report.platform -cne $Platform -or $report.image_tag -cne $imageTag -or
         $report.image_id -cnotmatch '^sha256:[0-9a-f]{64}$' -or $report.archive_sha256 -cne $archiveHash -or
-        $report.runtime_validation -cne 'not-run') { throw 'Docker package report identity mismatch.' }
+        $report.runtime_validation -cne 'not-run' -or $report.binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $report.migrator_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Docker package report identity mismatch.' }
     Assert-DockerSaveArchive $DockerArchive $report.image_id $imageTag
     $checks.Add('archive checksum, single RepoTag and configuration image ID before load')
     $FixtureDirectory = (Resolve-Path -LiteralPath $FixtureDirectory).Path
@@ -200,6 +203,19 @@ try {
         $image[3] -cne '10001:10001' -or $image[4] -cne $fullVersion -or $image[5] -cne $ExpectedCommit -or
         $image[6] -cne '["/opt/audiolibserver/audiolib-server"]' -or $image[7] -cne 'disabled') { throw 'Loaded image runtime identity/security mismatch.' }
     $checks.Add('loaded image architecture, version, revision, UID, entrypoint and disabled updater')
+    # A short owned container binds both shipped executables to the accepted
+    # native package and proves the migrator cannot activate test-only hooks.
+    # It has no library mount, network, credentials or writable image root.
+    $probeScript='set -eu; test -x /opt/audiolibserver/audiolib-migrate; sha256sum /opt/audiolibserver/audiolib-server /opt/audiolibserver/audiolib-migrate; set +e; reply=$(/opt/audiolibserver/audiolib-migrate status --db /tmp/never.db --sql-trace /tmp/never.sql 2>&1); code=$?; set -e; test "$code" -ne 0; printf "%s" "$reply" | grep -q "fault injection requires test-hooks"; test ! -e /tmp/never.db; test ! -e /tmp/never.sql'
+    $probe=(Invoke-Docker @('container','create','--name',('audiolib-validation-'+$nonce+'-binaries'),'--label',$label,'--platform',$Platform,'--read-only','--network','none','--security-opt','no-new-privileges','--user','10001:10001','--tmpfs','/tmp:rw,nosuid,nodev','--entrypoint','/bin/sh',$report.image_id,'-ec',$probeScript)).Text.Trim()
+    if($probe -cnotmatch '^[0-9a-f]{64}$'){throw 'Unexpected owned binary-probe container ID.'}
+    $containers.Add($probe);Assert-OwnedContainer $probe
+    $null=Invoke-Docker @('container','start',$probe)
+    $runtimeStarted=$true
+    if((Invoke-Docker @('container','wait',$probe)).Text.Trim() -cne '0'){throw 'Image migration executable or production feature guard failed.'}
+    $probeLines=@((Invoke-Docker @('container','logs',$probe)).Text -split "`n"|Where-Object {$_})
+    if($probeLines.Count -ne 2 -or $probeLines[0].Trim() -cne ($report.binary_sha256+'  /opt/audiolibserver/audiolib-server') -or $probeLines[1].Trim() -cne ($report.migrator_sha256+'  /opt/audiolibserver/audiolib-migrate')){throw 'Loaded image executable SHA256 differs from its accepted native package.'}
+    $checks.Add('server and migrator native SHA256; production migrator rejects test-hooks without creating a database')
     $volume = New-Volume 'data'
     $seed = Start-Container 'seed' $volume -SeedOnly
     $seedExit = (Invoke-Docker @('container','wait',$seed)).Text.Trim()
@@ -283,6 +299,8 @@ $result = [ordered]@{
     success=$success; tag=$Tag; version=$version; commit=$ExpectedCommit; platform=$Platform
     runtime_validation=$(if ($success) { 'passed' } elseif ($runtimeStarted) { 'failed' } else { 'not-run' }); checks=@($checks)
     archive_sha256=$archiveHash; image_id=$(if ($null -ne $report -and $report.Contains('image_id')) { $report.image_id } else { $null })
+    binary_sha256=$(if($null -ne $report -and $report.Contains('binary_sha256')){$report.binary_sha256}else{$null});migrator_sha256=$(if($null -ne $report -and $report.Contains('migrator_sha256')){$report.migrator_sha256}else{$null})
+    layout_revision=2;automatic_upgrade_compatible=$false;manual_bootstrap_required=$true;minimum_updater_version='0.9.0';old_updater_policy='refused'
     docker_engine=$(if ($null -ne $daemon) { @{os=$daemon[0]; architecture=$daemon[1]; version=$daemon[2]} } else { $null })
     hardware_coverage='Docker Linux environment; physical host hardware is not asserted'
     healthcheck='image health command with 1-second acceptance interval'; shutdown='normal docker stop SIGTERM, exit 0, no forced termination'

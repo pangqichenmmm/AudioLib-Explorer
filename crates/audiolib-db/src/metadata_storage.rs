@@ -3,6 +3,7 @@
 use audiolib_core::{Error, Result};
 use flate2::{Decompress, FlushDecompress, Status};
 use rusqlite::types::{Value, ValueRef};
+use std::borrow::Cow;
 
 const MAGIC: &[u8; 8] = b"ALEMD\x01Z\0";
 const HEADER_BYTES: usize = MAGIC.len() + 8;
@@ -48,6 +49,17 @@ pub(crate) fn decode_value(value: ValueRef<'_>) -> Result<String> {
             .map_err(invalid),
         ValueRef::Blob(bytes) => decode_blob(bytes),
         _ => Err(invalid("expected JSON text or a versioned compressed blob")),
+    }
+}
+
+/// Borrow UTF-8 TEXT while hydrating one SQLite row. Legacy BLOBs retain the
+/// strict owned decoder and its errors; the borrowed view cannot outlive the row.
+pub(crate) fn decode_view<'row>(value: ValueRef<'row>) -> Result<Cow<'row, str>> {
+    match value {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .map(Cow::Borrowed)
+            .map_err(invalid),
+        value => decode_value(value).map(Cow::Owned),
     }
 }
 
@@ -122,6 +134,16 @@ mod tests {
         compressed_fixture_bytes(raw).unwrap()
     }
 
+    fn assert_both_decoders_reject(value: ValueRef<'_>) {
+        let owned = decode_value(value).unwrap_err();
+        let view = decode_view(value).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&owned),
+            std::mem::discriminant(&view)
+        );
+        assert_eq!(owned.to_string(), view.to_string());
+    }
+
     #[test]
     fn legacy_decoder_retains_unknown_fields_unicode_and_exact_json_bytes() {
         let text = raw();
@@ -133,6 +155,9 @@ mod tests {
             decode_value(ValueRef::Blob(&encoded)).unwrap().as_bytes(),
             text.as_bytes()
         );
+        let view = decode_view(ValueRef::Blob(&encoded)).unwrap();
+        assert!(matches!(&view, Cow::Owned(_)));
+        assert_eq!(view.as_bytes(), text.as_bytes());
     }
 
     #[test]
@@ -143,6 +168,9 @@ mod tests {
         for text in ["{}", " \n{\"extra\": 1.00}\n", "not-json"] {
             assert_eq!(encode(text, true).unwrap(), Value::Text(text.into()));
             assert_eq!(decode_value(ValueRef::Text(text.as_bytes())).unwrap(), text);
+            let view = decode_view(ValueRef::Text(text.as_bytes())).unwrap();
+            assert!(matches!(&view, Cow::Borrowed(_)));
+            assert_eq!(view, text);
         }
     }
 
@@ -165,16 +193,20 @@ mod tests {
         let valid = compressed_bytes(raw().as_bytes());
         for length in [0, MAGIC.len(), HEADER_BYTES, valid.len() - 1] {
             assert!(decode_blob(&valid[..length]).is_err());
+            assert_both_decoders_reject(ValueRef::Blob(&valid[..length]));
         }
         let mut unknown = valid.clone();
         unknown[5] = 2;
         assert!(decode_blob(&unknown).is_err());
+        assert_both_decoders_reject(ValueRef::Blob(&unknown));
         let mut corrupt = valid.clone();
         *corrupt.last_mut().unwrap() ^= 0x80;
         assert!(decode_blob(&corrupt).is_err());
+        assert_both_decoders_reject(ValueRef::Blob(&corrupt));
         let mut trailing = valid;
         trailing.extend_from_slice(b"another stream or garbage");
         assert!(decode_blob(&trailing).is_err());
+        assert_both_decoders_reject(ValueRef::Blob(&trailing));
     }
 
     #[test]
@@ -182,12 +214,15 @@ mod tests {
         let mut bytes = compressed_bytes(b"small");
         bytes[MAGIC.len()..HEADER_BYTES].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_blob(&bytes).is_err());
+        assert_both_decoders_reject(ValueRef::Blob(&bytes));
         bytes[MAGIC.len()..HEADER_BYTES].copy_from_slice(&0_u64.to_le_bytes());
         assert!(decode_blob(&bytes).is_err());
+        assert_both_decoders_reject(ValueRef::Blob(&bytes));
         assert!(decode_blob(&compressed_bytes(&[0xff; 512])).is_err());
-        assert!(decode_value(ValueRef::Text(&[0xff])).is_err());
-        assert!(decode_value(ValueRef::Null).is_err());
-        assert!(decode_value(ValueRef::Integer(1)).is_err());
+        assert_both_decoders_reject(ValueRef::Blob(&compressed_bytes(&[0xff; 512])));
+        assert_both_decoders_reject(ValueRef::Text(&[0xff]));
+        assert_both_decoders_reject(ValueRef::Null);
+        assert_both_decoders_reject(ValueRef::Integer(1));
     }
 
     #[test]

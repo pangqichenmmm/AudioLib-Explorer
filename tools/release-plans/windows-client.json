@@ -7,7 +7,8 @@
   "variables": {"WithoutAsio": false},
   "stages": [
     {"id": "preflight", "script": "tools/check-release.ps1", "parameters": {"Tag": "${Tag}"}},
-    {"id": "build", "needs": ["preflight"], "script": "tools/build-release.ps1", "parameters": {"WithoutAsio": "${WithoutAsio}"}, "outputs": ["${TargetDirectory}/x86_64-pc-windows-msvc/release/AudioLibExplorer.exe", "${TargetDirectory}/x86_64-pc-windows-msvc/release/AudioLibCli.exe"]},
+    {"id": "license-preflight", "reuse": "never", "script": "tools/check-release-licenses.ps1", "parameters": {"Profile": "WindowsClient", "WithoutAsio": "${WithoutAsio}"}},
+    {"id": "build", "needs": ["preflight", "license-preflight"], "script": "tools/build-release.ps1", "parameters": {"WithoutAsio": "${WithoutAsio}"}, "outputs": ["${TargetDirectory}/x86_64-pc-windows-msvc/release/AudioLibExplorer.exe", "${TargetDirectory}/x86_64-pc-windows-msvc/release/AudioLibCli.exe"]},
     {"id": "package", "needs": ["build"], "script": "tools/package-portable.ps1", "parameters": {"Tag": "${Tag}", "SkipBuild": true, "WithoutAsio": "${WithoutAsio}"}, "outputs": ["dist/latest/portable", "dist/latest/AudioLibExplorer-latest-win-x64-portable.zip", "dist/latest/AudioLibExplorer-latest-win-x64-portable.zip.sha256"]},
     {"id": "accept", "needs": ["package"], "script": "tools/validate-portable.ps1", "parameters": {"BinaryDirectory": "dist/latest/portable", "WithoutAsio": "${WithoutAsio}"}},
     {"id": "install", "needs": ["accept", "package"], "script": "tools/install-local-release.ps1", "parameters": {"Source": "dist/latest/portable"}, "outputs": ["local_release"]}

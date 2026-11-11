@@ -19,10 +19,24 @@ use crate::stream::{MemoryCache, StreamSource};
 use crate::sync::directory_name;
 use crate::util::fnv64;
 use audiolib_core::AudioFile;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
+
+fn fallback_audio_filename(file: &AudioFile) -> String {
+    let extension = [file.filename.as_str(), file.file_path.as_str()]
+        .into_iter()
+        .filter_map(|name| Path::new(name).extension()?.to_str())
+        .find(|extension| {
+            audiolib_core::SUPPORTED_AUDIO_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
+        .unwrap_or("audio");
+    format!("audio-{}.{}", file.id, extension.to_ascii_lowercase())
+}
 
 /// How long revalidating an existing complete download may take before the cached copy
 /// is used as is: a drag must not wait for a sleeping NAS disk when the file is at hand.
@@ -34,6 +48,65 @@ pub const DEFAULT_DOWNLOAD_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MARKER_FILE: &str = ".audiolib-downloads";
 const STALE_PART_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_NAME_CHARS: usize = 180;
+const SOURCE_VERSION_DIRECTORY: &str = ".source-versions";
+
+/// A complete original pinned in a caller-owned staging directory, independently
+/// of cache eviction. Keep this value while reading `path`; dropping it closes the
+/// read-only guard but leaves directory/file cleanup to the caller's owner.
+#[derive(Debug)]
+pub struct OwnedOriginal {
+    /// Complete original in the caller's independently owned staging directory.
+    pub path: PathBuf,
+    /// Server validator captured from the download/probe, never a cache-name hash.
+    /// Older offline caches without a version receipt explicitly return `None`.
+    pub etag: Option<String>,
+    /// Validated complete byte length of the pinned original.
+    pub length: u64,
+    /// True when an existing original was used after server revalidation failed.
+    pub offline: bool,
+    _guard: std::fs::File,
+}
+
+/// Strong, original-byte identity suitable for binding a displayed Waveform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginalVersion {
+    /// Opaque, quoted strong validator of the original file bytes.
+    pub etag: String,
+    /// Complete original length checked alongside its validator.
+    pub length: u64,
+    /// Identity was recovered from an exact, verified original cache receipt.
+    pub offline: bool,
+}
+
+fn strong_etag(etag: Option<String>) -> Result<String> {
+    etag.filter(|etag| {
+        etag.len() >= 2
+            && etag.starts_with('"')
+            && etag.ends_with('"')
+            && !etag.chars().any(char::is_control)
+    })
+    .ok_or_else(|| {
+        RemoteError::Protocol(
+            "Original source has no verified strong ETag; reload when the server is available"
+                .into(),
+        )
+    })
+}
+
+struct EnsuredOriginal {
+    path: PathBuf,
+    etag: Option<String>,
+    length: u64,
+    offline: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SourceVersion {
+    version: u8,
+    filename: String,
+    etag: Option<String>,
+    length: u64,
+}
 
 /// `HEAD ...?download=1` result.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -208,6 +281,14 @@ pub fn probe_download(source: &StreamSource) -> Result<DownloadProbe> {
     probe_download_with(source, &AtomicBool::new(false), &mut |_| {})
 }
 
+/// Cancellable HEAD retaining a representation's actual server ETag.
+pub fn probe_download_with_cancel(
+    source: &StreamSource,
+    cancel: &AtomicBool,
+) -> Result<DownloadProbe> {
+    probe_download_with(source, cancel, &mut |_| {})
+}
+
 /// [`probe_download`] that stops waiting when `cancel` is set and reports the wait.
 fn probe_download_with(
     source: &StreamSource,
@@ -346,6 +427,82 @@ impl DownloadCache {
         self.root.join(directory_name(library_id))
     }
 
+    /// Probe current original bytes without downloading them. Offline fallback is
+    /// allowed only for a complete original with an exact saved version receipt;
+    /// legacy/unknown cache names are never interpreted as server validators.
+    pub fn original_version(
+        &self,
+        library_id: &str,
+        id: i64,
+        source: &StreamSource,
+        cancel: &AtomicBool,
+    ) -> Result<OriginalVersion> {
+        self.original_version_checked(library_id, id, source, cancel, None)
+    }
+
+    /// As `original_version`, retaining an exact verified cached version offline
+    /// instead of substituting the most recently used version of the same record.
+    pub fn original_version_expected(
+        &self,
+        library_id: &str,
+        id: i64,
+        source: &StreamSource,
+        cancel: &AtomicBool,
+        expected: &OriginalVersion,
+    ) -> Result<OriginalVersion> {
+        self.original_version_checked(library_id, id, source, cancel, Some(expected))
+    }
+
+    fn original_version_checked(
+        &self,
+        library_id: &str,
+        id: i64,
+        source: &StreamSource,
+        cancel: &AtomicBool,
+        expected: Option<&OriginalVersion>,
+    ) -> Result<OriginalVersion> {
+        let cached = self.newest_complete(&self.library_dir(library_id), id);
+        let source = if cached.is_some() {
+            source
+                .clone()
+                .with_first_byte_timeout(source.first_byte_timeout.min(CACHED_REVALIDATE_TIMEOUT))
+        } else {
+            source.clone()
+        };
+        match probe_download_with(&source, cancel, &mut |_| {}) {
+            Ok(probe) => Ok(OriginalVersion {
+                etag: strong_etag(probe.etag)?,
+                length: probe.length.ok_or_else(|| {
+                    RemoteError::Protocol("Original source has no complete byte length".into())
+                })?,
+                offline: false,
+            }),
+            Err(error)
+                if error.is_offline()
+                    || matches!(
+                        error,
+                        RemoteError::RootOffline { .. }
+                            | RemoteError::Starting { .. }
+                            | RemoteError::Busy { .. }
+                    ) =>
+            {
+                let library = self.library_dir(library_id);
+                let path = match expected {
+                    Some(expected) => self.exact_complete(&library, id, expected),
+                    None => self.newest_complete(&library, id),
+                }
+                .ok_or(error)?;
+                let length = std::fs::metadata(&path)?.len();
+                Ok(OriginalVersion {
+                    etag: strong_etag(self.read_source_version(&path, length))?,
+                    length,
+                    offline: true,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Make every item available as a complete local file (in order) and return the
     /// paths, then evict least-recently-used downloads above the cap (never these).
     pub fn ensure_all(
@@ -419,6 +576,18 @@ impl DownloadCache {
         report: &mut dyn FnMut(Event),
         cancel: &AtomicBool,
     ) -> Result<PathBuf> {
+        self.ensure_versioned(library_id, item, playback, report, cancel)
+            .map(|original| original.path)
+    }
+
+    fn ensure_versioned(
+        &self,
+        library_id: &str,
+        item: &DownloadItem,
+        playback: Option<&MemoryCache>,
+        report: &mut dyn FnMut(Event),
+        cancel: &AtomicBool,
+    ) -> Result<EnsuredOriginal> {
         match self.ensure_once(library_id, item, playback, report, cancel) {
             Err(RemoteError::Changed(detail)) => {
                 tracing::info!(%detail, "download changed on the server; retrying");
@@ -435,7 +604,7 @@ impl DownloadCache {
         playback: Option<&MemoryCache>,
         report: &mut dyn FnMut(Event),
         cancel: &AtomicBool,
-    ) -> Result<PathBuf> {
+    ) -> Result<EnsuredOriginal> {
         let library = self.library_dir(library_id);
         let file = &item.file;
         // With a complete earlier download at hand, revalidate briefly and fall back to it
@@ -464,7 +633,15 @@ impl DownloadCache {
                             | RemoteError::Busy { .. }
                     ) =>
             {
-                return self.newest_entry(&library, file.id).ok_or(error);
+                let path = self.newest_entry(&library, file.id).ok_or(error)?;
+                let length = std::fs::metadata(&path)?.len();
+                let etag = self.read_source_version(&path, length);
+                return Ok(EnsuredOriginal {
+                    path,
+                    etag,
+                    length,
+                    offline: true,
+                });
             }
             Err(error) => return Err(error),
         };
@@ -475,7 +652,7 @@ impl DownloadCache {
                 file.file_path
             )
         });
-        let fallback = format!("audio-{}.wav", file.id);
+        let fallback = fallback_audio_filename(file);
         let name = sanitize_filename(
             probe.filename.as_deref().unwrap_or(&file.filename),
             &fallback,
@@ -489,7 +666,7 @@ impl DownloadCache {
             touch(&target);
             self.remove_other_versions(&library, file.id, &entry);
             report(Event::Bytes(metadata.len(), Some(metadata.len())));
-            return Ok(target);
+            return self.completed_original(target, &probe);
         }
         std::fs::create_dir_all(&entry)?;
         let marker = library.join(MARKER_FILE);
@@ -504,7 +681,7 @@ impl DownloadCache {
             self.remove_other_versions(&library, file.id, &entry);
             let length = std::fs::metadata(&target)?.len();
             report(Event::Bytes(length, Some(length)));
-            return Ok(target);
+            return self.completed_original(target, &probe);
         }
         if let Err(error) = download(&item.source, &partial, &probe, report, cancel) {
             if matches!(error, RemoteError::Changed(_)) {
@@ -514,13 +691,288 @@ impl DownloadCache {
         }
         std::fs::rename(&partial, &target)?;
         self.remove_other_versions(&library, file.id, &entry);
-        Ok(target)
+        self.completed_original(target, &probe)
+    }
+
+    fn source_version_path(&self, path: &Path) -> Option<PathBuf> {
+        let entry = path.parent()?;
+        let library = entry.parent()?;
+        let name = entry.file_name()?.to_str()?;
+        if !library.starts_with(&self.root) || !is_entry_name(name) {
+            return None;
+        }
+        let directory = library.join(SOURCE_VERSION_DIRECTORY);
+        if let Ok(metadata) = std::fs::symlink_metadata(&directory)
+            && (!metadata.is_dir() || metadata.file_type().is_symlink())
+        {
+            return None;
+        }
+        Some(directory.join(format!("{name}.json")))
+    }
+
+    fn read_source_version(&self, path: &Path, length: u64) -> Option<String> {
+        let receipt = std::fs::File::open(self.source_version_path(path)?).ok()?;
+        if receipt.metadata().ok()?.len() > 8192 {
+            return None;
+        }
+        let version: SourceVersion = serde_json::from_reader(receipt.take(8192)).ok()?;
+        if version.version != 1
+            || version.length != length
+            || path.file_name()?.to_str()? != version.filename
+        {
+            return None;
+        }
+        version.etag
+    }
+
+    fn completed_original(&self, path: PathBuf, probe: &DownloadProbe) -> Result<EnsuredOriginal> {
+        let length = std::fs::metadata(&path)?.len();
+        // Receipts live outside the audio entry: newest_complete must never see
+        // them as playable originals, and old download-cache layouts remain valid.
+        if let Some(receipt) = self.source_version_path(&path) {
+            let saved = (|| -> std::io::Result<()> {
+                let directory = receipt
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("Missing source receipt directory"))?;
+                std::fs::create_dir_all(directory)?;
+                let file = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&receipt)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                let version = SourceVersion {
+                    version: 1,
+                    filename: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    etag: probe.etag.clone(),
+                    length,
+                };
+                serde_json::to_writer(file, &version).map_err(std::io::Error::other)
+            })();
+            // The receipt enriches future offline use; inability to add one must
+            // not invalidate an existing complete download used by older callers.
+            if let Err(error) = saved {
+                tracing::debug!(%error, "Could not save original source version receipt");
+            }
+        }
+        Ok(EnsuredOriginal {
+            path,
+            etag: probe.etag.clone(),
+            length,
+            offline: false,
+        })
+    }
+
+    fn remove_source_version(&self, entry: &Path) {
+        if let Some(receipt) = self.source_version_path(&entry.join("audio")) {
+            let _ = std::fs::remove_file(receipt);
+        }
+    }
+
+    /// Prepare a real original in a new path inside an existing caller-owned staging
+    /// directory. A hard link pins immutable cached bytes where supported; otherwise
+    /// a bounded copy reads an already opened source handle. Concurrent LRU deletion
+    /// can cause one retry before opening, but can never substitute another version.
+    /// The destination is never overwritten, and incomplete copies are removed.
+    pub fn prepare_owned_original(
+        &self,
+        library_id: &str,
+        item: &DownloadItem,
+        playback: Option<&MemoryCache>,
+        destination: &Path,
+        progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &AtomicBool,
+    ) -> Result<OwnedOriginal> {
+        self.prepare_owned_original_checked(
+            library_id,
+            item,
+            playback,
+            (destination, None),
+            progress,
+            cancel,
+        )
+    }
+
+    /// Pin exactly the displayed source version. Online replacements are rejected;
+    /// offline lookup can reuse any complete cache entry with the exact receipt.
+    pub fn prepare_owned_original_version(
+        &self,
+        library_id: &str,
+        item: &DownloadItem,
+        playback: Option<&MemoryCache>,
+        (destination, expected): (&Path, &OriginalVersion),
+        progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &AtomicBool,
+    ) -> Result<OwnedOriginal> {
+        self.prepare_owned_original_checked(
+            library_id,
+            item,
+            playback,
+            (destination, Some(expected)),
+            progress,
+            cancel,
+        )
+    }
+
+    fn prepare_owned_original_checked(
+        &self,
+        library_id: &str,
+        item: &DownloadItem,
+        playback: Option<&MemoryCache>,
+        (destination, expected): (&Path, Option<&OriginalVersion>),
+        progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &AtomicBool,
+    ) -> Result<OwnedOriginal> {
+        if let Some(expected) = expected {
+            let current = self.original_version_expected(
+                library_id,
+                item.file.id,
+                &item.source,
+                cancel,
+                expected,
+            )?;
+            if current.etag != expected.etag || current.length != expected.length {
+                return Err(RemoteError::Changed(
+                    "Original differs from the displayed Waveform version".into(),
+                ));
+            }
+        }
+        for attempt in 0..2 {
+            if cancel.load(Ordering::Acquire) {
+                return Err(RemoteError::Cancelled);
+            }
+            let mut original = self.ensure_versioned(
+                library_id,
+                item,
+                playback,
+                &mut |event| {
+                    let (received, total, waiting) = match event {
+                        Event::Bytes(received, total) => (received, total, None),
+                        Event::Waiting(waited) => (0, None, Some(waited)),
+                    };
+                    progress(DownloadProgress {
+                        index: 0,
+                        count: 1,
+                        received,
+                        total,
+                        waiting,
+                    });
+                },
+                cancel,
+            )?;
+            if let Some(expected) = expected {
+                if original.offline
+                    && let Some(path) =
+                        self.exact_complete(&self.library_dir(library_id), item.file.id, expected)
+                {
+                    original = EnsuredOriginal {
+                        path,
+                        etag: Some(expected.etag.clone()),
+                        length: expected.length,
+                        offline: true,
+                    };
+                }
+                if original.etag.as_deref() != Some(expected.etag.as_str())
+                    || original.length != expected.length
+                {
+                    return Err(RemoteError::Changed(
+                        "Original differs from the displayed Waveform version".into(),
+                    ));
+                }
+            }
+            let mut input = match open_pinned(&original.path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempt == 0 => {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let before = input.metadata()?;
+            if !before.is_file() || before.len() != original.length {
+                return Err(RemoteError::Changed(
+                    "Cached original changed before staging".into(),
+                ));
+            }
+            let staged = stage_original(
+                &mut input,
+                &original.path,
+                destination,
+                original.length,
+                cancel,
+            )?;
+            let after = input.metadata()?;
+            if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+                drop(staged);
+                let _ = std::fs::remove_file(destination);
+                return Err(RemoteError::Changed(
+                    "Cached original changed during staging".into(),
+                ));
+            }
+            return Ok(OwnedOriginal {
+                path: destination.to_owned(),
+                etag: original.etag,
+                length: original.length,
+                offline: original.offline,
+                _guard: staged,
+            });
+        }
+        Err(RemoteError::Changed(
+            "Original cache was evicted while staging".into(),
+        ))
     }
 
     /// The newest complete download of `id` (offline use), marked as recently used.
     fn newest_entry(&self, library: &Path, id: i64) -> Option<PathBuf> {
         self.newest_complete(library, id)
             .inspect(|path| touch(path))
+    }
+
+    fn exact_complete(
+        &self,
+        library: &Path,
+        id: i64,
+        expected: &OriginalVersion,
+    ) -> Option<PathBuf> {
+        let prefix = format!("{id}-");
+        for entry in std::fs::read_dir(library).ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || !is_entry_name(&name) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == expected.length
+                    && self.read_source_version(&path, expected.length).as_deref()
+                        == Some(expected.etag.as_str())
+                {
+                    return Some(path);
+                }
+            }
+        }
+        None
     }
 
     /// The newest complete download of `id` in any version folder.
@@ -558,8 +1010,12 @@ impl DownloadCache {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if name.starts_with(&prefix) && is_entry_name(&name) && path != keep {
-                remove_entry(&self.root, &path);
+            if name.starts_with(&prefix)
+                && is_entry_name(&name)
+                && path != keep
+                && remove_entry(&self.root, &path)
+            {
+                self.remove_source_version(&path);
             }
         }
     }
@@ -638,9 +1094,99 @@ impl DownloadCache {
             }
             if remove_entry(&self.root, &path) {
                 total = total.saturating_sub(size);
+                self.remove_source_version(&path);
             }
         }
     }
+}
+
+fn open_pinned(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Keep cached/staged bytes stable while still allowing playback readers.
+        options.share_mode(1);
+    }
+    options.open(path)
+}
+
+fn same_open_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    let same = left.is_file()
+        && right.is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same && left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        same
+    }
+}
+
+fn stage_original(
+    input: &mut std::fs::File,
+    source: &Path,
+    destination: &Path,
+    length: u64,
+    cancel: &AtomicBool,
+) -> Result<std::fs::File> {
+    // On Windows a conflicting writer/deleter is prevented by open_pinned.
+    // Unix permits removing a cache path while a handle is held: compare the
+    // hard-linked inode to that handle and fall back to copying the handle.
+    let mut owns_destination = false;
+    let result = (|| -> Result<std::fs::File> {
+        match std::fs::hard_link(source, destination) {
+            Ok(()) => {
+                owns_destination = true;
+                let staged = open_pinned(destination)?;
+                if same_open_file(&input.metadata()?, &staged.metadata()?) {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(RemoteError::Cancelled);
+                    }
+                    return Ok(staged);
+                }
+                drop(staged);
+                std::fs::remove_file(destination)?;
+                owns_destination = false;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(error.into());
+            }
+            Err(_) => {}
+        }
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        owns_destination = true;
+        input.seek(SeekFrom::Start(0))?;
+        let mut copied = 0_u64;
+        let mut bytes = [0; 256 * 1024];
+        while copied < length {
+            if cancel.load(Ordering::Acquire) {
+                return Err(RemoteError::Cancelled);
+            }
+            let count = (length - copied).min(bytes.len() as u64) as usize;
+            input.read_exact(&mut bytes[..count])?;
+            output.write_all(&bytes[..count])?;
+            copied += count as u64;
+        }
+        output.sync_all()?;
+        drop(output);
+        if cancel.load(Ordering::Acquire) {
+            return Err(RemoteError::Cancelled);
+        }
+        Ok(open_pinned(destination)?)
+    })();
+    if result.is_err() && owns_destination {
+        let _ = std::fs::remove_file(destination);
+    }
+    result
 }
 
 /// `<id>-<16 hex>` version folder names.
@@ -999,13 +1545,31 @@ mod tests {
     }
 
     fn record() -> AudioFile {
-        AudioFile {
+        AudioFile::from(audiolib_core::AudioFileData {
             id: 7,
             file_path: "/Volumes/SFX/thunder.wav".into(),
             filename: "雷声 近.wav".into(),
             file_size: 300_000,
-            ..AudioFile::default()
+            ..audiolib_core::AudioFileData::default()
+        })
+    }
+
+    #[test]
+    fn empty_download_names_retain_the_supported_original_type() {
+        for extension in ["MP3", "aif", "aiff", "bwf", "flac", "ogg"] {
+            let mut file = record();
+            file.filename.clear();
+            file.file_path = format!("/sounds/source.{extension}");
+            let name = sanitize_filename("", &fallback_audio_filename(&file));
+            assert_eq!(
+                Path::new(&name).extension().unwrap().to_str().unwrap(),
+                extension.to_ascii_lowercase()
+            );
         }
+        let mut unknown = record();
+        unknown.filename.clear();
+        unknown.file_path = "/sounds/unknown.exe".into();
+        assert!(fallback_audio_filename(&unknown).ends_with(".audio"));
     }
 
     fn item(server: &TestServer) -> DownloadItem {
@@ -1234,6 +1798,215 @@ mod tests {
             ),
             Err(RemoteError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn owned_original_retains_exact_version_across_eviction_and_offline_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture("\"owned-v1\"", 6);
+        let server = server(state.clone());
+        let cache = DownloadCache::new(directory.path().join("cache"), 0);
+        let stage = tempfile::tempdir_in(directory.path()).unwrap();
+        let first_path = stage.path().join("original.wav");
+        let first = cache
+            .prepare_owned_original(
+                "lib-1",
+                &item(&server),
+                None,
+                &first_path,
+                &mut |_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(first.path, first_path);
+        assert_eq!(first.etag.as_deref(), Some("\"owned-v1\""));
+        assert_eq!(first.length, 300_000);
+        assert!(!first.offline);
+        let cached = cache
+            .newest_complete(&cache.library_dir("lib-1"), 7)
+            .unwrap();
+        // The version receipt is outside each audio entry and cannot win the
+        // newest-original selection even if its mtime is newer than the WAV.
+        assert_eq!(cached.file_name().unwrap(), "雷声 近.wav");
+        state.lock().unwrap().root_offline = true;
+        let second_path = stage.path().join("offline.wav");
+        let second = cache
+            .prepare_owned_original(
+                "lib-1",
+                &item(&server),
+                None,
+                &second_path,
+                &mut |_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(second.offline);
+        assert_eq!(second.etag, first.etag);
+        cache.evict(&[]);
+        assert_eq!(std::fs::read(&first.path).unwrap(), vec![6; 300_000]);
+        assert_eq!(std::fs::read(&second.path).unwrap(), vec![6; 300_000]);
+        assert_eq!(state.lock().unwrap().gets.len(), 1);
+    }
+
+    #[test]
+    fn staging_does_not_replace_files_or_publish_cancelled_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture("\"owned-v1\"", 4);
+        let server = server(state);
+        let cache = DownloadCache::new(directory.path().join("cache"), u64::MAX);
+        let target = directory.path().join("keep.wav");
+        std::fs::write(&target, b"keep").unwrap();
+        assert!(
+            cache
+                .prepare_owned_original(
+                    "lib-1",
+                    &item(&server),
+                    None,
+                    &target,
+                    &mut |_| {},
+                    &AtomicBool::new(false),
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        let cancelled = directory.path().join("cancelled.wav");
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            cache.prepare_owned_original(
+                "lib-1",
+                &item(&server),
+                None,
+                &cancelled,
+                &mut |progress| {
+                    if progress.total == Some(progress.received) {
+                        cancel.store(true, Ordering::Release);
+                    }
+                },
+                &cancel,
+            ),
+            Err(RemoteError::Cancelled)
+        ));
+        assert!(!cancelled.exists());
+    }
+
+    #[test]
+    fn an_offline_legacy_cache_reports_unknown_etag_without_inventing_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture("\"legacy\"", 5);
+        let server = server(state.clone());
+        let cache = DownloadCache::new(directory.path().join("cache"), u64::MAX);
+        let cached = cache
+            .ensure(
+                "lib-1",
+                &item(&server),
+                None,
+                &mut |_, _| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        std::fs::remove_file(cache.source_version_path(&cached).unwrap()).unwrap();
+        state.lock().unwrap().root_offline = true;
+        let owned = cache
+            .prepare_owned_original(
+                "lib-1",
+                &item(&server),
+                None,
+                &directory.path().join("legacy.wav"),
+                &mut |_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(owned.offline);
+        assert_eq!(owned.etag, None);
+        assert_eq!(std::fs::read(&owned.path).unwrap(), vec![5; 300_000]);
+    }
+
+    #[test]
+    fn exact_offline_version_can_use_an_older_verified_original_and_reject_unknown_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture("\"v2\"", 2);
+        let server = server(state.clone());
+        let cache = DownloadCache::new(directory.path().join("cache"), u64::MAX);
+        let library = cache.library_dir("lib-1");
+        let first = library
+            .join(format!("7-{}", etag_token("\"v1\"")))
+            .join("original.wav");
+        let second = library
+            .join(format!("7-{}", etag_token("\"v2\"")))
+            .join("original.wav");
+        for (path, etag, fill) in [(&first, "\"v1\"", 1), (&second, "\"v2\"", 2)] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![fill; 300_000]).unwrap();
+            cache
+                .completed_original(
+                    path.clone(),
+                    &DownloadProbe {
+                        etag: Some(etag.into()),
+                        length: Some(300_000),
+                        filename: Some("original.wav".into()),
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&second)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(cache.newest_complete(&library, 7).unwrap(), second);
+        state.lock().unwrap().root_offline = true;
+        let expected = OriginalVersion {
+            etag: "\"v1\"".into(),
+            length: 300_000,
+            offline: false,
+        };
+        assert_eq!(
+            cache
+                .original_version_expected(
+                    "lib-1",
+                    7,
+                    &item(&server).source,
+                    &AtomicBool::new(false),
+                    &expected
+                )
+                .unwrap()
+                .etag,
+            expected.etag
+        );
+        let path = directory.path().join("exact-v1.wav");
+        let original = cache
+            .prepare_owned_original_version(
+                "lib-1",
+                &item(&server),
+                None,
+                (&path, &expected),
+                &mut |_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(original.offline);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1; 300_000]);
+        std::fs::remove_file(cache.source_version_path(&first).unwrap()).unwrap();
+        assert!(
+            cache
+                .original_version_expected(
+                    "lib-1",
+                    7,
+                    &item(&server).source,
+                    &AtomicBool::new(false),
+                    &expected
+                )
+                .is_err(),
+            "A legacy filename token cannot stand in for the missing v1 receipt"
+        );
+    }
+
+    #[test]
+    fn weak_or_missing_source_etags_are_never_export_identities() {
+        assert!(strong_etag(None).is_err());
+        assert!(strong_etag(Some("W/\"source\"".into())).is_err());
+        assert!(strong_etag(Some("\"source\"".into())).is_ok());
     }
 
     #[test]

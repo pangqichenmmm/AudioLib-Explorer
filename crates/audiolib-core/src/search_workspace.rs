@@ -1,6 +1,6 @@
 // crates/audiolib-core/src/search_workspace.rs
 //! Owned client-local search tasks and explicitly saved search definitions.
-use crate::{Error, Result, SearchFilters, SearchRequest, SortOrder};
+use crate::{Error, Result, SearchFilters, SearchRequest, SearchScope, SortOrder};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -68,6 +68,9 @@ pub struct AlbumFilterBinding {
 #[serde(default)]
 pub struct SearchTaskDefinition {
     pub query: String,
+    /// Saved match scope. Older workspaces preserve their legacy main-field search.
+    #[serde(default, skip_serializing_if = "crate::scope_is_main")]
+    pub scope: SearchScope,
     pub folder: Option<SearchFolderRef>,
     pub include_subfolders: bool,
     pub filters: SearchFilters,
@@ -81,6 +84,7 @@ impl Default for SearchTaskDefinition {
     fn default() -> Self {
         Self {
             query: String::new(),
+            scope: SearchScope::Main,
             folder: None,
             include_subfolders: true,
             filters: SearchFilters::default(),
@@ -105,6 +109,9 @@ impl SearchTaskDefinition {
             offset,
             order_by: self.order_by,
             descending: self.descending,
+            scope: self.scope,
+            cursor: None,
+            page: None,
         }
     }
 
@@ -366,6 +373,36 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_scopes_round_trip_and_legacy_definitions_keep_main_fields() {
+        let legacy: SearchTaskDefinition = serde_json::from_str(r#"{"query":"wind"}"#).unwrap();
+        assert_eq!(legacy.scope, SearchScope::Main);
+        assert_eq!(legacy.to_request(200, 400).scope, SearchScope::Main);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("scope")
+                .is_none()
+        );
+        for scope in [
+            SearchScope::Main,
+            SearchScope::All,
+            SearchScope::Path,
+            SearchScope::Filename,
+        ] {
+            let definition = SearchTaskDefinition {
+                scope,
+                query: "wind".into(),
+                ..Default::default()
+            };
+            let restored: SearchTaskDefinition =
+                serde_json::from_slice(&serde_json::to_vec(&definition).unwrap()).unwrap();
+            assert_eq!(restored, definition);
+            assert_eq!(restored.to_request(200, 400).scope, scope);
+            restored.validate().unwrap();
+        }
+    }
 
     #[test]
     fn title_provenance_defaults_for_legacy_json_and_round_trips_explicit_names() {

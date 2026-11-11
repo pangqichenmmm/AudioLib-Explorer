@@ -11,7 +11,17 @@ $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $root = Join-Path $taskRoot ('.rust-validation/server-docker-boundaries/' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $root -Force
 $Tag = 'v0.8.4'; $fullVersion = '0.8.4'; $passed = 0
-$publicFiles = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server-files.json') -Raw | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
+. (Join-Path $PSScriptRoot 'server-package-layout.ps1')
+$publicFiles = @(Get-ServerPublicDocuments)
+$target = 'x86_64-unknown-linux-gnu'
+$fixtureSource = Join-Path $root 'license-source'
+$null = New-Item -ItemType Directory -Path $fixtureSource
+[IO.File]::WriteAllText((Join-Path $fixtureSource 'LICENSE'),'synthetic public license')
+$fixturePackages = @('audiolib-server','audiolib-db','fixture') | ForEach-Object {
+    [pscustomobject]@{ name=$_; version='1.0.0'; license='GPL-3.0-only'; repository=$null; source=$null; license_file=$null; manifest_path=(Join-Path $fixtureSource ($_.ToString()+'.toml')) }
+}
+$fixtureGraph = @{roots=@('audiolib-server','audiolib-db');target=$target;features=@();no_default_features=$true;packages=@($fixturePackages)}
 function Import-TestFunctions([string]$File, [string[]]$Names) {
     # Import function ASTs without executing the tool's packaging/runtime entry point.
     $tokens = $null; $errors = $null
@@ -30,8 +40,9 @@ function Write-Tar([string]$Path, [Collections.IDictionary]$Files, [string]$Extr
     try {
         foreach ($pair in $Files.GetEnumerator()) {
             $entry = [Formats.Tar.PaxTarEntry]::new([Formats.Tar.TarEntryType]::RegularFile,$pair.Key)
-            $entry.Mode = [IO.UnixFileMode]$(if ($pair.Key -in @('audiolib-server','server/deploy/redeploy-server.sh')) { 493 } else { 420 })
+            $entry.Mode = [IO.UnixFileMode]$(if ($pair.Key -in @('audiolib-server','audiolib-migrate','server/deploy/redeploy-server.sh')) { 493 } else { 420 })
             if ($Extra -ceq 'bad-mode' -and $pair.Key -ceq 'audiolib-server') { $entry.Mode = [IO.UnixFileMode]420 }
+            if ($Extra -ceq 'migrator-mode' -and $pair.Key -ceq 'audiolib-migrate') { $entry.Mode = [IO.UnixFileMode]420 }
             $entryBytes = if ($pair.Value -is [array]) { [byte[]]$pair.Value } else { [Text.Encoding]::UTF8.GetBytes($pair.Value) }
             $memory = [IO.MemoryStream]::new([byte[]]$entryBytes)
             $entry.DataStream = $memory; $writer.WriteEntry($entry); $memory.Dispose()
@@ -59,15 +70,18 @@ function Write-Tar([string]$Path, [Collections.IDictionary]$Files, [string]$Extr
     } finally { $writer.Dispose(); $destination.Dispose(); $file.Dispose() }
 }
 Import-TestFunctions (Join-Path $PSScriptRoot 'package-server-docker.ps1') @('Assert-Unlinked','Read-Json','Get-Hash','Assert-Relative','Expand-PublicPayload')
-foreach ($case in @('valid','private-file','traversal','windows-traversal','case-collision','unknown-license','private-license','wrong-marker','bad-mode','symlink','hardlink','empty-private-dir','binary-hash')) {
+foreach ($case in @('valid','private-file','traversal','windows-traversal','case-collision','unknown-license','private-license','wrong-marker','bad-mode','symlink','hardlink','empty-private-dir','binary-hash','migrator-hash','missing-migrator','migrator-mode','notice-hash')) {
     $caseRoot = Join-Path $root ('native-' + $case)
     $null = New-Item -ItemType Directory -Path $caseRoot
     $payload = Join-Path $caseRoot 'payload'; $ServerArchive = Join-Path $caseRoot 'native.tar.gz'
     $files = [ordered]@{}
     foreach ($name in $publicFiles) { $files[$name] = 'public fixture' }
-    $files['audiolib-server'] = 'synthetic binary'; $files['update-version.txt'] = $fullVersion; $files['update-channel.txt'] = 'stable'
-    $files['licenses/dependencies.json'] = '[{"name":"fixture","version":"1.0.0","license":"MIT","repository":null}]'
-    $files['licenses/fixture-1.0.0/LICENSE'] = 'public MIT text'
+    $files['audiolib-server'] = 'synthetic binary'; $files['audiolib-migrate'] = 'synthetic migrator'; $files['update-version.txt'] = $fullVersion; $files['update-channel.txt'] = 'stable'
+    $licensePayload = Join-Path $caseRoot 'license-payload'
+    $null = New-Item -ItemType Directory -Path $licensePayload
+    foreach($binary in @('audiolib-server','audiolib-migrate')) { [IO.File]::WriteAllText((Join-Path $licensePayload $binary),$files[$binary]) }
+    $null = Write-AudioLibLicenseBundle -Graph $fixtureGraph -Root $fixtureSource -PayloadRoot $licensePayload -Artifacts @{'audiolib-server'=(Join-Path $licensePayload 'audiolib-server');'audiolib-migrate'=(Join-Path $licensePayload 'audiolib-migrate')}
+    foreach($file in (Get-ChildItem -LiteralPath (Join-Path $licensePayload 'licenses') -Recurse -File)) { $files[[IO.Path]::GetRelativePath($licensePayload,$file.FullName).Replace('\','/')] = [IO.File]::ReadAllBytes($file.FullName) }
     switch ($case) {
         'unknown-license' { $files['licenses/unknown-1.0.0/LICENSE'] = 'unknown' }
         'private-license' { $files['licenses/fixture-1.0.0/local.db'] = 'private' }
@@ -75,10 +89,13 @@ foreach ($case in @('valid','private-file','traversal','windows-traversal','case
         'traversal' { $files['../escape'] = 'escape' }
         'windows-traversal' { $files['licenses/fixture-1.0.0/.. /.. /escape'] = 'escape' }
         'wrong-marker' { $files['update-version.txt'] = '0.8.3' }
+        'missing-migrator' { $files.Remove('audiolib-migrate') }
+        'notice-hash' { $files['licenses/fixture-1.0.0/LICENSE'] = 'tampered license' }
     }
     Write-Tar $ServerArchive $files $case
-    $report = @{ binary_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('synthetic binary'))) }
+    $report = @{ binary_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('synthetic binary'))); migrator_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('synthetic migrator'))) }
     if ($case -ceq 'binary-hash') { $report.binary_sha256 = '0' * 64 }
+    if ($case -ceq 'migrator-hash') { $report.migrator_sha256 = '0' * 64 }
     $caught = $null
     try { Expand-PublicPayload } catch { $caught = $_.Exception.Message }
     $expectedFailure = switch ($case) {
@@ -86,8 +103,10 @@ foreach ($case in @('valid','private-file','traversal','windows-traversal','case
         { $_ -in @('traversal','windows-traversal') } { 'Unsafe archive path' }
         'case-collision' { 'case-colliding' }
         { $_ -in @('unknown-license','private-license') } { 'Unexpected/private file' }
-        { $_ -in @('wrong-marker','binary-hash') } { 'identity mismatch' }
-        'bad-mode' { 'file mode mismatch' }
+        { $_ -in @('wrong-marker','binary-hash','migrator-hash') } { 'identity mismatch' }
+        { $_ -in @('bad-mode','migrator-mode') } { 'file mode mismatch' }
+        'missing-migrator' { 'Required public package file is missing' }
+        'notice-hash' { 'License notice identity mismatch' }
         { $_ -in @('symlink','hardlink') } { 'Links and special' }
         'empty-private-dir' { 'empty/non-public' }
         default { '' }
@@ -169,7 +188,8 @@ $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
 $commit = 'a' * 40
 foreach ($case in @('checksum','unaccepted','target','commit','runtime-proof')) {
     $proof = [ordered]@{ success=$true;tag=$Tag;version='0.8.4';commit=$commit;target='x86_64-unknown-linux-gnu';archive_sha256=$hash;binary_sha256=('b'*64); checks=@{version=$true;allowlist=$true;unlinked_paths=$true;privacy=$true;archive_contents=$true;executable_mode=$true} }
-    $runtime = [ordered]@{ success=$true;tag=$Tag;version='0.8.4';commit=$commit;target='x86_64-unknown-linux-gnu';archive_sha256=$hash;binary_sha256=('b'*64);checks=@('synthetic native validation') }
+    $runtime = [ordered]@{ success=$true;tag=$Tag;version='0.8.4';commit=$commit;target='x86_64-unknown-linux-gnu';archive_sha256=$hash;binary_sha256=('b'*64);checks=@('owned migrator status/start/status/rollback/status 8/9/8') }
+    foreach($item in @($proof,$runtime)) { $item.migrator_sha256='d'*64; foreach($pair in @{layout_revision=2;automatic_upgrade_compatible=$false;manual_bootstrap_required=$true;minimum_updater_version='0.9.0';old_updater_policy='refused'}.GetEnumerator()){$item[$pair.Key]=$pair.Value} }
     Set-Content -LiteralPath ($archive + '.sha256') -Value ($hash + '  ' + [IO.Path]::GetFileName($archive)) -Encoding utf8NoBOM
     switch ($case) {
         'checksum' { Set-Content -LiteralPath ($archive + '.sha256') -Value (('0'*64) + '  ' + [IO.Path]::GetFileName($archive)) -Encoding utf8NoBOM }
@@ -191,6 +211,8 @@ Copy-Item -LiteralPath (Join-Path $root 'validate-server-docker.ps1-valid.tar.gz
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath ($archive + '.sha256') -Value ($hash + '  ' + [IO.Path]::GetFileName($archive)) -Encoding utf8NoBOM
 $dockerProof = @{success=$true;tag=$Tag;version='0.8.4';commit=$commit;platform='linux/amd64';image_tag=$expectedTag;image_id=$imageId;archive_sha256=$hash;runtime_validation='not-run'}
+$dockerProof.binary_sha256='b'*64; $dockerProof.migrator_sha256='d'*64
+foreach($pair in @{layout_revision=2;automatic_upgrade_compatible=$false;manual_bootstrap_required=$true;minimum_updater_version='0.9.0';old_updater_policy='refused'}.GetEnumerator()){$dockerProof[$pair.Key]=$pair.Value}
 $dockerReport=Join-Path $root 'docker-package-report.json'
 $dockerProof | ConvertTo-Json | Set-Content -LiteralPath $dockerReport -Encoding utf8NoBOM
 foreach ($case in @('extra-data','source-hash','recorded-path')) {

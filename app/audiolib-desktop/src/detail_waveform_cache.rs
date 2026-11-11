@@ -1,5 +1,5 @@
 // app/audiolib-desktop/src/detail_waveform_cache.rs
-//! 「彩色波形（本地）」 on 缓存与导出: the client's on-demand colored detail Waveform
+//! 「本机缓存」 in global settings: the client's on-demand colored detail Waveform
 //! cache, as distinct from the server's list thumbnail Waveforms.
 //!
 //! Layout under `<cache>/waveforms/` (shared parent with the list cache):

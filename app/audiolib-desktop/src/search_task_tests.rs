@@ -8,6 +8,8 @@ mod album_review;
 mod favorite_review;
 #[path = "search_task_lifecycle_review_tests.rs"]
 mod lifecycle_review;
+#[path = "search_task_scope_paging_tests.rs"]
+mod scope_paging;
 #[path = "search_task_ui_review_tests.rs"]
 mod ui_review;
 #[path = "search_task_waveform_review_tests.rs"]
@@ -147,6 +149,8 @@ fn fixture() -> Fixture {
             .compute_list_waveform(file.id, Arc::new(AtomicBool::new(false)))
             .unwrap();
     }
+    // Prepare the accepted-library state before exercising navigation controls.
+    provider.rebuild_directory_search().unwrap();
     let engine = audiolib_audio::AudioEngine::new(playback.clone()).unwrap();
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1600.0, 900.0));
@@ -1174,11 +1178,21 @@ fn child_result_window_restore() {
 
     let mut cached_task = task;
     cached_task.view.list_top_row = 20;
+    let revision = fixture.provider.search_revision().unwrap().unwrap();
     let cache = TaskCache {
         provider: Arc::downgrade(&fixture.provider),
-        revision: fixture.provider.search_revision().unwrap().unwrap(),
+        revision,
         tree: controller.tree.lock().unwrap().clone(),
         records,
+        window_coverage: Some(result_window::WindowCoverage {
+            revision: Some(revision),
+            positions: (0..600).collect(),
+            before_raw: 0,
+            after_raw: 600,
+            has_next: false,
+            first_offset: Some(0),
+            ..Default::default()
+        }),
         limit: 600,
         summary: "1–600 of 600 sounds".into(),
         page: "1–3/3".into(),
@@ -1205,6 +1219,9 @@ fn child_result_window_restore() {
     // are filtered out. Restoring or recapturing it must not shorten that span.
     let mut filtered_cache = cache;
     filtered_cache.records.truncate(180);
+    let coverage = filtered_cache.window_coverage.as_mut().unwrap();
+    coverage.positions.truncate(180);
+    coverage.has_next = true;
     filtered_cache.next = true;
     controller.apply_search_task(
         ui,

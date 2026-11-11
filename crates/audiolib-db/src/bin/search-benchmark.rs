@@ -271,7 +271,7 @@ fn first_only_report(
         "first_provider_facet_meets_target":facet_p95<500.0,
         "first_provider_sequential_meets_target":total_p95<500.0,
         "target_p95_ms":500,"cache_enabled":true,
-        "cache_kind":"bounded ranked IDs; Metadata is read from the current snapshot",
+        "cache_kind":"bounded ranked IDs and exact-snapshot first pages; cache-hit fields cover either layer",
         "reader_pool_size":4,"sqlite_cache_kb_per_reader":65536
     });
     report["parallel_ranking_auxiliary_readers_max"] = SQLITE_AUXILIARY_SEARCH_READERS.into();
@@ -868,7 +868,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     mmap_probe.pragma_update(None, "mmap_size", sqlite_reader_mmap_bytes(&path))?;
     let mmap_limit: i64 = mmap_probe.pragma_query_value(None, "mmap_size", |row| row.get(0))?;
-    let mut report = serde_json::json!({"records":records,"queries":queries,"cache_enabled":true,"cache_kind":"bounded ranked IDs; Metadata is read from the current snapshot","ranking_cache_hits":ranking_cache_hits,"edge_cases":edge_cases,"missing_records":missing_records,"folder_facets":folder_facets,
+    let mut report = serde_json::json!({"records":records,"queries":queries,"cache_enabled":true,"cache_kind":"bounded ranked IDs and exact-snapshot first pages; cache-hit fields cover either layer","ranking_cache_hits":ranking_cache_hits,"edge_cases":edge_cases,"missing_records":missing_records,"folder_facets":folder_facets,
         "database":path,"database_bytes":std::fs::metadata(&path)?.len(),"existing_database":existing,
         "reader_pool_size":4,"sqlite_cache_kb_per_reader":65536,"mmap_bytes":mmap_limit,
         "generation_ms":generation_ms,"p50_ms":percentile(&samples,0.5),

@@ -200,20 +200,41 @@ fn query_word_parts(word: &str) -> Vec<&str> {
 /// Compile plain-text AND terms with contiguous letter-fragment matching.
 /// Two or more characters use an indexed bigram phrase; single letters in a
 /// multi-term query, Han dictionary terms and numbers retain exact matching.
-pub(crate) fn compile_query(jieba: &Jieba, value: &str) -> Result<String> {
-    let terms: Vec<_> = words(jieba, value, false)
+fn term_words<'a>(jieba: &'a Jieba, value: &'a str) -> Vec<&'a str> {
+    words(jieba, value, false)
         .into_iter()
         .flat_map(query_word_parts)
         .filter(|word| word.chars().any(char::is_alphanumeric))
+        .collect()
+}
+
+/// Words of a query in the same order `compile_query` ANDs them.
+pub(crate) fn query_terms(jieba: &Jieba, value: &str) -> Vec<String> {
+    term_words(jieba, value)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Compile plain-text AND terms against one raw/derived column pair.
+/// `raw` and `derived` are fixed FTS column-filter literals, never request text.
+pub(crate) fn compile_query_columns(
+    jieba: &Jieba,
+    value: &str,
+    raw: &str,
+    derived: &str,
+) -> Result<String> {
+    let terms: Vec<_> = term_words(jieba, value)
+        .into_iter()
         .map(|word| {
             let quoted = word.replace('"', "\"\"");
             if let Some(grams) = letter_bigrams(word) {
                 // Only original columns may satisfy the raw-word alternative:
                 // a user code resembling an encoded gram must remain literal.
-                format!("({RAW_COLUMNS} : \"{quoted}\" OR {DERIVED_COLUMNS} : \"{grams}\")")
+                format!("({raw} : \"{quoted}\" OR {derived} : \"{grams}\")")
             } else if has_letters(word) {
                 format!(
-                    "({RAW_COLUMNS} : \"{quoted}\" OR {DERIVED_COLUMNS} : \"{}\")",
+                    "({raw} : \"{quoted}\" OR {derived} : \"{}\")",
                     single_letter_token(word)
                 )
             } else {
@@ -225,6 +246,10 @@ pub(crate) fn compile_query(jieba: &Jieba, value: &str) -> Result<String> {
         return Err(Error::Validation("Search requires a word or number".into()));
     }
     Ok(terms.join(" AND "))
+}
+
+pub(crate) fn compile_query(jieba: &Jieba, value: &str) -> Result<String> {
+    compile_query_columns(jieba, value, RAW_COLUMNS, DERIVED_COLUMNS)
 }
 
 #[cfg(test)]

@@ -646,6 +646,62 @@ pub(crate) fn collect(
     )
 }
 
+/// Build one complete immutable ranking on the caller's current transaction.
+/// This is suitable for a writer's uncommitted batch: no provider readers or
+/// auxiliary threads participate, and every DF/N/avgdl comes from this transaction.
+/// The caller must bind the resulting candidate to its exact epoch, publish only
+/// after commit, and drop it on abort. Capacity overflow retains normal fallback.
+pub(crate) fn collect_serial(
+    conn: &Connection,
+    query: String,
+    lengths: Option<Arc<search_bm25::Lengths>>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<Arc<Vec<i64>>>> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(Error::Cancelled);
+    }
+    if conn.is_autocommit() {
+        return Ok(None);
+    }
+    let plan = search_bm25::Prepared::empty(query);
+    let private = lengths.is_some();
+    plan.set_lengths(lengths)?;
+    // The same expression/statistics path as normal serial scoring, without a
+    // global registry/cache mutex held while SQLite enumerates phrase postings.
+    let _registration = private
+        .then(|| search_bm25::register_prepared(conn, plan.clone()))
+        .transpose()?;
+    let sql = if private {
+        "SELECT rowid,rank FROM audio_search WHERE audio_search MATCH ?1 AND rank MATCH 'audiolib_bm25()' ORDER BY rowid ASC"
+    } else {
+        "SELECT rowid,rank FROM audio_search WHERE audio_search MATCH ?1 AND rank MATCH 'bm25()' ORDER BY rowid ASC"
+    };
+    let mut statement = conn.prepare(sql).map_err(db_error)?;
+    let mut rows = statement.query([plan.query()]).map_err(db_error)?;
+    let mut ranked: RankedRows = Vec::new();
+    while let Some(row) = rows.next().map_err(db_error)? {
+        if ranked.len().is_multiple_of(BUDGET_BATCH)
+            && cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(Error::Cancelled);
+        }
+        if ranked.len() == search_cache::MAX_RANKED_IDS {
+            return Ok(None);
+        }
+        ranked.push((row.get(0).map_err(db_error)?, row.get(1).map_err(db_error)?));
+    }
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(Error::Cancelled);
+    }
+    ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(Error::Cancelled);
+    }
+    let mut ids = ranked.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    ids.shrink_to_fit();
+    Ok(Some(Arc::new(ids)))
+}
+
 fn collect_inner(
     provider: &SqliteProvider,
     tx: &Connection,
@@ -682,13 +738,7 @@ fn collect_inner(
     // Like rank_document_lengths(), reuse requires this request's stable revision;
     // the Arc remains owned by this pinned snapshot even if a later commit occurs.
     let cached_lengths = if cache_eligible {
-        provider
-            .document_lengths
-            .lock()
-            .map_err(|_| Error::Database("Document-length cache lock was poisoned".into()))?
-            .as_ref()
-            .filter(|(cached_revision, _)| *cached_revision == revision)
-            .map(|(_, lengths)| lengths.clone())
+        provider.cached_document_lengths(tx, revision)?
     } else {
         None
     };
@@ -1034,6 +1084,56 @@ mod tests {
     }
 
     #[test]
+    fn serial_candidates_use_uncommitted_writer_statistics_and_keep_abort_private() {
+        let (_directory, provider) = fixture();
+        let query = crate::compile_query(&provider.tokenizer, "metal").unwrap();
+        let mut writer = provider.writer().unwrap();
+        let tx = writer.transaction().unwrap();
+        let previous = search_bm25::load_lengths(&tx, None).unwrap().unwrap();
+        tx.execute(
+            "UPDATE audio_files SET filename='removed.wav',user_tags='' WHERE id=?1",
+            [i64::MIN],
+        )
+        .unwrap();
+        let lengths = search_bm25::apply_length_delta(&tx, &previous, &[i64::MIN], None)
+            .unwrap()
+            .unwrap();
+        let actual = collect_serial(&tx, query.clone(), Some(lengths), None)
+            .unwrap()
+            .unwrap();
+        let mut expected = native(&tx, &query);
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert_eq!(
+            actual.as_slice(),
+            expected
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+        assert_eq!(actual.len(), 511);
+        assert!(!actual.contains(&i64::MIN));
+        assert!(
+            collect_serial(&tx, "filename : \"absentserialword\"".into(), None, None)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            collect_serial(&tx, query.clone(), None, Some(&cancel)),
+            Err(Error::Cancelled)
+        ));
+        tx.rollback().unwrap();
+        assert_eq!(
+            native(&writer, &query).len(),
+            512,
+            "unpublished candidate did not commit the writer transaction"
+        );
+        assert!(!provider.parallel_rank_reserved.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn shared_global_statistics_preserve_native_scores_across_extreme_id_ranges() {
         let (_directory, provider) = fixture();
         let mut reader = provider.reader().unwrap();
@@ -1118,7 +1218,7 @@ mod tests {
         assert_eq!(cold.len(), 17);
         assert!(cold_plan.sparse_native_lengths());
         assert!(!cold_plan.has_cached_lengths());
-        assert!(provider.document_lengths.lock().unwrap().is_none());
+        assert!(provider.document_lengths.lock().unwrap().is_empty());
         assert!(!provider.parallel_rank_reserved.load(Ordering::Acquire));
         assert_native_ranking(&cold, &expected);
 
@@ -1134,13 +1234,7 @@ mod tests {
         assert!(warm_plan.has_cached_lengths());
         assert!(Arc::ptr_eq(
             &lengths,
-            &provider
-                .document_lengths
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .1
+            &provider.document_lengths.lock().unwrap().back().unwrap().1
         ));
         assert_eq!(
             cold.iter()
@@ -1188,7 +1282,7 @@ mod tests {
             assert_eq!(plan.has_complex_phrase(), complex);
             assert_eq!(plan.sparse_native_lengths(), sparse);
             assert!(plan.has_cached_lengths());
-            assert!(provider.document_lengths.lock().unwrap().is_some());
+            assert!(!provider.document_lengths.lock().unwrap().is_empty());
             assert_native_ranking(&actual, &expected);
             assert!(!provider.parallel_rank_reserved.load(Ordering::Acquire));
         }
@@ -1235,7 +1329,7 @@ mod tests {
         assert!(matches!(actual, Err(Error::Database(_))));
         assert!(plan.sparse_native_lengths());
         assert!(!plan.has_cached_lengths());
-        assert!(provider.document_lengths.lock().unwrap().is_none());
+        assert!(provider.document_lengths.lock().unwrap().is_empty());
         assert!(!provider.parallel_rank_reserved.load(Ordering::Acquire));
     }
 
@@ -1277,7 +1371,7 @@ mod tests {
             check_cancel(Some(&cancelled)),
             Err(Error::Cancelled)
         ));
-        assert!(provider.document_lengths.lock().unwrap().is_none());
+        assert!(provider.document_lengths.lock().unwrap().is_empty());
         assert_eq!(
             provider
                 .search(&SearchRequest::default())

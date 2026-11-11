@@ -173,14 +173,14 @@ fn matching_library_with_normalized_url_allows_edits_plays_and_downloads() {
                     TestResponse::json(
                         200,
                         &json!({
-                            "file": audiolib_core::AudioFile {
+                            "file": audiolib_core::AudioFile::from(audiolib_core::AudioFileData {
                                 id: 7,
                                 file_path: "/A/original.wav".into(),
                                 filename: "original.wav".into(),
                                 notes: "saved notes".into(),
                                 attributes: json!({"modified_at":"2026-10-24 12:34:56.789"}),
                                 ..Default::default()
-                            },
+                            }),
                             "revision_before": before,
                             "revision": *revision
                         })
@@ -293,7 +293,7 @@ fn remote_test_reports_incompatible_schema_and_retains_api_and_cache_evidence() 
                 "/api/v1/health" => TestResponse::json(200, r#"{"status":"ok","version":"0.4.0"}"#),
                 "/api/v1/library" => TestResponse::json(
                     200,
-                    &json!({"library_id": LIBRARY, "schema_version":audiolib_db::SCHEMA_VERSION+1,"revision":282}).to_string(),
+                    &json!({"library_id": LIBRARY, "schema_version":audiolib_db::MAX_SNAPSHOT_SCHEMA+1,"revision":282}).to_string(),
                 ),
                 "/api/v1/roots" => TestResponse::json(200, "[]"),
                 _ => TestResponse::json(500, "{}"),
@@ -308,7 +308,7 @@ fn remote_test_reports_incompatible_schema_and_retains_api_and_cache_evidence() 
     assert_eq!(reply["error_code"], "REMOTE_TEST_FAILED");
     assert_eq!(
         reply["data"]["library"]["schema_version"],
-        audiolib_db::SCHEMA_VERSION + 1
+        audiolib_db::MAX_SNAPSHOT_SCHEMA + 1
     );
     assert_eq!(reply["data"]["server_version"], "0.4.0");
     assert!(reply["data"].get("unauthorized").is_none());
@@ -324,11 +324,11 @@ fn remote_test_reports_incompatible_schema_and_retains_api_and_cache_evidence() 
         library["message"]
             .as_str()
             .unwrap()
-            .contains(&format!("schema {}", audiolib_db::SCHEMA_VERSION + 1))
+            .contains(&format!("schema {}", audiolib_db::MAX_SNAPSHOT_SCHEMA + 1))
     );
     assert!(library["message"].as_str().unwrap().contains(&format!(
         "newer than this client supports ({})",
-        audiolib_db::SCHEMA_VERSION
+        audiolib_db::MAX_SNAPSHOT_SCHEMA
     )));
     assert_eq!(cache.active().unwrap(), state);
     assert_eq!(std::fs::read(cache.database_path(&state)).unwrap(), before);

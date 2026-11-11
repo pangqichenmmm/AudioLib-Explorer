@@ -16,18 +16,45 @@ $ErrorActionPreference = 'Stop'
 $Root = [IO.Path]::GetFullPath($Root)
 $errors = [Collections.Generic.List[string]]::new()
 function Fail([string]$Message) { $script:errors.Add($Message) }
-function Read-Utf8([string]$Relative) {
+function Read-Utf8([string]$Relative, [switch]$Optional) {
     $path = Join-Path $Root $Relative
-    if (!(Test-Path -LiteralPath $path)) { Fail "Missing required file: $Relative"; return $null }
+    if (!(Test-Path -LiteralPath $path)) { if (!$Optional) { Fail "Missing required file: $Relative" }; return $null }
     [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
 }
-function Get-Schema([string]$Text, [switch]$MinOptional) {
+function Get-Schema([string]$Text, [string]$Compatibility, [switch]$LegacyBase) {
     if ($null -eq $Text) { return $null }
-    $cur = [regex]::Match($Text, '(?m)^\s*pub\s+const\s+SCHEMA_VERSION\s*:\s*i64\s*=\s*(\d+)\s*;')
-    $min = [regex]::Match($Text, '(?m)^\s*pub\s+const\s+MIN_SNAPSHOT_SCHEMA_VERSION\s*:\s*i64\s*=\s*(\d+)\s*;')
-    if (!$cur.Success -or (!$min.Success -and !$MinOptional)) { return $null }
-    $minValue = if ($min.Success) { [int]$min.Groups[1].Value } else { [int]$cur.Groups[1].Value }
-    [pscustomobject]@{ Current = [int]$cur.Groups[1].Value; Min = $minValue }
+    $cur = [regex]::Matches($Text, '(?m)^\s*pub\s+const\s+SCHEMA_VERSION\s*:\s*i64\s*=\s*(\d+)\s*;')
+    $min = [regex]::Matches($Text, '(?m)^\s*pub\s+const\s+MIN_SNAPSHOT_SCHEMA_VERSION\s*:\s*i64\s*=\s*(\d+)\s*;')
+    if ($cur.Count -ne 1 -or $min.Count -gt 1 -or ($min.Count -eq 0 -and !$LegacyBase)) { return $null }
+    $local = [int]$cur[0].Groups[1].Value
+    $facts = @{}
+    foreach ($name in 'TARGET_SCHEMA','SERVER_TARGET_SCHEMA','SNAPSHOT_SCHEMA_MAX') {
+        $matches = [regex]::Matches([string]$Compatibility, "(?m)^\s*pub\s+const\s+$name\s*:\s*u32\s*=\s*(\d+)\s*;")
+        $declared = [regex]::IsMatch([string]$Compatibility, "(?m)^\s*pub\s+const\s+$name\b")
+        if ($matches.Count -gt 1 -or ($declared -and $matches.Count -ne 1)) { return $null }
+        $facts[$name] = if ($matches.Count -eq 1) { [int]$matches[0].Groups[1].Value } else { $null }
+    }
+    $modern = $null -ne $facts.SERVER_TARGET_SCHEMA -or
+        [regex]::IsMatch([string]$Compatibility, '\bfn\s+server_schema\d+\s*\(')
+    if (!$LegacyBase -and $modern -and
+        ($null -eq $facts.TARGET_SCHEMA -or $null -eq $facts.SERVER_TARGET_SCHEMA -or $null -eq $facts.SNAPSHOT_SCHEMA_MAX)) { return $null }
+    if ($null -ne $facts.TARGET_SCHEMA -and $facts.TARGET_SCHEMA -ne $local) { return $null }
+    # Published older tags had no dedicated server target; it was their ordinary
+    # local target. Recognition bounds are deliberately not migration targets.
+    $server = if ($null -ne $facts.SERVER_TARGET_SCHEMA) { $facts.SERVER_TARGET_SCHEMA } else { $local }
+    $maximum = if ($null -ne $facts.SNAPSHOT_SCHEMA_MAX) { $facts.SNAPSHOT_SCHEMA_MAX } else { $local }
+    $minimum = if ($min.Count -eq 1) { [int]$min[0].Groups[1].Value } else { $local }
+    [pscustomobject]@{ Current=$local; Server=$server; Min=$minimum; Max=$maximum; Modern=$modern }
+}
+function Read-BaseFile([string]$Revision, [string]$Relative, [switch]$Optional) {
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& git -c "safe.directory=$Root" -C $Root show "${Revision}:$Relative" 2>$null)
+        if ($LASTEXITCODE -eq 0) { return ($lines -join "`n") }
+        if (!$Optional) { Fail "Cannot read '$Relative' from BaseTag '$Revision'." }
+        return $null
+    } finally { $ErrorActionPreference = $savedPreference }
 }
 function Get-CargoVersion([string]$Text) {
     if ($null -eq $Text) { return $null }
@@ -91,9 +118,11 @@ if ($checkTitle) {
 if ($null -ne $Prerelease -and [bool]$Prerelease -ne $expectPrerelease) { Fail "Release prerelease flag is $Prerelease but tag $Tag requires prerelease=$expectPrerelease (suffixed tags are prereleases, plain vX.Y.Z is not)." }
 
 # 3. Schema version
-$schema = Get-Schema (Read-Utf8 'crates/audiolib-db/src/schema.rs')
-if (!$schema) { Fail 'Cannot read SCHEMA_VERSION / MIN_SNAPSHOT_SCHEMA_VERSION from crates/audiolib-db/src/schema.rs.' }
-elseif ($schema.Min -gt $schema.Current) { Fail "MIN_SNAPSHOT_SCHEMA_VERSION ($($schema.Min)) is greater than SCHEMA_VERSION ($($schema.Current))." }
+$schema = Get-Schema (Read-Utf8 'crates/audiolib-db/src/schema.rs') (Read-Utf8 'crates/audiolib-core/src/compatibility.rs' -Optional)
+if (!$schema) { Fail 'Cannot read unambiguous local/server write targets and snapshot min/max from schema.rs / compatibility.rs.' }
+elseif ($schema.Min -lt 1 -or $schema.Min -gt $schema.Max -or $schema.Current -lt $schema.Min -or $schema.Current -gt $schema.Max -or $schema.Server -lt $schema.Min -or $schema.Server -gt $schema.Max) {
+    Fail "Invalid snapshot range $($schema.Min)..=$($schema.Max) for local schema $($schema.Current) / server schema $($schema.Server)."
+}
 
 # 4. API version: every /api/vN used by remote client/server code must be the same single version
 $apiVersions = @()
@@ -117,25 +146,26 @@ if (!$BaseTag -and $tagCore -ceq '0.8.1') {
     Write-Host '0.8.1 release baseline: v0.7.8 (withdrawn v0.8.0 tag remains unchanged).'
 }
 if (!$BaseTag) {
-    $candidates = @(git -C $Root tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $Tag -and $_ -match '^v\d+\.\d+\.\d+$' })
+    $candidates = @(git -c "safe.directory=$Root" -C $Root tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $Tag -and $_ -match '^v\d+\.\d+\.\d+$' })
     if ($LASTEXITCODE -ne 0) { Fail 'git tag --list failed.' }
     if ($candidates.Count -gt 0) { $BaseTag = $candidates[0] }
 }
 $schemaChanged = $null
 if (!$BaseTag) { Write-Warning 'No previous v* tag found; schema-change check skipped.' }
 else {
-    $baseSchemaText = git -C $Root show "${BaseTag}:crates/audiolib-db/src/schema.rs" 2>$null
-    $baseCargoText = git -C $Root show "${BaseTag}:Cargo.toml" 2>$null
-    if ($LASTEXITCODE -ne 0 -and !$baseSchemaText) { Fail "Cannot read BaseTag '$BaseTag' (fetch tags first: git fetch --tags)." }
+    $baseSchemaText = Read-BaseFile $BaseTag 'crates/audiolib-db/src/schema.rs'
+    $baseCargoText = Read-BaseFile $BaseTag 'Cargo.toml'
+    $baseCompatibilityText = Read-BaseFile $BaseTag 'crates/audiolib-core/src/compatibility.rs' -Optional
+    if (!$baseSchemaText -or !$baseCargoText) { Fail "Cannot read BaseTag '$BaseTag' (fetch tags first: git fetch --tags)." }
     else {
-        $baseSchema = Get-Schema ($baseSchemaText -join "`n") -MinOptional
-        $baseProgram = Get-CargoVersion ($baseCargoText -join "`n")
+        $baseSchema = Get-Schema $baseSchemaText $baseCompatibilityText -LegacyBase
+        $baseProgram = Get-CargoVersion $baseCargoText
         if (!$baseSchema -or !$baseProgram) { Fail "Cannot read schema/program version from BaseTag '$BaseTag'." }
         elseif ($schema -and $program) {
-            $schemaChanged = ($schema.Current -ne $baseSchema.Current)
+            $schemaChanged = ($schema.Current -ne $baseSchema.Current -or $schema.Server -ne $baseSchema.Server)
             if ($schemaChanged) {
                 $minorBumped = ($program.Major -gt $baseProgram.Major) -or ($program.Major -eq $baseProgram.Major -and $program.Minor -gt $baseProgram.Minor)
-                if (!$minorBumped) { Fail "SCHEMA_VERSION changed ($($baseSchema.Current) -> $($schema.Current) since $BaseTag) but program version is $($program.Text) (base $($baseProgram.Text)); bump at least MINOR." }
+                if (!$minorBumped) { Fail "Writable schema target changed (local $($baseSchema.Current) -> $($schema.Current), server $($baseSchema.Server) -> $($schema.Server) since $BaseTag) but program version is $($program.Text) (base $($baseProgram.Text)); bump at least MINOR." }
             }
             if (($program.Major -lt $baseProgram.Major) -or ($program.Major -eq $baseProgram.Major -and ($program.Minor -lt $baseProgram.Minor -or ($program.Minor -eq $baseProgram.Minor -and $program.Patch -lt $baseProgram.Patch)))) {
                 Fail "Program version $($program.Text) is lower than base tag $BaseTag ($($baseProgram.Text))."
@@ -150,12 +180,16 @@ if ($notes -and $program -and $schema -and $api) {
     $wantProgram = [regex]::Escape($program.Text)
     $wantApi = [regex]::Escape("/api/$api/")
     $wantSchema = "schema\s*v?$($schema.Current)(?!\d)"
-    $wantRange = "$($schema.Min)\s*\.\.=?\s*$($schema.Current)(?!\d)"
+    $wantRange = "(?:快照兼容|snapshot\s+compat(?:ibility)?)\s*$($schema.Min)\s*\.\.=?\s*$($schema.Max)(?!\d)"
+    $wantLocal = "(?:本地(?:可写|写)|local(?:\s+(?:write|writable))?)\s*schema\s*v?$($schema.Current)(?!\d)"
+    $wantServer = "(?:服务端(?:迁移|可写|写)|server(?:\s+(?:write|migration))?)\s*schema\s*v?$($schema.Server)(?!\d)"
+    $modernNotes = $schema.Modern -or $schema.Server -ne $schema.Current -or $schema.Max -ne $schema.Current
     $ok = $false
     foreach ($line in ($notes -split "`r?`n")) {
-        if ($line -match "(?<![\d.])$wantProgram(?![\d.])" -and $line -match $wantApi -and $line -imatch $wantSchema -and $line -match $wantRange) { $ok = $true; break }
+        $targetsMatch = if ($modernNotes) { $line -imatch $wantLocal -and $line -imatch $wantServer } else { $line -imatch $wantSchema }
+        if ($line -match "(?<![\d.])$wantProgram(?![\d.])" -and $line -match $wantApi -and $targetsMatch -and $line -imatch $wantRange) { $ok = $true; break }
     }
-    if (!$ok) { Fail "doc/Rust_Release_Notes.md has no single line naming program $($program.Text), API /api/$api/, schema $($schema.Current) and snapshot range $($schema.Min)..=$($schema.Current). Example: 'Versions: program $($program.Text) | API /api/$api/ | schema $($schema.Current) | snapshot compat $($schema.Min)..=$($schema.Current)'." }
+    if (!$ok) { Fail "doc/Rust_Release_Notes.md has no single line naming program $($program.Text), API /api/$api/, local schema $($schema.Current), server schema $($schema.Server) and snapshot range $($schema.Min)..=$($schema.Max). Example: 'Versions: program $($program.Text) | API /api/$api/ | local schema $($schema.Current) | server schema $($schema.Server) | snapshot compat $($schema.Min)..=$($schema.Max)'." }
 }
 
 if ($errors.Count -gt 0) {
@@ -163,4 +197,4 @@ if ($errors.Count -gt 0) {
     throw "Release check failed for $Tag with $($errors.Count) error(s)."
 }
 $changedText = if ($null -eq $schemaChanged) { 'n/a' } else { $schemaChanged }
-Write-Host "Release check passed: $Tag program=$($program.Text) api=$api schema=$($schema.Current) snapshot=$($schema.Min)..=$($schema.Current) base=$BaseTag schemaChanged=$changedText"
+Write-Host "Release check passed: $Tag program=$($program.Text) api=$api schema=$($schema.Current) serverSchema=$($schema.Server) snapshot=$($schema.Min)..=$($schema.Max) base=$BaseTag schemaChanged=$changedText"

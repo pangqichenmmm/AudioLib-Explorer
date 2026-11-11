@@ -1,0 +1,420 @@
+{
+  "EM-01": {
+    "bext_invalid_utf8": {
+      "probe": {
+        "attributes_sha256": "740fa930f6a47d22618ca11e6dfa813c1edd94532611433dccb309102bf70b78",
+        "bext_description": "ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "bext_len_past_eof": {
+      "probe": {
+        "ok": false
+      },
+      "scan_added": 0,
+      "scan_errors": 1
+    },
+    "bext_odd_unpadded": {
+      "probe": {
+        "ok": false
+      },
+      "scan_added": 0,
+      "scan_errors": 1
+    },
+    "bext_short": {
+      "probe": {
+        "attributes_sha256": "f1cb18de453ad398bef39026303d7825c2f17a670d45e0805c6e1ffa4f0d3ce4",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    }
+  },
+  "EM-02": {
+    "ixml_bad_encoding": {
+      "probe": {
+        "attributes_sha256": "fe30995fcd7ddb8c1b0ca761447d1de8b2d9806abe3aefb704cdb3fba0e35370",
+        "bext_description": "bextsurvives",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "ixml_binary": {
+      "probe": {
+        "attributes_sha256": "6d3d7c6b22f484e6a77af84a5e1bb2e5a26617d206a6e523dd1de536214aaa9d",
+        "bext_description": "bextsurvives",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "ixml_unterminated": {
+      "probe": {
+        "attributes_sha256": "e1c5ad6bec27bc84e52e93ff915f937d8f76235d588b327056e67ef3b3d423c4",
+        "bext_description": "bextsurvives",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "ixml_utf16_odd": {
+      "probe": {
+        "attributes_sha256": "e6b602f7b586b56a09ddd59f0fd8e75f4b8d4d9a9d2cc7671c8c3f0cf70aca55",
+        "bext_description": "bextsurvives",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    }
+  },
+  "EM-03": {
+    "comm_size_overflow": {
+      "probe": {
+        "attributes_sha256": "e5dbc570dcb5b88c5405052b8599595def472e383ab4017dee24af81c87545a6",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "comm_truncated_lang": {
+      "probe": {
+        "attributes_sha256": "580e114324779f6cb50e1b77e3ca087f91130e3faca32c2e1ccd59b32cd3a49b",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "tag_size_lies": {
+      "probe": {
+        "attributes_sha256": "aa10e5beda5ba440d0b8b4ad262b9d50c53a30651a8a8e56afd67cf259d598a2",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "txxx_bad_utf16": {
+      "probe": {
+        "attributes_sha256": "13bcdc1fbefb78971ae812c999ef2e2fd782db1d2c4e54c9c30e896a59ff6261",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "txxx_no_separator": {
+      "probe": {
+        "attributes_sha256": "269d81bccacc691a3be6b303b84ea51853e71abc4079bc9b7fe7abaccc146594",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "txxx_zero": {
+      "probe": {
+        "attributes_sha256": "86647e6a75992e315ff1c0fd9878061ea86497457a8d1bb35b65afa7e4716347",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    }
+  },
+  "EM-04": {
+    "gbk": {
+      "attributes": {
+        "bwf_coding_history": "",
+        "bwf_description": "±¬Õ¨",
+        "bwf_origination_date": "",
+        "bwf_origination_time": "",
+        "bwf_originator": "",
+        "bwf_originator_reference": "",
+        "bwf_time_reference": 0,
+        "bwf_umid": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "bwf_version": 0,
+        "container": "RIFF",
+        "format_tag": 1,
+        "wav_metadata": {
+          "chunks": [
+            {
+              "bytes": 16,
+              "id": "fmt "
+            },
+            {
+              "bytes": 128,
+              "id": "data"
+            },
+            {
+              "bytes": 602,
+              "id": "bext"
+            },
+            {
+              "bytes": 18,
+              "id": "LIST"
+            }
+          ],
+          "fields": {
+            "description": "±¬Õ¨"
+          },
+          "riff_info": {
+            "ICMT": "±¬Õ¨"
+          },
+          "version": 4
+        }
+      },
+      "bext_description": "±¬Õ¨"
+    },
+    "latin1": {
+      "attributes": {
+        "bwf_coding_history": "",
+        "bwf_description": "café",
+        "bwf_origination_date": "",
+        "bwf_origination_time": "",
+        "bwf_originator": "",
+        "bwf_originator_reference": "",
+        "bwf_time_reference": 0,
+        "bwf_umid": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "bwf_version": 0,
+        "container": "RIFF",
+        "format_tag": 1,
+        "wav_metadata": {
+          "chunks": [
+            {
+              "bytes": 16,
+              "id": "fmt "
+            },
+            {
+              "bytes": 128,
+              "id": "data"
+            },
+            {
+              "bytes": 602,
+              "id": "bext"
+            },
+            {
+              "bytes": 18,
+              "id": "LIST"
+            }
+          ],
+          "fields": {
+            "description": "café"
+          },
+          "riff_info": {
+            "ICMT": "café"
+          },
+          "version": 4
+        }
+      },
+      "bext_description": "café"
+    },
+    "shift_jis": {
+      "attributes": {
+        "bwf_coding_history": "",
+        "bwf_description": "Œø‰Ê‰¹",
+        "bwf_origination_date": "",
+        "bwf_origination_time": "",
+        "bwf_originator": "",
+        "bwf_originator_reference": "",
+        "bwf_time_reference": 0,
+        "bwf_umid": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "bwf_version": 0,
+        "container": "RIFF",
+        "format_tag": 1,
+        "wav_metadata": {
+          "chunks": [
+            {
+              "bytes": 16,
+              "id": "fmt "
+            },
+            {
+              "bytes": 128,
+              "id": "data"
+            },
+            {
+              "bytes": 602,
+              "id": "bext"
+            },
+            {
+              "bytes": 20,
+              "id": "LIST"
+            }
+          ],
+          "fields": {
+            "description": "Œø‰Ê‰¹"
+          },
+          "riff_info": {
+            "ICMT": "Œø‰Ê‰¹"
+          },
+          "version": 4
+        }
+      },
+      "bext_description": "Œø‰Ê‰¹"
+    }
+  },
+  "EM-05": {
+    "ixml_101mb": {
+      "after_chunk_extracted": true,
+      "probe": {
+        "attributes_sha256": "3f402da317f4f18d9beb4ba9ee8c8e6089d09756e9586e5faf612739e5f15d9e",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "ixml_declared_4gb": {
+      "probe": {
+        "ok": false
+      },
+      "scan_added": 0,
+      "scan_errors": 1
+    },
+    "junk_101mb": {
+      "after_chunk_extracted": true,
+      "probe": {
+        "attributes_sha256": "4c9c70291612047bcbf8efeba613ea25a8f0043c78073ccee3b9dd78a47a44cf",
+        "bext_description": "",
+        "ok": true
+      },
+      "scan_added": 1,
+      "scan_errors": 0
+    },
+    "list_declared_200mb": {
+      "probe": {
+        "ok": false
+      },
+      "scan_added": 0,
+      "scan_errors": 1
+    }
+  },
+  "EM-06": {
+    "electrovoice": {
+      "count": 41,
+      "paths_sha256": "1a7c5042bb566791652847b03db08503d96cfffb8e64689bc5d9200e9365871d"
+    },
+    "personage": {
+      "count": 148,
+      "paths_sha256": "1b3acf752fa5a5c37eb712ecb35a66397239ffb3029cce1e746f0f38e4d3b297"
+    },
+    "sortilege": {
+      "count": 120,
+      "paths_sha256": "0898a6a870ca56e427bc31c00ea14d3514bda89903d1ff9af3eb0506bdab11c4"
+    },
+    "zildjian": {
+      "count": 64,
+      "paths_sha256": "46e9682bf4a74cac582687ae61e5ec3029435e72b0c940fc97e5c814ec77277d"
+    }
+  },
+  "EM-07": {
+    "AMBUrbn": {
+      "hits": {
+        "count": 40,
+        "paths_sha256": "3d9522c99a56508ad621833f9c8d1e012421c18c5f841330cc343432a82f34bb"
+      },
+      "tokens": []
+    },
+    "DOORWood": {
+      "hits": {
+        "count": 41,
+        "paths_sha256": "4a3c51ae9cb7e176fe3c04e8942884bf88a33ec7fa60d49fac811ee857c663c5"
+      },
+      "tokens": []
+    },
+    "EXPLReal": {
+      "hits": {
+        "count": 39,
+        "paths_sha256": "4bbda91096944e8e9ebd6d6f0ac45360641d1e6b35c908336e42fd2f8616e15f"
+      },
+      "tokens": []
+    }
+  },
+  "EM-08": {
+    "notes": {
+      "count": 27,
+      "paths_sha256": "6830cccec898a2a5d224644ffb1844454afeafeee3915f2661a1e9c061f3d165"
+    },
+    "tags": {
+      "count": 35,
+      "paths_sha256": "f0e260b6fa171cf7c78bc683f8de867db65df962808bdd1a56bc2da90a78da12"
+    }
+  },
+  "EM-09": {
+    "\\u{30ab}\\u{3099}\\u{20}\\u{64}\\u{6f}\\u{6f}\\u{72}": {
+      "count": 2,
+      "filenames": [
+        "ガ_door.wav",
+        "ガ_door.wav"
+      ],
+      "query": "ガ door"
+    },
+    "\\u{30ac}\\u{20}\\u{64}\\u{6f}\\u{6f}\\u{72}": {
+      "count": 2,
+      "filenames": [
+        "ガ_door.wav",
+        "ガ_door.wav"
+      ],
+      "query": "ガ door"
+    },
+    "\\u{30ac}\\u{30e9}\\u{30b9}": {
+      "count": 1,
+      "filenames": [
+        "ガラス_ワレ.wav"
+      ],
+      "query": "ガラス"
+    },
+    "\\u{45}\\u{58}\\u{50}\\u{4c}\\u{4f}\\u{53}\\u{49}\\u{4f}\\u{4e}": {
+      "count": 1,
+      "filenames": [
+        "EXPLOSION_01.wav"
+      ],
+      "query": "EXPLOSION"
+    },
+    "\\u{53}\\u{46}\\u{58}": {
+      "count": 0,
+      "filenames": [],
+      "query": "SFX"
+    },
+    "\\u{63}\\u{61}\\u{66}\\u{65}\\u{301}": {
+      "count": 2,
+      "filenames": [
+        "café_ambience.wav",
+        "café_ambience.wav"
+      ],
+      "query": "café"
+    },
+    "\\u{63}\\u{61}\\u{66}\\u{e9}": {
+      "count": 2,
+      "filenames": [
+        "café_ambience.wav",
+        "café_ambience.wav"
+      ],
+      "query": "café"
+    },
+    "\\u{ff25}\\u{ff38}\\u{ff30}\\u{ff2c}\\u{ff2f}\\u{ff33}\\u{ff29}\\u{ff2f}\\u{ff2e}": {
+      "count": 1,
+      "filenames": [
+        "ＥＸＰＬＯＳＩＯＮ_０１.wav"
+      ],
+      "query": "ＥＸＰＬＯＳＩＯＮ"
+    },
+    "\\u{ff33}\\u{ff26}\\u{ff38}": {
+      "count": 0,
+      "filenames": [],
+      "query": "ＳＦＸ"
+    },
+    "\\u{ff76}\\u{ff9e}\\u{ff97}\\u{ff7d}": {
+      "count": 1,
+      "filenames": [
+        "ｶﾞﾗｽ_ﾜﾚ.wav"
+      ],
+      "query": "ｶﾞﾗｽ"
+    }
+  }
+}

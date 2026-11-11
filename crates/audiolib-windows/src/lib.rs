@@ -9,7 +9,9 @@ use audiolib_core::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod documents;
 mod drag;
+pub use documents::documents_directory;
 pub use drag::{DragOutcome, drag_files, primary_button_down};
 
 /// Main-thread interception of native macOS Quit through the desktop close drain.

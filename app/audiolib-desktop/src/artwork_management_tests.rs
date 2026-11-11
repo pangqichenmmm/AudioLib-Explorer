@@ -391,3 +391,37 @@ fn child_artwork_identity_and_cancellation() {
     assert!(server_a.is_file());
     finish(&fixture);
 }
+
+#[test]
+fn remote_disk_cover_is_kept_until_capabilities_are_ready() {
+    isolated("album_review::management::child_remote_disk_cover_without_capabilities");
+}
+
+#[test]
+#[ignore = "isolated remote disk cover before capabilities"]
+fn child_remote_disk_cover_without_capabilities() {
+    let fixture = fixture();
+    let file = selected_artwork_file(&fixture);
+    let controller = &fixture.controller;
+    controller.remote_mode.store(true, Ordering::Release);
+    controller.config.lock().unwrap().data_source.server_url = "http://127.0.0.1:9".into();
+    controller.remote.lock().unwrap().state = Some(audiolib_remote::CacheState {
+        library_id: "disk-cover".into(),
+        ..Default::default()
+    });
+    assert!(
+        controller.remote_artwork_context().is_none(),
+        "capabilities are not ready yet"
+    );
+    let cached_path = controller.cached_artwork_path(&file).unwrap();
+    std::fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
+    let cached = image::RgbaImage::from_pixel(2, 2, image::Rgba([4, 5, 6, 255]));
+    crate::artwork::save_thumbnail(&cached_path, &cached).unwrap();
+    let job = artwork_job(controller, &file);
+    let pixels = controller
+        .load_artwork(&job)
+        .expect("on-disk cover while remote artwork is not ready");
+    assert_eq!(pixels.get_pixel(0, 0).0, [4, 5, 6, 255]);
+    assert!(job.notice.lock().unwrap().is_none());
+    finish(&fixture);
+}

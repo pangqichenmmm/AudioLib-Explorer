@@ -426,6 +426,7 @@ fn child_table_controller_preferences() {
     let mut config = AppConfig::load_in(root.join("preferences")).unwrap();
     config.language = "cn".into();
     config.audition_play_on_single_click = true;
+    config.pregenerate_list_waveforms = false;
     config.audio_table = AudioTablePreferences {
         name_width: 280.0,
         duration_width: 70.0,
@@ -450,10 +451,12 @@ fn child_table_controller_preferences() {
             |_| {},
         )
         .unwrap();
+    // Table interactions exercise a library whose path-index upgrade is complete.
+    provider.rebuild_directory_search().unwrap();
     let engine = audiolib_audio::AudioEngine::new(playback.clone()).unwrap();
     let ui = AppWindow::new().unwrap();
-    // This fixture exercises scrolling and preferences. On-demand Waveform
-    // derivation would add unrelated provider revisions while facets settle.
+    // This fixture exercises scrolling and preferences. Disable both background
+    // and on-demand Waveform derivation to keep provider revisions stable.
     ui.set_list_waveforms_enabled(false);
     ui.window().set_size(slint::LogicalSize::new(1800.0, 900.0));
     let controller = Controller::new(&ui, provider, engine.handle(), config, playback);
@@ -515,7 +518,7 @@ fn child_table_controller_preferences() {
             let ui = weak.upgrade().unwrap();
             assert!(
                 started.elapsed() < Duration::from_secs(25),
-                "Table phase {} timed out: rows={}, request={:?}, searching={}, restoring={}, range_requests={}, publication={:?}, search_generation={}, search_queue={}, cancelled={:?}",
+                "Table phase {} timed out: rows={}, request={:?}, searching={}, restoring={}, range_requests={}, publication={:?}, search_generation={}, search_queue={}, cancelled={:?}, status={}",
                 timer_phase.get(),
                 ui.get_rows().row_count(),
                 {
@@ -542,7 +545,8 @@ fn child_table_controller_preferences() {
                 },
                 timer_controller.search_cancel.try_lock()
                     .map(|cancel| cancel.load(Ordering::Acquire))
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string()),
+                ui.get_status()
             );
             // The system-time testing loop does not render. Instantiate each new
             // result range once; traversing the full tree every tick starves posted

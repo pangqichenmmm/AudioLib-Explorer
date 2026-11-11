@@ -15,7 +15,7 @@ use std::{
 
 fn wav(path: &Path) {
     let mut bytes = b"RIFF".to_vec();
-    bytes.extend_from_slice(&40_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
     bytes.extend_from_slice(b"WAVEfmt ");
     bytes.extend_from_slice(&16_u32.to_le_bytes());
     for value in [1_u16, 1] {
@@ -28,6 +28,8 @@ fn wav(path: &Path) {
     bytes.extend_from_slice(b"data");
     bytes.extend_from_slice(&8_u32.to_le_bytes());
     bytes.extend_from_slice(&[0; 8]);
+    let riff_size = (bytes.len() - 8) as u32;
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
 }
@@ -39,7 +41,7 @@ fn state_with_files(count: usize) -> (tempfile::TempDir, ServerConfig, AppState)
         wav(&sounds.join("Group").join(format!("f_{index}.wav")));
     }
     let db = dir.path().join("library").join("library.db");
-    ScanService::new(Arc::new(SqliteProvider::open(&db).unwrap()))
+    let progress = ScanService::new(Arc::new(SqliteProvider::open(&db).unwrap()))
         .scan(
             &sounds,
             &ScanOptions::default(),
@@ -47,6 +49,11 @@ fn state_with_files(count: usize) -> (tempfile::TempDir, ServerConfig, AppState)
             |_| {},
         )
         .unwrap();
+    assert_eq!(progress.errors, 0, "fixture scan must succeed");
+    assert_eq!(
+        progress.added, count as u64,
+        "fixture files must be indexed"
+    );
     let config = ServerConfig::from_toml_str(
         &format!(
             "bind = \"127.0.0.1:0\"\nlibrary_db = 'library/library.db'\n\

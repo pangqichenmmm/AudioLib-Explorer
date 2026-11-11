@@ -1,6 +1,6 @@
-# 0.8.7 发布准备跟踪
+# 0.8.7 发布记录
 
-记录日期：2026-11-02。本文记录范围整理与后续门禁；“准备完成”不表示候选或正式产物已验收。
+记录日期：2026-11-02。[v0.8.7 正式 Release](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.8.7) 于 2026-11-02 09:54:18 UTC（北京时间 17:54:18）发布，Release ID `431279834`，为 Latest 稳定版、非 draft、非 prerelease。本文区分候选、beta、最终产物与远端发布核验的实际身份，保留失败历史及覆盖边界。
 
 ## 身份与范围
 
@@ -8,8 +8,8 @@
 |---|---|
 | 已发布基线 | [v0.8.6](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.8.6)，提交 `9b883f9c6c35886682ec3e1df1dbd40720c25339` |
 | 整理时 beta | `20455819ea15b642a33f779f6d83abde60a13d36` |
-| 目标程序版本 | 0.8.7，PATCH；正式 main/tag 提交待确定 |
-| 本机候选应用身份 | beta `86acdac21468ac0f88228f5a4b613ad49c8eaa31`，合并 [#194](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/194) |
+| 已发布程序版本 | 0.8.7，PATCH；正式标签 `v0.8.7` 与七份产物的源码提交为 `b5a98ff98fed501aafff0f6a4ef5015c8b4d435d`；后续流程 main `d0168f74182f52f493adb2a3b1fc9af0f3ec4eac` 不改变该发布身份 |
+| 历史候选应用身份 | beta `86acdac21468ac0f88228f5a4b613ad49c8eaa31`，合并 [#194](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/194)；原证据保留 |
 | beta 服务验收身份 | `b1e428cc4ceec2f3993b3fdc859f8227f18660d9`；后续文档/流程提交保留该服务与既有客户端的原始证据身份 |
 | API / schema | `/api/v1/` / 8；快照兼容 `3..=8` |
 | 完整格式 | `ale-s8-cld1-t3-m2-p1-a1`，无新增数据库迁移 |
@@ -31,14 +31,14 @@
 这些内容来自已合并的 [#186](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/186)、[#188](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/188)、
 [#189](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/189)、[#190](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/190)、
 [#191](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/191)、[#192](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/192)、[#193](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/193) 和
-[#187](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/187)。30 任务功能来自原工作区，在首轮版本准备后获用户确认追加，并经 #194 合入 beta；所选源码、本机 portable、两主题原生窗口和 beta 两端验收已通过，最终 main/tag 与正式产物门禁仍待完成。行为说明见[主题契约](Rust_Themes.md)、[搜索任务](Rust_Search_Tasks.md)与[发布说明](Rust_Release_Notes.md)。
+[#187](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/187)。30 任务功能来自原工作区，在首轮版本准备后获用户确认追加，并经 #194 合入 beta；所选源码、候选 portable、两主题原生窗口和 beta 两端验收已通过。随后从最终应用 main `b5a98ff98fed` 构建并验收七份发布产物，完成十四资产离线核验、正式发布与项目 debug 缓存维护，见后文。行为说明见[主题契约](Rust_Themes.md)、[搜索任务](Rust_Search_Tasks.md)与[发布说明](Rust_Release_Notes.md)。
 
 ## 暂不纳入的工作
 
 - [#185](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/185) 与已合并 Studio 外观部分重叠，但并非全部被取代：其独有的分页、结果数量、侧栏显示偏好和 draft 上传 helper 延后单独评估，不直接合入冲突分支。
 - [#135](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/135) / [#137](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/137) 的封面工作已由合并的 [#138](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/138) 接续；[#97](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/97) 的 marker 方向已有后续实现。这三个过时 PR 已关闭，保留分支与提交；[标记设计](api/Compatibility_Markers.md)已注明历史状态，未合入旧草稿代码。
 
-## 已有证据与未解决门禁
+## 原始证据与门禁历史
 
 以下为原 PR 的历史记录，未在本次准备中重新执行；只有相关源码、feature、工具链及环境仍相同时才可复用。
 
@@ -74,7 +74,7 @@
 
 ## 本机候选交付与原生门禁
 
-以下实际产物均来自 beta 应用提交 `86acdac21468ac0f88228f5a4b613ad49c8eaa31`；短阶段收据和原始日志位于私有目录 `.rust-validation/release-087/delivery/`，不在本文嵌入完整日志。
+以下保留 beta 应用提交 `86acdac21468ac0f88228f5a4b613ad49c8eaa31` 的候选交付历史，beta 服务另列其原身份；短阶段收据和原始日志位于私有目录 `.rust-validation/release-087/delivery/`。后续最终 `b5a98ff98fed` 产物单独记录，不改写候选身份。
 
 | 阶段 | 当前结果 |
 |---|---|
@@ -86,8 +86,8 @@
 | Studio 原生重绘 | 通过：192 DPI（200%）、2214×1409 client，同样九轮、采样 `changed_fraction=0`，前台曝光与正常关闭均为 true |
 | Mac beta 服务门禁 | `b1e428c` 构建、替换及 health 已通过；首轮根读取超时失败保留，同一 payload 的只读阶段续验确认唯一配置根为 206 / 4,096 字节 / WAVE，前后 health 均为 0.8.7 / `b1e428c` / ok / API v1 / schema 8 |
 | Windows beta smoke | exit 0，10 passed / 0 failed，20/20 配置根内流样本通过；强制全量同步 909,342 条，与服务端相等；快照 10,150.7 MiB，同步 147.2 秒，总计 160.38 秒 |
-| 最终多平台产物 | 尚未确定最终 main/tag 身份；beta 两端与 Mac 源码检查不替代七个归档及十四资产的正式构建和验收 |
-| 缓存维护 | 失败诊断完整保留；尚未执行预算清理 Run。成功交付后的预算维护仍待执行；`C:/audiolib-build/target` 未注册，保持原样 |
+| 最终多平台产物 | 已从 main `b5a98ff98fed` 构建并验收七个归档，正式 Release 已发布十四项资产；最终身份与远端核验见后文 |
+| 缓存维护 | Windows 原清理失败保留；Mac 原生恢复维护成功，项目 debug profiles 实测余量 0 B、40 GiB 预算达标，详见末节。`C:/audiolib-build/target` 未注册，不做清理或认领 |
 
 首轮只将基线图保存移到断言前，仍失败；后续定位并修正的是验收工具，未修改应用 Rust 源码或重建应用：
 
@@ -111,12 +111,42 @@ Windows 使用既有客户端应用提交 `86acdac21468ac0f88228f5a4b613ad49c8ea
 
 覆盖范围必须保留：资料库共 909,342 条，既有 beta 配置的一个根覆盖 80,562 条；其余 828,780 条可浏览 Metadata，但位于配置根外，`/stream` 返回 404。smoke 的流样本仅从配置根内选择，跳过了 172 个根外候选；这不是全资料库可播放验收，也没有通过修改配置或扩大权限掩盖该边界。
 
-本次追加只涉及文档/流程证据，复用 `b1e428c` 服务和 `86acdac21468` 客户端的原始身份；相关应用输入未变时不为文档提交重复构建或 refresh。最终 main/tag 的七个正式归档及十四资产仍须按最终身份构建和验收，不能将上述 beta 产物直接记为已验收的正式 payload。
+上述 beta 阶段追加只涉及文档/流程证据，保留 `b1e428c` 服务和 `86acdac21468` 客户端的原始身份；相关应用输入未变时没有为文档提交重复构建或 refresh。它们不替代后续从 `b5a98ff98fed` 实际生成并验收的最终产物。
 
-## 按实际影响执行的后续计划
+## 最终 main 产物与独立工具验收
+
+最终应用源码为 `b5a98ff98fed501aafff0f6a4ef5015c8b4d435d`，由 beta 提升后的 main 生成实际发布 payload。相关应用输入与已检候选一致，原格式、Clippy、功能及 beta 证据保留原始身份复用；最终管线没有把 `source_checks=not-requested` 记作新执行的功能测试。
+
+| 最终 payload | 本地实际验收与覆盖边界 |
+|---|---|
+| Windows x64 客户端 | 默认 ASIO 构建、portable 验收与固定安装通过；原生 Default / Studio 各九轮通过，验收工具的独立身份见下文 |
+| macOS arm64 客户端 | 结构、签名、原生启动及退出验收通过；ad-hoc 签名，未经 Apple 公证 |
+| Windows x64 服务端 | 分发包、摘要、提取 EXE、隔离 health / API v1 / schema 8 / main commit 与合成库验收通过；Windows fixture 使用自有测试进程终止，未声称服务端 graceful drain 已测 |
+| macOS arm64 服务端 | 本机服务包及隔离运行验收通过，未部署到生产服务 |
+| Linux x64 服务端 | 包及隔离运行验收通过；在 ARM64 主机上的 AMD64 仿真环境执行，不代表物理 x64 硬件覆盖 |
+| Docker linux/amd64 | 消费已验收 Linux 输入，离线归档及运行验收通过；同样为 AMD64 仿真，未测物理 x64 硬件 |
+| Docker linux/arm64 | 消费已验收 ARM64 Linux 内部输入，离线归档及运行验收通过；独立 Linux arm64 原生包不列为公开资产 |
+
+发布前，七个归档及各自 SHA256 共十四个文件汇集于私有目录 `.rust-validation/release-087/final-assets/`，共 536,799,119 B，离线汇总核验通过。collector 使用本地拟发布元数据核对确切文件名、集合、摘要及原平台验收凭据；收据为 `.rust-validation/release-087/asset-assembly/22b30fc178d547449a32ccb5045c0028/assembly-receipt.json`。本地 annotated 标签冻结收据 `.rust-validation/release-087/release-tag-freeze.json` 保留原阶段身份；离线核验本身不作为远端发布成功凭据。
+
+随后标签推送与 [正式 Release](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.8.7) 创建、十四资产上传及远端核验完成，标签仍指向 `b5a98ff98fed501aafff0f6a4ef5015c8b4d435d`。14/14 项的名称、状态、大小和 GitHub SHA256 与上传前凭据匹配，并实际下载七份已发布 `.sha256` 完成摘要闭环；Latest、非 draft、非 prerelease 均已核对。只读发布核验收据为 `.rust-validation/release-087/publication/remote-audit-76f2fc7682d84e35acf029b9bc99d674/remote-proof.json`。
+
+最终 Windows 客户端的固定 `local_release/` 安装验证 1,249 个 package-owned 文件，仅复制 6 个内容变化文件；`AudioLibCli 0.8.7` 与隔离启动通过，原库和偏好保留。私有汇总 `.rust-validation/release-087/final-windows-client/result.json` 保留该次实际 main 产物、安装及原生验收身份；不把早期候选的 13 文件更新当作此次安装结果。
+
+发布后，Release `431279834` 的 Windows 归档通过 GitHub SHA256 与实际下载的发布校验文件，绑定到同一已验收的本地 ZIP、portable 和固定安装。正式安装器执行一次，验证 1,249 文件、复制 0 文件，`AudioLibCli 0.8.7` 与隔离桌面启动通过；正常环境未变，工作库和偏好保留。未重复构建或完整 portable 验收。同步收据为 `.rust-validation/release-087/publication/sync-runs/20261102T095840Z-256dbfdc512341328754b6eb595a4062/result.json`，安装凭据为 `.rust-validation/local-install/318c8176cdad4dbcacb2a0e22b8c110d`。
+
+该最终 payload 首次 Default 原生验收在 refocus 第 1 轮未取得要求的遮挡窗前台状态：应用的基线及操作前后前台检查均成立，遮挡命中也成立，直接焦点请求未使遮挡窗取得前台。失败日志 `.rust-validation/release-087/final-windows-client/native-default.log` 和逐轮 facts 保留；不将具体策略或超时机制写为已证实原因，也不把未完成焦点转换算作通过。
+
+后续仅修改验收工具的 refocus 交接：前置复核应用 HWND，再复用已有的两个自有队列短暂绑定方法，并在 finally 解绑定。工具独立提交 `2d25272cf0a37678e5b2a178c1079e8ca859e1c1`、SHA256 `d0344e7a28f91d6b0044d3dac0e5e2043ff6a7eecb2bbe07e39cc933751cbc79`；没有修改应用 Rust 或降低原层级、遮挡、前台、内容和像素差异门禁。
+
+使用该工具验证同一 `b5a98ff98fed` 实际 EXE（SHA256 `859541a34d4eb05a04ddcda4f92d88596253235bc8ad1ed66a723999489faf81`）：192 DPI（200%），Default client 2214×1370、Studio 2214×1409；各自 refocus、保持前台的遮挡恢复、最小化恢复各三轮，共十八轮采样 `changed_fraction=0`，`foreground_exposure_verified=true`、`normal_shutdown=true`。副本与原报告身份见私有 `final-windows-client/default-accepted.json`、`studio-accepted.json`，对应证据根为 `.rust-validation/release-087/`；两个报告均固定工具与应用各自的提交、SHA256。
+
+验收工具修正与此前结果记录属于独立流程改动，已单独整合到 beta/main，流程 main 为 `d0168f74182f52f493adb2a3b1fc9af0f3ec4eac`；应用发布源码保持 `b5a98ff98fed` 的既定身份，没有为纯工具或文档提交重建七份已通过的 payload。未新增声学输出延迟测量或真实 ASIO 硬件试验；音频后端未改，不因此增加硬件门禁。现有原生验收也不扩展为其他 DPI、Apple 公证、物理 x64 或全部真实音频库的测量结论。
+
+## 本轮执行顺序与复用规则
 
 1. 同步 workspace 与十个本地包的锁文件版本、README、版本规则及本轮发布说明；保留旧标签和历史证据身份。
-2. 运行版本预检及文档差异检查。首轮版本准备仅执行这些轻量检查和管线计划预览；追加 30 任务后的所选源码、交互、持久化、本机交付及 beta 两端验证已按上表补齐，最终产物另行验收。
+2. 运行版本预检及文档差异检查。首轮版本准备仅执行这些轻量检查和管线计划预览；追加 30 任务后的所选源码、交互、持久化、本机交付、beta 两端及最终产物验证已按上表补齐，保留各阶段实际身份。
 
    ```powershell
    pwsh tools/check-release.ps1 -Tag v0.8.7 -BaseTag v0.8.6
@@ -138,17 +168,23 @@ Windows 使用既有客户端应用提交 `86acdac21468ac0f88228f5a4b613ad49c8ea
 - 首轮版本准备实测通过：`check-release.ps1 -Tag v0.8.7 -BaseTag v0.8.6`、`git diff --check`；Windows client/server、Unix server、Mac client 四种原生 release plan 的 `Plan` 路由预览通过（`source_checks=not-requested`）。这是追加 30 任务前的原始记录，计划预览不运行构建、源码测试或平台验收。
 - 源码检查已通过：最终 desktop strict Clippy 与定向 106 passed / 0 failed / 51 ignored，结合未变 core142、db 工作区10、remote 离线工作区1、windows27、update29 及既有格式/Clippy 结果，完成本轮所选源码验证。保留各输入与 ignored 限制；首轮 desktop 的 471 passed / 2 failed / 154 ignored 仍是失败历史，未改称全量通过。
 - Mac 源码检查已通过：`053c2a2` 的原生 arm64 desktop strict Clippy 与所选 106 passed / 0 failed / 51 ignored；不代表 Mac release payload、服务端或部署通过。
-- 本机交付与原生门禁已通过：beta `86acdac21468` 的默认 ASIO 构建、打包、portable、review-fixes、playback/IPC、固定 `local_release/` 与独立 Development beta 安装；同一 EXE 的 Default / Studio 原生曝光各九轮通过并正常退出。保留所有先前失败及工具修正记录，未另行重建应用。
+- 早期候选交付与原生门禁已通过：beta `86acdac21468` 的默认 ASIO 构建、打包、portable、review-fixes、playback/IPC、固定 `local_release/` 与独立 Development beta 安装；同一 EXE 的 Default / Studio 原生曝光各九轮通过并正常退出。保留所有先前失败及工具修正记录，未另行重建应用。
 - beta 两端已通过：Mac `b1e428c` 的原构建/替换/health 与只读根阶段续验结合通过；Windows `86acdac21468` 客户端完整 smoke 为 10 passed / 0 failed、20/20 流样本及 909,342 条全量同步。原根读取超时失败和配置根覆盖边界保留，恢复原因未证实。
-- 尚待完成：最终 main/tag 身份、七个正式归档及十四资产的构建/验收/发布流程，以及交付后的缓存预算维护。现有候选与 beta 证据不表示正式 payload 已验收或 Release 已发布。
-- 保留全部失败证据与诊断缓存；本次文档/流程追加复用仍有效的原服务、客户端身份，没有把旧构建或历史测试描述为新执行。
+- 最终产物已通过：应用 main `b5a98ff98fed` 的七个归档分别完成实际构建/打包及本地验收；Windows 固定安装核对 1,249 文件、复制 6 文件并通过隔离启动，最终原生两主题各九轮使用独立工具 `2d25272` 验证通过。beta `b1e428c` / `86acdac21468` 证据仍保留原身份。
+- 正式发布与远端核验已完成：[v0.8.7](https://github.com/Freedragonlancer/AudioLib-Explorer/releases/tag/v0.8.7) 的标签固定 `b5a98ff98fed`，七个归档及七个 SHA256 共十四项资产已发布；离线汇集与远端名称集合、摘要核验各保留独立结果。发布后固定安装同步亦通过，1,249 文件已核对、0 文件需复制。
+- 缓存维护已完成：保留 Windows 原失败记录，在 Mac 原生恢复同一项目 target 的 debug 清理，独立复核剩余 0 B、40 GiB 预算达标；未登记外部 target 保留。
+- 保留全部失败日志、报告与图像；本次文档/流程追加复用仍有效的原服务、客户端身份，没有把旧构建或历史测试描述为新执行。
 
 门禁结果在实际执行后追加其提交、feature、平台与私有报告路径；不得将本文件的计划表当成通过记录。
 
-本轮本机汇总：固定安装验证 1,249 个 package-owned 文件（13 个内容更新），CLI 为 `AudioLibCli 0.8.7`，隔离桌面启动通过；`beta_release/` 的 Development 安装也已完成（1,249 文件）。两处安装使用同一已验收的客户端 payload，工作资料库与数据目录保留。
+本轮本机汇总：发布后同一 `b5a98ff98fed` 产物的固定安装同步验证 1,249 个 package-owned 文件，复制 0 文件，CLI 为 `AudioLibCli 0.8.7`，隔离桌面启动通过。此前最终 main 初装的 6 文件更新、早期候选固定安装的 13 文件更新及 `beta_release/` 的 1,249 文件 Development 安装作为各阶段历史保留；不混用安装身份。工作资料库、偏好和正常数据目录环境保留。
 
-缓存维护仅执行 Plan：首轮预览时已拥有的项目 target 约 **66.65 GiB 逻辑大小**，未执行删除，不代表当前预算已达标。Plan 中的 `remaining_bytes=0` / `budget_met=true` 是执行所列删除后的预测，不能作为实际回收记录。预算 Run 待本轮交付后执行；原生失败诊断及未注册的 `C:/audiolib-build/target` 均保留。
+缓存维护先在 Windows 遇到 `DirectoryNotEmpty` 失败，完整失败日志保留，不将它记作成功或实际回收 0 B。随后在 Mac 对同一默认项目 target 执行正式 `Debug` / 40 GiB 恢复 Run，exit 0：fresh before 与已移除 profile 的逻辑大小均为 **71,560,759,252 B（约 66.65 GiB）**，独立 postcheck 为 **0 B**，`budget_met=true`。这是真实执行与后验复核，区别于首轮 Plan 的预测；物理释放空间未测量。收据为 `.rust-validation/release-087/cache-recovery/completion.json`。
 
-原生失败后，一个 owned `--smoke-view window-repaint` 测试进程在常规关闭后隐藏窗口但未退出。确认其可执行路径、专用 smoke 参数、隔离空库路径及 Metadata/扫描已排空日志后，仅对该超时测试实例执行了回收；保留临时数据与 `native-timeout-cleanup.json`。该次回收仍不是正常关闭通过记录；后续已从工具窗口误选定位其失去唤醒目标的原因，并以精确窗口选择和两主题真实正常退出完成本轮复核，未把该现象归为新的 Rust 关闭排空故障。
+维护仅移除默认 target 下的 `debug` 与 `x86_64-pc-windows-msvc/debug`，保留 release、SDK、Cargo/Rustup home、工作库和源音频、dist、安装及验证证据。所有未登记的 Mac/Linux/C 外部缓存均未扫描、登记或清理，包括 `C:/audiolib-build/target`；原生失败诊断仍保留。
+
+原生失败后，一个 owned `--smoke-view window-repaint` 测试进程在常规关闭后隐藏窗口但未退出。确认其可执行路径、专用 smoke 参数、隔离空库路径及 Metadata/扫描已排空日志后，仅对该超时测试实例执行了回收；保留临时数据与 `native-timeout-cleanup.json`。该次回收仍不是正常关闭通过记录；后续确认脚本存在可能误关工具窗口并丢失唤醒目标的路径，再以精确窗口选择和两主题真实正常退出完成本轮复核，未把该现象归为新的 Rust 关闭排空故障。
 
 最终产物准备时修正 Windows client 计划的归档声明：打包器常规输出为 latest ZIP/SHA256，计划现在记录这两个实际文件。Profiles 合成回归保留真实产物声明，验证错误的版本化声明会在验收和安装前失败，以及修正后两种 ASIO 路由通过；应用源码、包格式与白名单未变。私有日志为 .rust-validation/native-validation-087/pipeline-profiles-final.log。
+
+发布身份冻结后，验收驱动与先前纯流程记录已独立整合到 beta/main；应用输入未变。本次发布状态同步同样不改变标签和七份已验收 payload 的 `b5a98ff98fed501aafff0f6a4ef5015c8b4d435d` 源码身份，不把后续流程提交冒称它们的新构建身份。归档内文档保留 b5 构建时的快照；本次仓库文档同步不修改已发布归档、校验文件或标签。

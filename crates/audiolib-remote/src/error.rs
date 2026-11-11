@@ -295,6 +295,13 @@ impl RemoteError {
                     message,
                 }
             }
+            // Migration refusals wrote nothing: retry after `Retry-After` (never a loss).
+            (_, code @ ("migration_in_progress" | "migration_switching" | "already_running")) => {
+                Self::Busy {
+                    message: format!("{message} [{code}]"),
+                    retry_after,
+                }
+            }
             (_, "MANAGE_FORBIDDEN") => Self::Forbidden(message),
             (_, "HOST_FORBIDDEN") => Self::HostForbidden(message),
             (_, "ADMIN_LAN_ONLY") => Self::AdminLanOnly(message),
@@ -476,6 +483,12 @@ impl RemoteError {
 
     /// Human-readable text for the desktop language.
     pub fn localized(&self, chinese: bool) -> String {
+        if let Some((refusal, _)) = self.migration_refusal() {
+            return refusal.text(chinese).to_string();
+        }
+        if let Some(code) = self.migration_error_code() {
+            return audiolib_core::server_upgrade::migration_error_text(&code, chinese);
+        }
         if !chinese {
             return match self {
                 Self::Unreachable(detail) => {
@@ -819,6 +832,31 @@ impl RemoteError {
     /// server's `408 TIMEOUT`, a connection dropped mid-request or an unreadable reply),
     /// so the local snapshot must be re-synced rather than trusted. Classified server
     /// errors (`400`/`404`/`409`/`413`/`5xx`) never change the server library.
+    /// Migration `error_code` of an admin reply (`409 already_running`).
+    pub fn migration_error_code(&self) -> Option<String> {
+        let Self::Busy { message, .. } = self else {
+            return None;
+        };
+        let code = message.rsplit_once(" [")?.1.strip_suffix(']')?;
+        (code == "already_running").then(|| code.to_string())
+    }
+
+    /// A `503` refused because of a server migration, with its `Retry-After`.
+    pub fn migration_refusal(
+        &self,
+    ) -> Option<(audiolib_core::server_upgrade::MigrationRefusal, Option<u64>)> {
+        let Self::Busy {
+            message,
+            retry_after,
+        } = self
+        else {
+            return None;
+        };
+        let code = message.rsplit_once(" [")?.1.strip_suffix(']')?;
+        audiolib_core::server_upgrade::MigrationRefusal::from_code(code)
+            .map(|refusal| (refusal, *retry_after))
+    }
+
     pub fn write_may_have_committed(&self) -> bool {
         matches!(
             self,

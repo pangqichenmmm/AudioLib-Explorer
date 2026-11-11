@@ -351,6 +351,77 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     (directory, path)
 }
 
+fn af1_projection_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (directory, path) = fixture();
+    let conn = Connection::open(&path).unwrap();
+    schema::register_tokenizer(&conn, load_tokenizer()).unwrap();
+    conn.execute_batch("UPDATE audio_files SET filename='owned.mp3',file_path='owned.mp3',path_key='owned.mp3' WHERE id=1;
+        INSERT INTO library_meta(key,value) VALUES('extension_metadata','preserved');").unwrap();
+    (directory, path)
+}
+
+#[test]
+fn af1_publication_does_not_replace_an_unknown_source_format_marker() {
+    let (_directory, path) = af1_projection_fixture();
+    Connection::open(&path).unwrap().execute(
+        "INSERT INTO library_meta(key,value) VALUES('snapshot_format','unknown-private-format')", [],
+    ).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let destination = path.parent().unwrap().join("imported.db");
+    let error = crate::import_legacy(&path, &destination).unwrap_err();
+    assert!(
+        matches!(&error, Error::Validation(message) if message.contains("Unknown source snapshot_format")),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(!destination.exists());
+}
+
+#[test]
+fn af1_expected_projection_still_rejects_format_and_extension_metadata_tampering() {
+    for damage in [
+        "UPDATE library_meta SET value='forged-future-format' WHERE key='snapshot_format'",
+        "UPDATE library_meta SET value='tampered' WHERE key='extension_metadata'",
+    ] {
+        let (_directory, path) = af1_projection_fixture();
+        let cancel = AtomicBool::new(false);
+        let reviewed = plan(&path, &cancel).unwrap();
+        let interrupted = apply(&reviewed, &cancel, &mut |event| {
+            if event.phase == MigrationPhase::Validating {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(interrupted, Err(Error::Cancelled)),
+            "{interrupted:?}"
+        );
+        let job = discover(&path).unwrap().unwrap();
+        Connection::open(job.directory.join("candidate.db"))
+            .unwrap()
+            .execute_batch(damage)
+            .unwrap();
+        let error = resume(&job.directory, &cancel, &mut |_| Ok(())).unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation(message) if message.contains("business projection")),
+            "{damage}: {error:?}"
+        );
+        rollback(&job.directory, &cancel, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            inspect(
+                &path,
+                audiolib_core::compatibility::LibraryAccess::Read,
+                true,
+                &cancel
+            )
+            .unwrap()
+            .business,
+            reviewed.source.business
+        );
+    }
+}
+
 fn identifier_case_fixture(mixed: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("library.db");

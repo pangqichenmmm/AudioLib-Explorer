@@ -205,8 +205,9 @@ fn definition_identity_allows_id_drift_without_merging_distinct_indexed_aliases(
     assert!(!same_search_definition(&original, &compared));
     compared.folder = None;
     assert!(!same_search_definition(&original, &compared));
-    let changes: [fn(&mut SearchTaskDefinition); 5] = [
+    let changes: [fn(&mut SearchTaskDefinition); 6] = [
         |definition: &mut SearchTaskDefinition| definition.query.push_str(" rain"),
+        |definition: &mut SearchTaskDefinition| definition.scope = audiolib_core::SearchScope::Path,
         |definition: &mut SearchTaskDefinition| definition.include_subfolders = false,
         |definition: &mut SearchTaskDefinition| definition.filters.favorites_only = true,
         |definition: &mut SearchTaskDefinition| definition.order_by = SortOrder::Filename,

@@ -239,7 +239,64 @@ fn declared_name_filters_keep_empty_library_distinct_from_folder_display_names()
     assert_eq!(provider.search(&named).unwrap().total_count, 0);
     let file = provider.get_audio(1).unwrap();
     assert!(file.album.is_empty());
-    assert_eq!(file.album_entity.unwrap().name, "Folder");
+    assert_eq!(file.album_entity.as_ref().unwrap().name, "Folder");
+}
+
+#[test]
+fn declared_album_hydration_preserves_sources_without_shared_album_tables() {
+    let (_root, path) = previous_fixture();
+    let conn = Connection::open(&path).unwrap();
+    register_library_functions(&conn).unwrap();
+    let projection = audio_projection(&conn).unwrap();
+    let sql = format!("SELECT {projection} FROM audio_files af WHERE af.id=2");
+    for (raw, expected) in [
+        (
+            r#"{"vendor_metadata":{"fields":{"library":[null," ","  厂商库  "]}},"wav_metadata":{"fields":{"library":"Embedded"}}}"#,
+            "厂商库",
+        ),
+        (
+            r#"{"vendor_metadata":{"fields":{"library":" \t"}},"wav_metadata":{"fields":{"library":[false,"  Embedded  ","Later"]}}}"#,
+            "Embedded",
+        ),
+        (
+            r#"{"wav_metadata":{"fields":{"\u006cibrary":"  转义库  "}}}"#,
+            "转义库",
+        ),
+        (
+            r#"{"wav_metadata":{"fields":{"library":[" ","Later"]}}}"#,
+            "",
+        ),
+        (r#"{"unknown":{"library":"Not declared"}}"#, ""),
+        (r#"[{"library":"Not declared"}]"#, ""),
+        ("not-json", ""),
+    ] {
+        conn.execute("UPDATE audio_files SET metadata_json=?1 WHERE id=2", [raw])
+            .unwrap();
+        let audio = conn.query_row(&sql, [], audio_from_row).unwrap();
+        assert_eq!(audio.album, expected, "{raw}");
+        assert!(audio.album_id.is_none());
+        assert!(audio.album_entity.is_none());
+    }
+
+    let raw = serde_json::json!({
+        "vendor_metadata":{"fields":{"library":["  Legacy BLOB library  "]}},
+        "wav_metadata":{"fields":{"library":"Embedded BLOB library"}},
+        "private_extension":{"retain":"unknown 🦉 text ".repeat(128)}
+    });
+    let stored = metadata_storage::encode_legacy_fixture(&raw.to_string()).unwrap();
+    assert!(matches!(&stored, Value::Blob(_)));
+    conn.execute(
+        "UPDATE audio_files SET metadata_json=?1 WHERE id=2",
+        [stored],
+    )
+    .unwrap();
+    let audio = conn.query_row(&sql, [], audio_from_row).unwrap();
+    assert_eq!(audio.album, "Legacy BLOB library");
+    assert_eq!(
+        audio.attributes["private_extension"],
+        raw["private_extension"]
+    );
+    assert_eq!(audio.attributes["vendor_metadata"], raw["vendor_metadata"]);
 }
 
 #[test]

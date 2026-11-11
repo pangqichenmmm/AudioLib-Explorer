@@ -10,6 +10,7 @@
 //! A network source can also register a [`SourceBuffer`]: the engine then asks it whether
 //! the bytes the decoder needs next are in memory, and pauses playback with a short fade
 //! ("buffering") instead of letting a decoder read block while the output plays.
+use audiolib_core::AudioMetadata;
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -40,6 +41,7 @@ pub trait SourceBuffer: Send + Sync {
 struct Registered {
     opener: SourceOpener,
     buffer: Option<Arc<dyn SourceBuffer>>,
+    metadata: Option<AudioMetadata>,
 }
 
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
@@ -49,15 +51,27 @@ fn registry() -> MutexGuard<'static, BTreeMap<PathBuf, Registered>> {
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn register(path: PathBuf, opener: SourceOpener, buffer: Option<Arc<dyn SourceBuffer>>) {
+fn register(
+    path: PathBuf,
+    opener: SourceOpener,
+    buffer: Option<Arc<dyn SourceBuffer>>,
+    metadata: Option<AudioMetadata>,
+) {
     let mut registry = registry();
-    registry.insert(path, Registered { opener, buffer });
+    registry.insert(
+        path,
+        Registered {
+            opener,
+            buffer,
+            metadata,
+        },
+    );
     REGISTERED.store(registry.len(), Ordering::Release);
 }
 
 /// Route decoder opens for `path` through `opener` (replacing an earlier registration).
 pub fn register_stream_source(path: impl Into<PathBuf>, opener: SourceOpener) {
-    register(path.into(), opener, None);
+    register(path.into(), opener, None, None);
 }
 
 /// [`register_stream_source`] for a source that fills from the network: playback waits
@@ -67,7 +81,25 @@ pub fn register_buffered_stream_source(
     opener: SourceOpener,
     buffer: Arc<dyn SourceBuffer>,
 ) {
-    register(path.into(), opener, Some(buffer));
+    register(path.into(), opener, Some(buffer), None);
+}
+
+/// Register an original stream with its scanned layout, avoiding a network-wide
+/// MP3 frame recount before playback. The decoder validates the layout and source
+/// header; this owned snapshot never substitutes for source authorization.
+pub fn register_buffered_stream_source_with_metadata(
+    path: impl Into<PathBuf>,
+    opener: SourceOpener,
+    buffer: Arc<dyn SourceBuffer>,
+    metadata: AudioMetadata,
+) {
+    register(path.into(), opener, Some(buffer), Some(metadata));
+}
+
+pub(crate) fn registered_metadata(path: &Path) -> Option<AudioMetadata> {
+    registry()
+        .get(path)
+        .and_then(|entry| entry.metadata.clone())
 }
 
 /// Remove a registration; later opens of `path` use the file system again.
@@ -143,12 +175,21 @@ impl Seek for Tracked {
 /// Symphonia media source over any [`ByteSource`] with a known length.
 pub(crate) struct MediaAdapter {
     inner: Box<dyn ByteSource>,
-    len: u64,
+    len: Option<u64>,
 }
 
 impl MediaAdapter {
     pub(crate) fn new(inner: Box<dyn ByteSource>, len: u64) -> Self {
-        Self { inner, len }
+        Self {
+            inner,
+            len: Some(len),
+        }
+    }
+
+    // Exact MP3 duration comes from the scanned layout. With no declared byte
+    // length, the demuxer does not replace it with an average-bitrate estimate.
+    pub(crate) fn without_length(inner: Box<dyn ByteSource>) -> Self {
+        Self { inner, len: None }
     }
 }
 
@@ -170,6 +211,127 @@ impl symphonia::core::io::MediaSource for MediaAdapter {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.len)
+        self.len
+    }
+}
+
+/// Restrict a demuxer to an authorized audio payload, keeping outer source
+/// tracking in absolute coordinates and excluding ID3 trailers from packet reads.
+pub(crate) struct AudioRegion {
+    inner: Box<dyn ByteSource>,
+    start: u64,
+    len: u64,
+    at: u64,
+}
+
+impl AudioRegion {
+    pub(crate) fn new(mut inner: Box<dyn ByteSource>, start: u64, len: u64) -> io::Result<Self> {
+        start
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Audio region overflow"))?;
+        inner.seek(SeekFrom::Start(start))?;
+        Ok(Self {
+            inner,
+            start,
+            len,
+            at: 0,
+        })
+    }
+}
+
+impl Read for AudioRegion {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = bytes
+            .len()
+            .min(usize::try_from(self.len.saturating_sub(self.at)).unwrap_or(usize::MAX));
+        let count = self.inner.read(&mut bytes[..count])?;
+        self.at += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for AudioRegion {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(at) => i128::from(at),
+            SeekFrom::End(delta) => i128::from(self.len) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.at) + i128::from(delta),
+        };
+        let at = u64::try_from(target)
+            .ok()
+            .filter(|at| *at <= self.len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Seek outside audio region")
+            })?;
+        self.inner.seek(SeekFrom::Start(self.start + at))?;
+        self.at = at;
+        Ok(at)
+    }
+}
+
+/// In-memory decoder-only prefix followed by an unchanged authorized audio
+/// region. Header repair never writes source bytes or a downloaded cache file.
+pub(crate) struct PrefixedSource {
+    prefix: Vec<u8>,
+    inner: Box<dyn ByteSource>,
+    len: u64,
+    at: u64,
+}
+
+impl PrefixedSource {
+    pub(crate) fn new(
+        prefix: Vec<u8>,
+        inner: Box<dyn ByteSource>,
+        payload_len: u64,
+    ) -> io::Result<Self> {
+        let len = (prefix.len() as u64)
+            .checked_add(payload_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Prefixed audio length overflow",
+                )
+            })?;
+        Ok(Self {
+            prefix,
+            inner,
+            len,
+            at: 0,
+        })
+    }
+}
+
+impl Read for PrefixedSource {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.at < self.prefix.len() as u64 {
+            let start = self.at as usize;
+            let count = bytes.len().min(self.prefix.len() - start);
+            bytes[..count].copy_from_slice(&self.prefix[start..start + count]);
+            self.at += count as u64;
+            return Ok(count);
+        }
+        let count = self.inner.read(bytes)?;
+        self.at += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for PrefixedSource {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(at) => i128::from(at),
+            SeekFrom::End(delta) => i128::from(self.len) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.at) + i128::from(delta),
+        };
+        let at = u64::try_from(target)
+            .ok()
+            .filter(|at| *at <= self.len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Seek outside prefixed audio")
+            })?;
+        self.inner
+            .seek(SeekFrom::Start(at.saturating_sub(self.prefix.len() as u64)))?;
+        self.at = at;
+        Ok(at)
     }
 }

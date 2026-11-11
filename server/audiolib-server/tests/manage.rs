@@ -643,6 +643,14 @@ async fn capabilities(
     .await
 }
 
+fn plain_library_server_catalog() -> audiolib_core::compatibility::CompatibilityManifest {
+    let mut catalog = audiolib_core::compatibility::compatibility_manifest();
+    // A ready server reports its actual source-library writer role. The generic
+    // client catalog also supports af1, but this fixture contains ordinary WAVs.
+    catalog.database_write_formats = vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()];
+    catalog
+}
+
 #[tokio::test]
 async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     let f = fixture(&[]);
@@ -663,7 +671,28 @@ async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     assert_eq!(
         capabilities(state, &[], LAN).await,
         CapabilitiesResponse {
-            compatibility: audiolib_core::compatibility::compatibility_manifest(),
+            compatibility: plain_library_server_catalog(),
+            library_schema: Some(audiolib_core::server_upgrade::LibrarySchemaInfo {
+                current: Some(8),
+                source_search_rev: Some(2),
+                snapshot_formats_served: vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()],
+            }),
+            schema_migration: Some(audiolib_core::server_upgrade::SchemaMigrationInfo {
+                state: audiolib_core::server_upgrade::MigrationState::Idle,
+                endpoint: Some("/admin/api/migration".into()),
+            }),
+            vendor_import: Some(audiolib_core::server_upgrade::VendorImportInfo {
+                endpoint: Some(audiolib_core::server_upgrade::VENDOR_IMPORT_API.into()),
+                revision: 1,
+                max_file_bytes: 52_428_800,
+                max_rows: 200_000,
+                max_row_text_bytes: Some(262_144),
+            }),
+            client_upgrade: None,
+            search_scopes: ["main", "all", "path", "filename"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             manage_mode: ManageMode::All,
             external: false,
             can_manage: true,
@@ -678,7 +707,28 @@ async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     assert_eq!(
         capabilities(state, proxied, LAN).await,
         CapabilitiesResponse {
-            compatibility: audiolib_core::compatibility::compatibility_manifest(),
+            compatibility: plain_library_server_catalog(),
+            library_schema: Some(audiolib_core::server_upgrade::LibrarySchemaInfo {
+                current: Some(8),
+                source_search_rev: Some(2),
+                snapshot_formats_served: vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()],
+            }),
+            schema_migration: Some(audiolib_core::server_upgrade::SchemaMigrationInfo {
+                state: audiolib_core::server_upgrade::MigrationState::Idle,
+                endpoint: Some("/admin/api/migration".into()),
+            }),
+            vendor_import: Some(audiolib_core::server_upgrade::VendorImportInfo {
+                endpoint: Some(audiolib_core::server_upgrade::VENDOR_IMPORT_API.into()),
+                revision: 1,
+                max_file_bytes: 52_428_800,
+                max_rows: 200_000,
+                max_row_text_bytes: Some(262_144),
+            }),
+            client_upgrade: None,
+            search_scopes: ["main", "all", "path", "filename"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             manage_mode: ManageMode::All,
             external: true,
             can_manage: true,
@@ -758,7 +808,28 @@ async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     assert_eq!(
         capabilities(state, proxied, LAN).await,
         CapabilitiesResponse {
-            compatibility: audiolib_core::compatibility::compatibility_manifest(),
+            compatibility: plain_library_server_catalog(),
+            library_schema: Some(audiolib_core::server_upgrade::LibrarySchemaInfo {
+                current: Some(8),
+                source_search_rev: Some(2),
+                snapshot_formats_served: vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()],
+            }),
+            schema_migration: Some(audiolib_core::server_upgrade::SchemaMigrationInfo {
+                state: audiolib_core::server_upgrade::MigrationState::Idle,
+                endpoint: Some("/admin/api/migration".into()),
+            }),
+            vendor_import: Some(audiolib_core::server_upgrade::VendorImportInfo {
+                endpoint: Some(audiolib_core::server_upgrade::VENDOR_IMPORT_API.into()),
+                revision: 1,
+                max_file_bytes: 52_428_800,
+                max_rows: 200_000,
+                max_row_text_bytes: Some(262_144),
+            }),
+            client_upgrade: None,
+            search_scopes: ["main", "all", "path", "filename"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             manage_mode: ManageMode::Lan,
             external: true,
             can_manage: false,
@@ -773,7 +844,28 @@ async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     assert_eq!(
         capabilities(state, public, PUBLIC).await,
         CapabilitiesResponse {
-            compatibility: audiolib_core::compatibility::compatibility_manifest(),
+            compatibility: plain_library_server_catalog(),
+            library_schema: Some(audiolib_core::server_upgrade::LibrarySchemaInfo {
+                current: Some(8),
+                source_search_rev: Some(2),
+                snapshot_formats_served: vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()],
+            }),
+            schema_migration: Some(audiolib_core::server_upgrade::SchemaMigrationInfo {
+                state: audiolib_core::server_upgrade::MigrationState::Idle,
+                endpoint: Some("/admin/api/migration".into()),
+            }),
+            vendor_import: Some(audiolib_core::server_upgrade::VendorImportInfo {
+                endpoint: Some(audiolib_core::server_upgrade::VENDOR_IMPORT_API.into()),
+                revision: 1,
+                max_file_bytes: 52_428_800,
+                max_rows: 200_000,
+                max_row_text_bytes: Some(262_144),
+            }),
+            client_upgrade: None,
+            search_scopes: ["main", "all", "path", "filename"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             manage_mode: ManageMode::Lan,
             external: true,
             can_manage: false,
@@ -788,7 +880,28 @@ async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     assert_eq!(
         capabilities(state, &[], LAN).await,
         CapabilitiesResponse {
-            compatibility: audiolib_core::compatibility::compatibility_manifest(),
+            compatibility: plain_library_server_catalog(),
+            library_schema: Some(audiolib_core::server_upgrade::LibrarySchemaInfo {
+                current: Some(8),
+                source_search_rev: Some(2),
+                snapshot_formats_served: vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()],
+            }),
+            schema_migration: Some(audiolib_core::server_upgrade::SchemaMigrationInfo {
+                state: audiolib_core::server_upgrade::MigrationState::Idle,
+                endpoint: Some("/admin/api/migration".into()),
+            }),
+            vendor_import: Some(audiolib_core::server_upgrade::VendorImportInfo {
+                endpoint: Some(audiolib_core::server_upgrade::VENDOR_IMPORT_API.into()),
+                revision: 1,
+                max_file_bytes: 52_428_800,
+                max_rows: 200_000,
+                max_row_text_bytes: Some(262_144),
+            }),
+            client_upgrade: None,
+            search_scopes: ["main", "all", "path", "filename"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             manage_mode: ManageMode::Lan,
             external: false,
             can_manage: true,
@@ -861,7 +974,28 @@ async fn manage_mode_gates_scans_and_removals_but_not_reads_or_metadata() {
     assert_eq!(
         capabilities(state, &[], LAN).await,
         CapabilitiesResponse {
-            compatibility: audiolib_core::compatibility::compatibility_manifest(),
+            compatibility: plain_library_server_catalog(),
+            library_schema: Some(audiolib_core::server_upgrade::LibrarySchemaInfo {
+                current: Some(8),
+                source_search_rev: Some(2),
+                snapshot_formats_served: vec![audiolib_core::compatibility::PLAN_B_FORMAT.into()],
+            }),
+            schema_migration: Some(audiolib_core::server_upgrade::SchemaMigrationInfo {
+                state: audiolib_core::server_upgrade::MigrationState::Idle,
+                endpoint: Some("/admin/api/migration".into()),
+            }),
+            vendor_import: Some(audiolib_core::server_upgrade::VendorImportInfo {
+                endpoint: Some(audiolib_core::server_upgrade::VENDOR_IMPORT_API.into()),
+                revision: 1,
+                max_file_bytes: 52_428_800,
+                max_rows: 200_000,
+                max_row_text_bytes: Some(262_144),
+            }),
+            client_upgrade: None,
+            search_scopes: ["main", "all", "path", "filename"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             manage_mode: ManageMode::Off,
             external: false,
             can_manage: false,

@@ -10,6 +10,19 @@
 
 ## 功能
 
+下一大型版本的原生服务端包使用 layout 2，同时包含同目录的 `audiolib-server` 与
+`audiolib-migrate`（Windows 为 `.exe`）；Docker 镜像在 `/opt/audiolibserver` 保留两者。
+迁移工具输出 JSON，以显式 `--db` 执行 `status`、`start`、`rollback`，没有 `--version`
+命令；正式构建不带 test-hooks，清单和验收报告绑定两个文件的 SHA256。
+
+从 0.9 之前的安装升级这次包布局必须先**人工引导升级服务端**。冻结的旧更新器确实会
+拒绝新增迁移程序，不能把它记作自动更新兼容；包报告明确写 layout revision 2、
+`automatic_upgrade_compatible=false`、`manual_bootstrap_required=true`、最低已发布更新器
+版本 `0.9.0`。当前程序版本已冻结为 0.9.0，尚未发布。保留数据库、配置及配套回退备份，
+正常停服后安装完整原生负载，再按双端迁移方案显式迁移库。停服后的离线恢复可用
+`audiolib-migrate.exe status --db <库路径>`（Unix 去掉 `.exe`），`start`/`rollback`
+使用同一明确路径。Docker 通过替换镜像升级并保留数据挂载。仍为七归档、十四资产。
+
 - 每次启动在后台检查 GitHub Release；管理页提示新版本，确认后下载、校验、安全关闭并自动部署重启，见[自动更新](deploy/README.md#automatic-release-updates)。
 - 库快照（`/library/snapshot`，可选 zstd）和基于 revision 的变更轮询。
 - `/audio/{id}/stream`：单段 `Range`、`ETag`、`If-Range`；`?download=1` 用于下载。
@@ -31,7 +44,7 @@
 **macOS（Apple 芯片）**（`server/rust-toolchain.toml` 固定 1.97.1）：
 
 ```sh
-cargo build -p audiolib-server --release --target aarch64-apple-darwin
+cargo build -p audiolib-server -p audiolib-db --bin audiolib-server --bin audiolib-migrate --release --locked --no-default-features --target aarch64-apple-darwin
 # 产物：target/aarch64-apple-darwin/release/audiolib-server
 ```
 
@@ -41,7 +54,7 @@ cargo build -p audiolib-server --release --target aarch64-apple-darwin
 sudo apt-get install -y build-essential pkg-config clang libclang-dev
 export RUSTUP_TOOLCHAIN=1.97.1          # 覆盖仓库的 Windows 工具链文件
 rustup toolchain install 1.97.1
-cargo build -p audiolib-server --release --locked --target x86_64-unknown-linux-gnu
+cargo build -p audiolib-server -p audiolib-db --bin audiolib-server --bin audiolib-migrate --release --locked --no-default-features --target x86_64-unknown-linux-gnu
 #   ARM64 用 --target aarch64-unknown-linux-gnu
 cargo test  -p audiolib-server --locked --target x86_64-unknown-linux-gnu   # 可选
 ```

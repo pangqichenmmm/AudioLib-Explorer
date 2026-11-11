@@ -55,7 +55,7 @@ fn fixture() -> Fixture {
     }
 }
 fn tags(f: &Fixture, id: i64) -> String {
-    f.provider.get_audio(id).unwrap().tags
+    f.provider.get_audio(id).unwrap().into_data().tags
 }
 fn patch(tags: &str) -> MetadataPatch {
     MetadataPatch {
@@ -1072,7 +1072,7 @@ fn root_relocation_keeps_windows_case_aliases_as_a_noop() {
     let before: Vec<_> = f
         .ids
         .iter()
-        .map(|id| f.provider.get_audio(*id).unwrap().file_path)
+        .map(|id| f.provider.get_audio(*id).unwrap().into_data().file_path)
         .collect();
     assert_eq!(f.provider.relink_folder(&source, &equivalent).unwrap(), 0);
     assert_eq!(f.provider.stats().unwrap().audio_files, 2);

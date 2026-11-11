@@ -3,9 +3,12 @@ import { Slider, CheckBox, LineEdit } from "std-widgets.slint";
 
 // Soft charcoal surfaces and restrained gray-teal actions keep spectral peaks readable.
 export global Theme {
-    // Complete theme presentation, selected with the palette by src/theme.rs.
-    // The default retains the original beta controls; Studio opts into the redesign.
+    // Workbench and player can be selected independently: Default v2 uses the
+    // Studio workbench with the original beta player.
     in-out property <bool> modern-style: false;
+    in-out property <bool> modern-player: false;
+    // Studio keeps its warm surface artwork; Default v2 blends it into graphite.
+    out property <float> workbench-backdrop-opacity: Theme.modern-player ? 1.0 : 0.22;
     // GUI scale factor (PR1: stays 1.0; nothing reads or writes it from Rust yet).
     // Literal lengths are written as `Npx * Theme.ui-scale`. 0px and 1px hairlines
     // (borders, separators, `/ 1px` unit conversions) stay unscaled.
@@ -80,25 +83,25 @@ export global Theme {
     out property <image> rail-backdrop: Theme.modern-style ? Theme.studio-rail : Theme.empty-backdrop;
     out property <image> library-backdrop: Theme.modern-style ? Theme.studio-library : Theme.empty-backdrop;
     out property <image> inspector-backdrop: Theme.modern-style ? Theme.studio-inspector : Theme.empty-backdrop;
-    out property <image> player-backdrop: Theme.modern-style ? Theme.studio-player : Theme.empty-backdrop;
-    out property <image> transport-backdrop: Theme.modern-style ? Theme.studio-transport : Theme.empty-backdrop;
+    out property <image> player-backdrop: Theme.modern-player ? Theme.studio-player : Theme.empty-backdrop;
+    out property <image> transport-backdrop: Theme.modern-player ? Theme.studio-transport : Theme.empty-backdrop;
     out property <image> tab-indicator: Theme.modern-style ? Theme.studio-tab-indicator : Theme.empty-backdrop;
-    out property <color> toolbar-surface: Theme.modern-style ? #28282a : Theme.bg;
-    out property <color> rail-surface: Theme.modern-style ? #2a2b2e : Theme.panel;
-    out property <color> library-surface: Theme.modern-style ? #202224 : Theme.panel;
-    out property <color> inspector-surface: Theme.modern-style ? #202224 : Theme.panel;
-    out property <color> player-surface: Theme.modern-style ? #202225 : Theme.player;
-    out property <color> table-surface: Theme.modern-style ? #1d1f21 : Theme.panel;
-    out property <color> table-alternate: Theme.modern-style ? #1f2123 : Theme.alternate;
-    out property <brush> control-surface: Theme.modern-style ? @linear-gradient(180deg, #2e3033 0%, #25272a 100%) : Theme.raised;
-    out property <brush> control-hover-surface: Theme.modern-style ? @linear-gradient(180deg, #373a3d 0%, #2c3033 100%) : Theme.hover;
-    out property <brush> table-header-surface: Theme.modern-style ? @linear-gradient(180deg, #26282a 0%, #212325 100%) : Theme.raised;
-    out property <brush> table-toolbar-surface: Theme.modern-style ? @linear-gradient(180deg, #26282a 0%, #202224 100%) : Theme.panel;
-    out property <brush> table-footer-surface: Theme.modern-style ? @linear-gradient(180deg, #202224 0%, #202224 100%) : Theme.panel;
-    out property <brush> tab-surface: Theme.modern-style ? @linear-gradient(180deg, #343537 0%, #272a2c 100%) : Theme.panel;
+    out property <color> toolbar-surface: Theme.modern-player ? #28282a : Theme.bg;
+    out property <color> rail-surface: Theme.modern-player ? #2a2b2e : Theme.panel;
+    out property <color> library-surface: Theme.modern-player ? #202224 : Theme.panel;
+    out property <color> inspector-surface: Theme.modern-player ? #202224 : Theme.panel;
+    out property <color> player-surface: Theme.modern-player ? #202225 : Theme.player;
+    out property <color> table-surface: Theme.modern-player ? #1d1f21 : Theme.panel;
+    out property <color> table-alternate: Theme.modern-player ? #1f2123 : Theme.alternate;
+    out property <brush> control-surface: Theme.modern-player ? @linear-gradient(180deg, #2e3033 0%, #25272a 100%) : Theme.raised;
+    out property <brush> control-hover-surface: Theme.modern-player ? @linear-gradient(180deg, #373a3d 0%, #2c3033 100%) : Theme.hover;
+    out property <brush> table-header-surface: Theme.modern-player ? @linear-gradient(180deg, #26282a 0%, #212325 100%) : Theme.raised;
+    out property <brush> table-toolbar-surface: Theme.modern-player ? @linear-gradient(180deg, #26282a 0%, #202224 100%) : Theme.panel;
+    out property <brush> table-footer-surface: Theme.modern-player ? @linear-gradient(180deg, #202224 0%, #202224 100%) : Theme.panel;
+    out property <brush> tab-surface: Theme.modern-player ? @linear-gradient(180deg, #343537 0%, #272a2c 100%) : Theme.panel;
     // Not themeable. Matches the pixel renderer. Frequency hues and noise-to-black are audio data.
     out property <color> spectral-canvas: #849094;
-    out property <color> normal-canvas: Theme.modern-style ? transparent : #1d2328;
+    out property <color> normal-canvas: Theme.modern-player ? transparent : #1d2328;
     // Motion. Transitions stay short and ease out; nothing bounces or travels far.
     // `motion` scales every duration below: 1 keeps the designed timing, 0 turns
     // transitions off (state changes then apply immediately).

@@ -508,9 +508,7 @@ impl RemoteCache {
         // Keep backup/registry/guard files inside the same owned subtree. The shared
         // migrator retains them for standalone jobs; this disposable cache conversion
         // can be retried from the unchanged cached source after cancellation.
-        let job = tempfile::Builder::new()
-            .prefix(".snapshot-job-")
-            .tempdir_in(&directory)?;
+        let (job, external_workspace) = crate::snapshot_staging::snapshot_job(self, &directory)?;
         let staging = job.path().join("snapshot.download");
         // Reserve our unique staging file before SQLite opens it. Error cleanup may
         // remove only this owned file and its SQLite sidecars.
@@ -591,9 +589,11 @@ impl RemoteCache {
             .checked_add(1)
             .ok_or_else(|| RemoteError::Snapshot("Local format generation overflow".into()))?;
         let target = directory.join(&name);
-        if let Err(error) = std::fs::rename(&staging, &target) {
+        if let Err(error) =
+            crate::snapshot_staging::publish_snapshot(&staging, &target, external_workspace, cancel)
+        {
             remove_owned_staging(&staging);
-            return Err(error.into());
+            return Err(error);
         }
         let mut prepared = state.clone();
         prepared.database_file = name;
@@ -760,7 +760,7 @@ fn validate_snapshot_with_progress_cancellable(
     check_cancelled(cancel)?;
     progress(CachePreparation::Validating);
     check_cancelled(cancel)?;
-    {
+    let version = {
         let conn = rusqlite::Connection::open(path)
             .map_err(|error| RemoteError::Snapshot(error.to_string()))?;
         conn.query_row("PRAGMA journal_mode=DELETE", [], |row| {
@@ -775,7 +775,8 @@ fn validate_snapshot_with_progress_cancellable(
                 "schema {version} is not supported by this client (expected {MIN_SNAPSHOT_SCHEMA}..={MAX_SNAPSHOT_SCHEMA})"
             )));
         }
-    }
+        version
+    };
     // The staging file belongs to this sync alone: check it in place (one quick_check, no
     // temporary copy of a possibly several-hundred-MB library).
     let report = SqliteProvider::check_owned_file_cancellable(path, cancel)?;
@@ -784,6 +785,13 @@ fn validate_snapshot_with_progress_cancellable(
             "integrity check failed: {}",
             serde_json::to_string(&report).unwrap_or_default()
         )));
+    }
+    if version == 9 {
+        // This is owned download staging. A completed schema-9 snapshot must
+        // satisfy its own directory contract and never enter the schema-8
+        // derived-state repair recipe, even when its markers are inconsistent.
+        SqliteProvider::validate_owned_snapshot_format_cancellable(path, cancel)?;
+        return SqliteProvider::owned_snapshot_info_cancellable(path, cancel).map_err(Into::into);
     }
     // Compatible legacy snapshots remain byte-format compatible. A new client
     // version alone is not a reason to convert a complete read-only cache to v6.
@@ -1064,9 +1072,7 @@ fn sync_library_inner(
         library.revision,
         std::process::id()
     );
-    let job = tempfile::Builder::new()
-        .prefix(".snapshot-job-")
-        .tempdir_in(&directory)?;
+    let (job, external_workspace) = crate::snapshot_staging::snapshot_job(cache, &directory)?;
     let staging = job.path().join("snapshot.download");
     let result = (|| -> Result<(SnapshotMeta, audiolib_core::LibraryInfo, CacheFormat)> {
         progress(SyncProgress::Downloading {
@@ -1211,7 +1217,7 @@ fn sync_library_inner(
         return Err(RemoteError::Snapshot("The downloaded revision is older than the current cache; the newer cache was kept. Sync again to download a fresh snapshot".into()));
     }
     let target = directory.join(&file_name);
-    std::fs::rename(&staging, &target)?;
+    crate::snapshot_staging::publish_snapshot(&staging, &target, external_workspace, cancel)?;
     let state = CacheState {
         library_id: library.library_id.clone(),
         // The snapshot header names the exact revision it was taken at (possibly newer
@@ -1706,6 +1712,176 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    fn external_test_workspace() -> tempfile::TempDir {
+        match std::env::var_os("AUDIOLIB_TEST_EXTERNAL_WORKSPACE") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("audiolib-staging-test-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn configure_test_workspace(cache: &RemoteCache, workspace: &Path) {
+        std::fs::create_dir_all(cache.root()).unwrap();
+        std::fs::write(
+            cache.root().join("snapshot-workdir.json"),
+            serde_json::to_vec(&serde_json::json!({"directory": workspace})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn external_workspace_upgrades_old_cache_and_publishes_to_original_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = external_test_workspace();
+        let cache = RemoteCache::new(directory.path());
+        let state = CacheState {
+            library_id: "lib-external".into(),
+            revision: 7,
+            schema_version: 5,
+            database_file: "library-r7-old.db".into(),
+            server_url: "http://offline.test".into(),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(cache.library_dir(&state.library_id)).unwrap();
+        let original_path = cache.database_path(&state);
+        let original = old_unicode_snapshot(directory.path());
+        std::fs::write(&original_path, &original).unwrap();
+        cache.save_state(&state).unwrap();
+        configure_test_workspace(&cache, workspace.path());
+        let mut observed_job = false;
+        let prepared = cache
+            .prepare_cached_state_with_progress(&state, &mut |stage| {
+                if matches!(stage, CachePreparation::Copying { .. }) {
+                    observed_job |=
+                        std::fs::read_dir(workspace.path())
+                            .unwrap()
+                            .flatten()
+                            .any(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with(".snapshot-job-")
+                            });
+                }
+            })
+            .unwrap();
+        assert!(observed_job);
+        assert_eq!(std::fs::read(&original_path).unwrap(), original);
+        let result = cache.database_path(&prepared);
+        assert!(result.starts_with(cache.library_dir(&state.library_id)));
+        assert_ne!(result, original_path);
+        assert_unicode_source(&SqliteProvider::open_read_only(&result).unwrap());
+        assert_eq!(cache.active().unwrap(), prepared);
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn external_workspace_handles_downloaded_legacy_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = external_test_workspace();
+        let bytes = old_unicode_snapshot(directory.path());
+        let server = TestServer::start(move |request| match request.path.as_str() {
+            "/api/v1/health" => crate::test_server::marker_health(),
+            "/api/v1/capabilities" => {
+                crate::test_server::marker_capabilities(serde_json::json!({}))
+            }
+            "/api/v1/library" => TestResponse::json(200, &library_json(8)),
+            "/api/v1/roots" => TestResponse::json(200, "[]"),
+            "/api/v1/library/snapshot" => TestResponse::bytes(200, bytes.clone())
+                .with_header("X-Library-Id", "lib-r")
+                .with_header("X-Library-Revision", "8")
+                .with_header("X-Schema-Version", "5"),
+            _ => panic!("unexpected request {}", request.path),
+        });
+        let cache = RemoteCache::new(&directory.path().join("data"));
+        configure_test_workspace(&cache, workspace.path());
+        let client = RemoteClient::new(&server.url, "").unwrap();
+        let mut observed_job = false;
+        let result = sync_library(
+            &client,
+            &cache,
+            &mut |stage| {
+                if matches!(stage, SyncProgress::Downloading { .. }) {
+                    observed_job |=
+                        std::fs::read_dir(workspace.path())
+                            .unwrap()
+                            .flatten()
+                            .any(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with(".snapshot-job-")
+                            });
+                }
+            },
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap();
+        assert!(result.downloaded && observed_job);
+        let snapshot = cache.database_path(&result.state);
+        assert!(snapshot.starts_with(cache.library_dir("lib-r")));
+        assert_unicode_source(&SqliteProvider::open_read_only(&snapshot).unwrap());
+        assert_eq!(cache.active().unwrap(), result.state);
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unavailable_or_cancelled_external_workspace_keeps_the_active_cache() {
+        for unavailable in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = external_test_workspace();
+            let cache = RemoteCache::new(directory.path());
+            let state = CacheState {
+                library_id: "lib-external-interruption".into(),
+                revision: 7,
+                schema_version: 5,
+                database_file: "library-r7-old.db".into(),
+                server_url: "http://offline.test".into(),
+                ..Default::default()
+            };
+            let library = cache.library_dir(&state.library_id);
+            std::fs::create_dir_all(&library).unwrap();
+            let original_path = cache.database_path(&state);
+            let original = old_unicode_snapshot(directory.path());
+            std::fs::write(&original_path, &original).unwrap();
+            cache.save_state(&state).unwrap();
+            configure_test_workspace(&cache, workspace.path());
+            let before_state = std::fs::read(library.join(STATE_FILE)).unwrap();
+            let before_active = std::fs::read(cache.root().join(ACTIVE_FILE)).unwrap();
+            if unavailable {
+                std::fs::remove_dir(workspace.path()).unwrap();
+            }
+            let cancel = AtomicBool::new(false);
+            let result = cache.prepare_cached_state_with_progress_cancellable(
+                &state,
+                &mut |stage| {
+                    if !unavailable && matches!(stage, CachePreparation::Copying { .. }) {
+                        cancel.store(true, Ordering::Release);
+                    }
+                },
+                &cancel,
+            );
+            assert!(result.is_err());
+            if !unavailable {
+                assert!(matches!(result, Err(RemoteError::Cancelled)));
+                assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+            }
+            assert_eq!(std::fs::read(&original_path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(library.join(STATE_FILE)).unwrap(),
+                before_state
+            );
+            assert_eq!(
+                std::fs::read(cache.root().join(ACTIVE_FILE)).unwrap(),
+                before_active
+            );
+            assert_eq!(cache.active().unwrap(), state);
         }
     }
 

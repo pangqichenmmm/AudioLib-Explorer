@@ -41,7 +41,9 @@ RUN test -n "$VERSION" \
  && test -r /opt/audiolibserver/LICENSE \
  && test -r /opt/audiolibserver/THIRD_PARTY.md \
  && test -r /opt/audiolibserver/licenses/dependencies.json \
- && chmod 755 /opt/audiolibserver/audiolib-server \
+ && test -r /opt/audiolibserver/licenses/inventory.json \
+ && test -f /opt/audiolibserver/audiolib-migrate \
+ && chmod 755 /opt/audiolibserver/audiolib-server /opt/audiolibserver/audiolib-migrate \
  && test "$(/opt/audiolibserver/audiolib-server --version)" = "audiolib-server ${VERSION%%-*}" \
  && test "$(tr -d '\r\n' < /opt/audiolibserver/update-version.txt)" = "$VERSION"
 

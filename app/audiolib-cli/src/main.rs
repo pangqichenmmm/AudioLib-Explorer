@@ -704,6 +704,7 @@ fn operation(args: &Arguments) -> anyhow::Result<Value> {
                 offset: *offset,
                 order_by,
                 descending: *descending,
+                ..Default::default()
             };
             let page = provider.search(&request)?;
             if let Some(message) = empty_library_notice(page.total_count, || {
@@ -734,12 +735,17 @@ fn operation(args: &Arguments) -> anyhow::Result<Value> {
             json!(service.scan(path, &options, &cancellation, |progress| {
                 if last_update.elapsed().as_millis() > 500 {
                     eprintln!(
-                        "scan: discovered={} processed={} added={} updated={} errors={}",
+                        "scan: discovered={} processed={} added={} updated={} errors={} vendor_tables={} vendor_matched={} vendor_updated={} vendor_unmatched={} vendor_ambiguous={}",
                         progress.discovered,
                         progress.processed,
                         progress.added,
                         progress.updated,
-                        progress.errors
+                        progress.errors,
+                        progress.vendor_metadata.tables,
+                        progress.vendor_metadata.matched,
+                        progress.vendor_metadata.updated,
+                        progress.vendor_metadata.unmatched,
+                        progress.vendor_metadata.ambiguous
                     );
                     last_update = Instant::now();
                 }
@@ -791,7 +797,7 @@ fn operation(args: &Arguments) -> anyhow::Result<Value> {
             },
         })?),
         Command::Relink { id, path } => {
-            let target = audiolib_core::validate_wav_path(path, &config.allowed_scan_roots)?;
+            let target = audiolib_core::validate_audio_path(path, &config.allowed_scan_roots)?;
             json!(provider.relink_audio(*id, &target)?)
         }
         Command::Remove { ids, .. } => json!({"removed":provider.remove_audio(ids)?}),
@@ -1460,6 +1466,7 @@ mod tests {
             audition_play_on_single_click: false,
             play_history_limit: audiolib_core::config::PLAY_HISTORY_LIMIT_PER_LIBRARY,
             show_album_artwork: true,
+            slice_export_directory: None,
             pregenerate_list_waveforms: false,
             hold_list_waveform_batches_after_audition: false,
             max_search_tasks: audiolib_core::config::DEFAULT_MAX_SEARCH_TASKS,
@@ -1474,6 +1481,7 @@ mod tests {
             allowed_scan_roots: Vec::new(),
             data_source: Default::default(),
             data_source_fallback: None,
+            search_scope: "all".into(),
         }
     }
 

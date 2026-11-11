@@ -362,7 +362,8 @@ try {
                 [Windows.Forms.Application]::DoEvents()
                 $coverTrace += 'pumped: '+[AudioLibRepaintNative]::WindowState($cover.Handle)
                 if ($action -eq 'refocus') {
-                    $coverFocusRequested = [AudioLibRepaintNative]::FocusOwnedWindow($cover.Handle,[Diagnostics.Process]::GetCurrentProcess().Id)
+                    Assert-CurrentApplicationWindow
+                    $coverFocusRequested = [AudioLibRepaintNative]::FocusFromOwnedWindow($cover.Handle,[Diagnostics.Process]::GetCurrentProcess().Id,$handle,$process.Id)
                     [Windows.Forms.Application]::DoEvents()
                 }
                 # Service the cover's UI queue during exposure so native hit

@@ -59,7 +59,7 @@ fn names(provider: &SqliteProvider, query: &str) -> BTreeSet<String> {
         .unwrap()
         .results
         .into_iter()
-        .map(|file| file.filename)
+        .map(|file| file.into_data().filename)
         .collect()
 }
 

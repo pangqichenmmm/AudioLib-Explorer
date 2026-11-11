@@ -104,7 +104,7 @@ try {
     # cc-rs retains caller global/target flags and appends these target flags last.
     [Environment]::SetEnvironmentVariable($nativeFlagKey, $combinedNativeFlags)
     [Environment]::SetEnvironmentVariable($shellFlagKey, '1')
-    cargo build -p audiolib-server --release --locked --no-default-features --target $Target
+    cargo build -p audiolib-server -p audiolib-db --bin audiolib-server --bin audiolib-migrate --release --locked --no-default-features --target $Target
     if ($LASTEXITCODE -ne 0) { throw 'Rust server release build failed.' }
 } finally {
     if ($buildLease) { $buildLease.Dispose() }

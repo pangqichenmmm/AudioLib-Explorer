@@ -322,6 +322,10 @@ impl Timeouts {
         self.apply(shared_agent().post(url))
     }
 
+    pub(crate) fn put(&self, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+        self.apply(shared_agent().put(url))
+    }
+
     pub(crate) fn patch(&self, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
         self.apply(shared_agent().patch(url))
     }

@@ -92,12 +92,23 @@ $null=Invoke-Clean @{TargetDirectory=$external} 1
 $null=Invoke-Clean @{Action='Register';TargetDirectory=$external} 1
 $registered=Invoke-Clean @{Action='Register';TargetDirectory=$external;AdoptExisting=$true}
 if($registered.status -ne 'registered'){throw 'Explicit cache registration failed.'}
-$null=Invoke-Clean @{TargetDirectory=$external}
 $marker=Join-Path $external '.audiolib-build-owner.json'
+$markerAttributes=[IO.File]::GetAttributes($marker)
+try{
+    # Dotfiles are hidden on Unix; Windows requires the real Hidden attribute.
+    if($IsWindows){[IO.File]::SetAttributes($marker,($markerAttributes -bor [IO.FileAttributes]::Hidden))}
+    if(!((Get-Item -LiteralPath $marker -Force).Attributes -band [IO.FileAttributes]::Hidden)){throw 'Ownership regression requires a genuinely hidden marker.'}
+    $hiddenPreview=Invoke-Clean @{Action='Plan';TargetDirectory=$external}
+    if($hiddenPreview.status -ne 'planned' -or $hiddenPreview.ownership -ne 'registered' -or $hiddenPreview.removed_bytes -ne 0){throw 'Hidden cache ownership was not recognized safely during preview.'}
+    $hiddenRun=Invoke-Clean @{TargetDirectory=$external}
+    if($hiddenRun.status -ne 'passed' -or $hiddenRun.ownership -ne 'registered' -or $hiddenRun.removed_bytes -le 0 -or !(Test-Path -LiteralPath $marker) -or !(Test-Path -LiteralPath (Join-Path $external 'x86_64-pc-windows-msvc/release/app.exe'))){throw 'Hidden-marker cleanup lost ownership or exceeded the debug boundary.'}
+}finally{
+    if($IsWindows -and (Test-Path -LiteralPath $marker)){[IO.File]::SetAttributes($marker,$markerAttributes)}
+}
 @{schema_version=1;owner_id='foreign';host=[Environment]::MachineName}|ConvertTo-Json|Set-Content -LiteralPath $marker -Encoding utf8
 $null=Invoke-Clean @{TargetDirectory=$external;Mode='All'} 1
 if(!(Test-Path -LiteralPath (Join-Path $external 'x86_64-pc-windows-msvc/release/app.exe'))){throw 'Foreign-owned cache was deleted.'}
-Write-Host 'PASS: external caches require explicit adoption; foreign ownership refused.'
+Write-Host 'PASS: external caches require explicit adoption; hidden owner markers support preview/cleanup; foreign ownership refused.'
 $realCompilers=@(Microsoft.PowerShell.Management\Get-Process | Where-Object ProcessName -match '^(cargo|rustc|rustdoc|clippy-driver|clang|clang\+\+|gcc|g\+\+|cc1|cc1plus|link|lld|lld-link|cl)$')
 if($realCompilers.Count){Write-Host 'Pipeline cleanup integration: not-run (another real compiler is active).'}else{
     $tools=Join-Path $taskRoot 'tools'

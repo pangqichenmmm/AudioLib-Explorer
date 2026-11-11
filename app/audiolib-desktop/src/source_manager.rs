@@ -19,7 +19,9 @@ use super::{
 };
 use crate::{AppWindow, ServerRootRow, SourceRow};
 use audiolib_core::config::DEFAULT_LOCAL_LIBRARY_ID;
-use audiolib_core::config::{ActiveSource, DataSourceMode, DataSourceSettings, TestSummary};
+use audiolib_core::config::{
+    ActiveSource, AppConfig, DataSourceMode, DataSourceSettings, TestSummary,
+};
 use audiolib_core::profiles::{MAX_PROFILE_NAME_CHARS, ServerProfile, same_server_url};
 use audiolib_core::{ScanSession, ScanState};
 use audiolib_remote::{
@@ -47,6 +49,19 @@ const PAGE_CACHE: i32 = 2;
 /// `sm-open-requested` focus values.
 const FOCUS_LIBRARY: i32 = 1;
 const FOCUS_HISTORY: i32 = 2;
+
+/// Persist only shared polling preferences against the latest acknowledged configuration.
+fn store_shared_sync_preferences(
+    config: &mut AppConfig,
+    settings: &DataSourceSettings,
+) -> Result<(), String> {
+    let mut preferences = config.clone();
+    preferences.data_source.poll_interval_secs = settings.poll_interval_secs;
+    preferences.data_source.auto_sync = settings.auto_sync;
+    preferences.save().map_err(|error| error.to_string())?;
+    *config = preferences;
+    Ok(())
+}
 
 #[path = "source_roots.rs"]
 mod source_roots;
@@ -240,6 +255,8 @@ impl Controller {
         ui.on_sm_save_requested(move || c.save_selected(AfterSave::Nothing));
         let c = self.clone();
         ui.on_shared_sync_save_requested(move || c.save_shared_sync_settings());
+        let c = self.clone();
+        ui.on_global_settings_opened(move || c.open_global_settings());
         let c = self.clone();
         ui.on_sm_pending_save_requested(move |index| {
             c.save_selected(if index == -3 {
@@ -594,10 +611,6 @@ impl Controller {
         );
         ui.set_ds_transcode_touched(false);
         ui.set_ds_transcode(edit_transcode(profile.as_ref(), &url));
-        if !ui.get_shared_sync_dirty() {
-            ui.set_ds_poll_interval(settings.poll_interval_secs.to_string().into());
-            ui.set_ds_auto_sync(settings.auto_sync);
-        }
         self.remote.lock().unwrap().manager.last_report = None;
         ui.set_ds_report("".into());
         ui.set_ds_public_url("".into());
@@ -639,7 +652,6 @@ impl Controller {
         ui.set_sm_root_form(false);
         ui.set_sm_fs_visible(false);
         ui.set_sm_fs_busy(false);
-        self.refresh_detail_cache(false);
         match page {
             PAGE_LIBRARY => self.load_server_library(&ui),
             PAGE_CACHE => {
@@ -712,50 +724,80 @@ impl Controller {
         edit_transcode(self.selected_profile().as_ref(), url)
     }
 
-    /// Read shared synchronization fields while preserving settings-file WebDAV configuration.
+    /// Start one global-settings session without touching connection drafts or selection.
+    fn open_global_settings(self: &Arc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if ui.get_shared_sync_busy() {
+            return;
+        }
+        let settings = self.config.lock().unwrap().data_source.clone();
+        ui.set_ds_poll_interval(settings.poll_interval_secs.to_string().into());
+        ui.set_ds_auto_sync(settings.auto_sync);
+        ui.set_shared_sync_dirty(false);
+        ui.set_shared_sync_message("".into());
+        ui.set_artwork_message("".into());
+        self.refresh_detail_cache(false);
+    }
+
+    /// Read only the global polling fields; unrelated connection settings stay untouched.
     fn shared_form(&self, ui: &AppWindow) -> DataSourceSettings {
-        let mut settings = self.config.lock().unwrap().data_source.clone();
         let interval = ui.get_ds_poll_interval();
         let interval = interval.trim();
         // Empty means the default; anything unparsable fails validation with a message.
-        settings.poll_interval_secs = if interval.is_empty() {
+        let poll_interval_secs = if interval.is_empty() {
             audiolib_core::config::DEFAULT_POLL_INTERVAL_SECS
         } else {
             interval.parse().unwrap_or(u32::MAX)
         };
-        settings.auto_sync = ui.get_ds_auto_sync();
-        settings
+        DataSourceSettings {
+            poll_interval_secs,
+            auto_sync: ui.get_ds_auto_sync(),
+            ..Default::default()
+        }
     }
 
     /// Persist global polling preferences without replacing the active provider or drafts.
     fn save_shared_sync_settings(self: &Arc<Self>) {
         let Some(ui) = self.ui.upgrade() else { return };
-        if !self.available() || ui.get_ds_applying() {
+        if ui.get_shared_sync_busy() {
             return;
         }
         let chinese = self.chinese.load(Ordering::Acquire);
-        let settings = self.shared_form(&ui);
-        let mut checked = settings.clone();
-        checked.mode = DataSourceMode::Local;
-        if let Err(error) = checked.validate() {
-            ui.set_ds_message(error.to_string().into());
+        if !self.available() {
+            ui.set_settings_close_pending(false);
+            ui.set_settings_exit_pending(false);
+            ui.set_shared_sync_message(
+                cn_or(
+                    chinese,
+                    "当前操作结束后再保存同步设置。",
+                    "Save synchronization settings after the current operation finishes.",
+                )
+                .into(),
+            );
             return;
         }
-        ui.set_ds_applying(true);
+        let settings = self.shared_form(&ui);
+        if let Err(error) = settings.validate() {
+            ui.set_settings_close_pending(false);
+            ui.set_settings_exit_pending(false);
+            ui.set_shared_sync_message(error.to_string().into());
+            return;
+        }
+        ui.set_shared_sync_busy(true);
+        ui.set_shared_sync_message(cn_or(chinese, "正在保存…", "Saving…").into());
         let c = self.clone();
         std::thread::spawn(move || {
-            let result = c.update_sources(chinese, false, |stored, _| {
-                stored.poll_interval_secs = settings.poll_interval_secs;
-                stored.auto_sync = settings.auto_sync;
-                Ok(())
-            });
+            let result = {
+                let mut config = c.config.lock().unwrap();
+                store_shared_sync_preferences(&mut config, &settings)
+            };
             let c2 = c.clone();
             post(c.ui.clone(), move |ui| {
-                ui.set_ds_applying(false);
+                ui.set_shared_sync_busy(false);
                 match result {
                     Ok(()) => {
                         ui.set_shared_sync_dirty(false);
-                        ui.set_ds_message(
+                        ui.set_shared_sync_message(
                             cn_or(
                                 c2.chinese.load(Ordering::Acquire),
                                 "同步设置已保存。",
@@ -764,12 +806,17 @@ impl Controller {
                             .into(),
                         );
                         c2.wake_revision_poller();
-                        if ui.get_shared_sync_close_pending() {
-                            ui.set_shared_sync_close_pending(false);
-                            ui.invoke_close_library_manager();
+                        if ui.get_settings_close_pending() {
+                            ui.invoke_continue_settings_close();
+                        } else if ui.get_settings_exit_pending() {
+                            ui.invoke_request_close_settings();
                         }
                     }
-                    Err(error) => ui.set_ds_message(error.into()),
+                    Err(error) => {
+                        ui.set_settings_close_pending(false);
+                        ui.set_settings_exit_pending(false);
+                        ui.set_shared_sync_message(error.into());
+                    }
                 }
             });
         });
@@ -1266,7 +1313,9 @@ impl Controller {
                 return;
             }
         };
-        let mut settings = self.shared_form(&ui);
+        // Connection tests use acknowledged global settings, independently of any
+        // pending or discarded draft in the global-settings window.
+        let mut settings = self.config.lock().unwrap().data_source.clone();
         settings.server_url = url.clone();
         let profile = self.selected_profile();
         let active = profile.as_ref().is_some_and(|profile| {
@@ -2727,6 +2776,12 @@ fn scan_text(scan: Option<&ServerScan>, chinese: bool) -> String {
             progress.errors
         )
     };
+    let vendor =
+        audiolib_core::vendor_import::automatic_scan_summary(&progress.vendor_metadata, chinese);
+    if !vendor.is_empty() {
+        text.push('\n');
+        text.push_str(&vendor);
+    }
     if !progress.current_path.is_empty() {
         text.push('\n');
         text.push_str(&progress.current_path);
@@ -2796,6 +2851,270 @@ mod tests {
     use super::super::RemoteRuntime;
     use super::*;
     use audiolib_core::{DataProvider, ScanProgress};
+
+    #[test]
+    fn shared_sync_save_preserves_connection_and_unrelated_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "language": "en",
+                "active_database": root.path().join("library.db")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = AppConfig::load_in(root.path().to_path_buf()).unwrap();
+        config.language = "cn".into();
+        config.theme = audiolib_core::config::STUDIO_THEME.into();
+        config.data_source.audition_memory_mb = 1024;
+        config.data_source.webdav.username = "saved-user".into();
+        config.data_source.profiles.push(ServerProfile {
+            id: "saved-server".into(),
+            name: "Saved server".into(),
+            server_url: "https://server.example.test".into(),
+            transcode: Some(false),
+            ..Default::default()
+        });
+        config.save().unwrap();
+        let mut expected = serde_json::to_value(&config).unwrap();
+        expected["data_source"]["poll_interval_secs"] = 90.into();
+        expected["data_source"]["auto_sync"] = true.into();
+        let requested = DataSourceSettings {
+            poll_interval_secs: 90,
+            auto_sync: true,
+            // Only the two global fields may reach the stored connection settings.
+            server_url: "https://different.example.test".into(),
+            audition_memory_mb: 32,
+            ..Default::default()
+        };
+
+        store_shared_sync_preferences(&mut config, &requested).unwrap();
+
+        assert_eq!(serde_json::to_value(&config).unwrap(), expected);
+        let saved = AppConfig::load_in(root.path().to_path_buf()).unwrap();
+        assert_eq!(saved.data_source.poll_interval_secs, 90);
+        assert!(saved.data_source.auto_sync);
+        assert_eq!(saved.data_source.audition_memory_mb, 1024);
+        assert_eq!(saved.data_source.webdav.username, "saved-user");
+        assert_eq!(saved.data_source.profiles[0].id, "saved-server");
+        assert_eq!(saved.data_source.profiles[0].transcode, Some(false));
+        assert_eq!(saved.language, "cn");
+        assert_eq!(saved.theme, audiolib_core::config::STUDIO_THEME);
+    }
+
+    #[test]
+    fn failed_shared_sync_save_keeps_acknowledged_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "language": "en",
+                "active_database": root.path().join("library.db")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = AppConfig::load_in(root.path().to_path_buf()).unwrap();
+        config.save().unwrap();
+        let saved_before = std::fs::read(&config.paths.settings).unwrap();
+        let blocked = root.path().join("settings-destination-is-a-directory");
+        std::fs::create_dir(&blocked).unwrap();
+        config.paths.settings = blocked;
+        let expected = serde_json::to_value(&config).unwrap();
+        let requested = DataSourceSettings {
+            poll_interval_secs: 90,
+            auto_sync: true,
+            ..Default::default()
+        };
+
+        assert!(store_shared_sync_preferences(&mut config, &requested).is_err());
+
+        assert_eq!(serde_json::to_value(&config).unwrap(), expected);
+        assert_eq!(
+            std::fs::read(root.path().join("settings.json")).unwrap(),
+            saved_before
+        );
+    }
+
+    #[test]
+    fn connection_test_uses_saved_settings_after_discarding_global_sync_edits() {
+        super::super::source_transition_tests::isolated_module(
+            "source_manager::tests",
+            "child_connection_test_ignores_sync_drafts",
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated connection probe with discarded synchronization edits"]
+    fn child_connection_test_ignores_sync_drafts() {
+        use super::super::source_transition_tests::{configuration, request, root as test_root};
+        use audiolib_audio::{AudioEngine, PlaybackConfig};
+        use audiolib_db::SqliteProvider;
+        use i_slint_backend_testing::ElementHandle;
+        use slint::ComponentHandle;
+        use std::io::Write;
+
+        i_slint_backend_testing::init_integration_test_with_system_time();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let typed_url = format!("http://{}", listener.local_addr().unwrap());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stopped = stopped.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while !server_stopped.load(Ordering::Acquire)
+                && started.elapsed() < Duration::from_secs(10)
+            {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("mock connection probe: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                // The connectivity step opens a TCP socket without an HTTP request.
+                if socket.peek(&mut [0]).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request = request(&mut socket);
+                let status = if request.starts_with("GET /api/v1/health ") {
+                    // Preserve cached roots while the server API is unavailable.
+                    "404 Not Found"
+                } else if request.starts_with("PROPFIND /saved-dav/ ") {
+                    "207 Multi-Status"
+                } else {
+                    panic!("unexpected connection probe: {request}");
+                };
+                sent.send(request).unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let fixture_root = test_root();
+        let config = configuration(&fixture_root.join("preferences"));
+        let provider = Arc::new(SqliteProvider::open(&config.paths.database).unwrap());
+        let playback = PlaybackConfig {
+            volume: 0.0,
+            ..Default::default()
+        };
+        let engine = AudioEngine::new(playback.clone()).unwrap();
+        let ui = AppWindow::new().unwrap();
+        let controller = Controller::new(&ui, provider, engine.handle(), config, playback);
+        {
+            let mut config = controller.config.lock().unwrap();
+            config.data_source = DataSourceSettings {
+                mode: DataSourceMode::Server,
+                server_url: "http://127.0.0.1:9".into(),
+                active: Some("saved-profile".into()),
+                poll_interval_secs: 120,
+                profiles: vec![ServerProfile {
+                    id: "saved-profile".into(),
+                    name: "Saved profile".into(),
+                    server_url: "http://127.0.0.1:9".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            config.data_source.webdav.username = "u".into();
+            config
+                .data_source
+                .webdav
+                .root_urls
+                .insert("ActiveOnly".into(), format!("{typed_url}/saved-dav"));
+            config.save().unwrap();
+        }
+        {
+            let mut remote = controller.remote.lock().unwrap();
+            remote.live_roots = Some(vec![root("ActiveOnly")]);
+            remote.secrets_loaded = true;
+            remote.secrets.webdav_password = "p".into();
+        }
+        ui.show().unwrap();
+        ui.invoke_open_global_settings(3);
+        ui.set_ds_poll_interval("discarded invalid interval".into());
+        ui.set_ds_auto_sync(true);
+        ui.set_shared_sync_dirty(true);
+        ui.invoke_request_close_settings();
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        ElementHandle::find_by_accessible_label(&ui, "Discard and close")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+        assert!(!ui.get_settings_visible());
+        assert!(!ui.get_shared_sync_dirty());
+        ui.invoke_open_data_source();
+        assert_eq!(ui.get_ds_poll_interval(), "discarded invalid interval");
+        ui.set_ds_server_url(typed_url.clone().into());
+        ui.invoke_data_source_test_requested();
+        assert!(ui.get_ds_testing());
+        let weak = ui.as_weak();
+        let started = std::time::Instant::now();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(10),
+            move || {
+                if !weak.upgrade().unwrap().get_ds_testing()
+                    || started.elapsed() > Duration::from_secs(8)
+                {
+                    slint::quit_event_loop().unwrap();
+                }
+            },
+        );
+        slint::run_event_loop().unwrap();
+        timer.stop();
+        stopped.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert!(!ui.get_ds_testing(), "connection probe did not finish");
+        let report = controller
+            .remote
+            .lock()
+            .unwrap()
+            .manager
+            .last_report
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        assert_eq!(report.server_url.as_deref(), Some(typed_url.as_str()));
+        assert_eq!(report.roots.len(), 1);
+        assert_eq!(report.roots[0].name, "ActiveOnly");
+        let expected_webdav_url = format!("{typed_url}/saved-dav");
+        assert!(report.steps.iter().any(|step| {
+            step.target == "ActiveOnly"
+                && step.ok
+                && step.url.as_deref() == Some(expected_webdav_url.as_str())
+        }));
+        let requests: Vec<_> = received.try_iter().collect();
+        let webdav = requests
+            .iter()
+            .find(|request| request.starts_with("PROPFIND /saved-dav/ "))
+            .expect("saved WebDAV override must be tested for the active cached root");
+        assert!(webdav.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("Authorization") && value.trim() == "Basic dTpw"
+            })
+        }));
+        let config = controller.config.lock().unwrap();
+        assert_eq!(config.data_source.poll_interval_secs, 120);
+        assert!(!config.data_source.auto_sync);
+        assert_eq!(
+            config.data_source.active_source(),
+            ActiveSource::Profile("saved-profile".into())
+        );
+        drop(config);
+        controller.shutdown();
+        ui.hide().unwrap();
+    }
 
     #[test]
     fn mirror_folder_resolution_rejects_other_endpoints_and_missing_snapshots() {

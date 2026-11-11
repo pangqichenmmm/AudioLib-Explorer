@@ -2,7 +2,7 @@
 //! Isolated regressions for automatic server refresh during audition and search retention.
 use super::super::*;
 use super::source_transition_tests::{
-    configuration, isolated_module, request, respond, root, run_until,
+    CapabilityProbeServer, configuration, isolated_module, request, respond, root, run_until,
 };
 use super::*;
 use audiolib_core::config::{ActiveSource, ServerProfile};
@@ -648,9 +648,8 @@ fn play_source_switch(transition: PlayTransition) {
         state.revision,
         std::fs::read(b_snapshot).unwrap(),
     );
-    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url_a = format!("http://{}", a.local_addr().unwrap());
-    a.set_nonblocking(true).unwrap();
+    let a = CapabilityProbeServer::start();
+    let url_a = a.url.clone();
     state.server_url = url_a.clone();
     let cache = RemoteCache::new(&controller.data_root());
     cache.save_state(&state).unwrap();
@@ -746,7 +745,11 @@ fn play_source_switch(transition: PlayTransition) {
                     state.revision == 1 && cached_source_matches(&state.server_url, &url_b)
                 })
     });
-    assert!(matches!(a.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    // A completed provider swap refreshes /capabilities. The strict mock rejects
+    // every play, mutation or snapshot request instead of rejecting this read.
+    if !snapshot_swap {
+        assert_eq!(a.request_count(), 0);
+    }
     assert!(history_path.is_file());
     assert_eq!(local_history.page(10, 0).unwrap().len(), 2);
     if close {
@@ -763,6 +766,7 @@ fn play_source_switch(transition: PlayTransition) {
                 .is_none()
         );
         controller.shutdown();
+        a.finish();
         b.finish();
         return;
     }
@@ -792,6 +796,7 @@ fn play_source_switch(transition: PlayTransition) {
         );
         controller.shutdown();
         ui.hide().unwrap();
+        a.finish();
         b.finish();
         return;
     }
@@ -817,5 +822,6 @@ fn play_source_switch(transition: PlayTransition) {
     );
     controller.shutdown();
     ui.hide().unwrap();
+    a.finish();
     b.finish();
 }

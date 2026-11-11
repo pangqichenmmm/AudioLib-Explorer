@@ -23,8 +23,9 @@ COPY . .
 # The repository's .cargo/config.toml pins a Windows default target, so pass the host
 # target explicitly (also makes the output path predictable).
 RUN HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')" \
- && cargo build --release --locked -p audiolib-server --target "$HOST_TARGET" \
- && install -D -m 755 "target/$HOST_TARGET/release/audiolib-server" /out/audiolib-server
+ && cargo build --release --locked --no-default-features -p audiolib-server -p audiolib-db --bin audiolib-server --bin audiolib-migrate --target "$HOST_TARGET" \
+ && install -D -m 755 "target/$HOST_TARGET/release/audiolib-server" /out/audiolib-server \
+ && install -D -m 755 "target/$HOST_TARGET/release/audiolib-migrate" /out/audiolib-migrate
 
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 # ffmpeg is OPTIONAL: it is only used for /audio/{id}/preview?codec=flac. Without it the
@@ -38,6 +39,7 @@ RUN apt-get update \
  && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin audiolib \
  && install -d -o audiolib -g audiolib /data /config /music
 COPY --from=builder /out/audiolib-server /usr/local/bin/audiolib-server
+COPY --from=builder /out/audiolib-migrate /usr/local/bin/audiolib-migrate
 COPY server/deploy/docker/config.docker.toml /config/config.toml
 USER audiolib
 WORKDIR /data

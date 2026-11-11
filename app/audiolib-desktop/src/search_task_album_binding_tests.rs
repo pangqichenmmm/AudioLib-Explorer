@@ -21,7 +21,12 @@ fn provider(path: &Path, names: &[&str]) -> Arc<SqliteProvider> {
 }
 
 fn task(provider: &SqliteProvider, id: i64) -> SearchTask {
-    let album = provider.get_audio(id).unwrap().album_entity.unwrap();
+    let album = provider
+        .get_audio(id)
+        .unwrap()
+        .into_data()
+        .album_entity
+        .unwrap();
     SearchTask {
         id: format!("task-{id}"),
         title: album.name.clone(),
@@ -245,7 +250,7 @@ fn relocated_roots_keep_open_and_saved_album_filters_on_the_same_live_entity() {
     );
     // Retirement remains unavailable even though live root relocation is admitted.
     provider
-        .remove_folder(current.album_entity.unwrap().folder_id.unwrap())
+        .remove_folder(current.album_entity.as_ref().unwrap().folder_id.unwrap())
         .unwrap();
     assert!(resolve_album_filter(&provider, &mut workspace.session.tasks[0].definition).unwrap());
 }
@@ -342,7 +347,7 @@ fn fresh_album_dispatch(known: bool, cancel_with_short_query: bool) {
         AppConfig::load_in(preferences).unwrap(),
         playback,
     );
-    let album = next.get_audio(1).unwrap().album_entity.unwrap();
+    let album = next.get_audio(1).unwrap().into_data().album_entity.unwrap();
     controller.remember_task_album_bindings(
         if known {
             next.album_namespace()
@@ -521,7 +526,7 @@ fn child_unavailable_album_gate() {
     );
     // Facet publication owns C's identity. Its reused numeric ID must neither
     // highlight it as A nor make the first explicit click toggle to no filter.
-    let available = next.get_audio(1).unwrap().album_entity.unwrap();
+    let available = next.get_audio(1).unwrap().into_data().album_entity.unwrap();
     controller.remember_task_album_bindings(next.album_namespace(), [available.clone()]);
     ui.set_albums(ModelRc::new(VecModel::from(vec![crate::AlbumRow {
         id: available.id.to_string().into(),

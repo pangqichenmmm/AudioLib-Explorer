@@ -79,6 +79,9 @@ thread_local! {
 }
 
 fn handle_event(window: &slint::Window, event: &WindowEvent) {
+    if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+        crate::waveform_cursor::scale_factor_changed();
+    }
     match event {
         WindowEvent::Focused(true) | WindowEvent::Occluded(false) => {
             FULL_REPAINT_PENDING.with(|pending| pending.set(true));

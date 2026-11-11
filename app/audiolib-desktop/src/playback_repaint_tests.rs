@@ -1,5 +1,5 @@
 // app/audiolib-desktop/src/playback_repaint_tests.rs
-//! Playback cost guard for every theme. The window uses Slint's software renderer
+//! Playback pixel correctness and cost guards. The window uses Slint's software renderer
 //! with partial repaint, so a playback frame costs about the area it repaints.
 //! While the playhead moves, a frame may repaint the playhead, the edge of the
 //! played region and the changing labels, never the played waveform or the window.
@@ -12,6 +12,7 @@ use slint::platform::software_renderer::{
 };
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -147,5 +148,142 @@ fn playback_repaints_only_around_the_playhead_in_every_theme() {
                 );
             }
         }
+    }
+}
+
+slint::slint! {
+    import { PlayedRegion } from "../ui/audition-panel.slint";
+
+    export component PlayedRegionProbe inherits Window {
+        in property <float> head;
+        in property <float> offset;
+        in property <float> y-offset;
+        in property <float> extent;
+        in property <bool> faded;
+        width: 640px;
+        height: 110px;
+        background: #202428;
+        wave := Rectangle {
+            x: 10px + root.offset * 1px;
+            y: 10px + root.y-offset * 1px;
+            width: root.extent * 1px;
+            height: 80.5px;
+            background: #849094;
+            clip: true;
+            PlayedRegion {
+                width: parent.width;
+                height: parent.height;
+                fraction: root.head * 1px / parent.width;
+                position: root.head;
+                duration: root.extent;
+                tint: #183c3428;
+                faded: root.faded;
+            }
+        }
+    }
+}
+
+#[test]
+fn played_region_partial_repaint_matches_full_at_fractional_pixel_offsets() {
+    use slint::platform::WindowEvent;
+    use slint::private_unstable_api::re_exports::{LogicalRect, WindowInner};
+    use std::cell::RefCell;
+
+    struct PixelPlatform {
+        windows: RefCell<VecDeque<Rc<MinimalSoftwareWindow>>>,
+        now: Rc<Cell<Duration>>,
+    }
+    impl slint::platform::Platform for PixelPlatform {
+        fn create_window_adapter(
+            &self,
+        ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+            Ok(self.windows.borrow_mut().pop_front().unwrap())
+        }
+
+        fn duration_since_start(&self) -> Duration {
+            self.now.get()
+        }
+    }
+
+    let cases = [
+        (1.0_f32, 0.0_f32, 0.0_f32, 600.0_f32),
+        (1.0, 0.5, 0.5, 599.5),
+        (1.25, 0.1, 0.3, 600.0),
+        (1.25, 0.1, 0.5, 600.5),
+        (1.5, 0.0, 0.0, 600.0),
+        (1.5, 0.5, 0.5, 599.5),
+        (1.75, 0.5, 0.5, 599.5),
+        (2.0, 0.25, 0.75, 600.5),
+    ];
+    let windows: Vec<_> = (0..cases.len() * 2)
+        .map(|_| MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer))
+        .collect();
+    let now = Rc::new(Cell::new(Duration::ZERO));
+    slint::platform::set_platform(Box::new(PixelPlatform {
+        windows: RefCell::new(windows.iter().cloned().collect()),
+        now: now.clone(),
+    }))
+    .unwrap();
+    for (case, (scale, offset, y_offset, extent)) in cases.into_iter().enumerate() {
+        let partial = PlayedRegionProbe::new().unwrap();
+        let full = PlayedRegionProbe::new().unwrap();
+        let width = (640.0 * scale).round() as usize;
+        let height = (110.0 * scale).round() as usize;
+        for ui in [&partial, &full] {
+            ui.window().dispatch_event(WindowEvent::ScaleFactorChanged {
+                scale_factor: scale,
+            });
+            ui.window()
+                .set_size(slint::PhysicalSize::new(width as u32, height as u32));
+            ui.set_offset(offset);
+            ui.set_y_offset(y_offset);
+            ui.set_extent(extent);
+            ui.show().unwrap();
+        }
+        let mut actual = vec![slint::Rgb8Pixel::default(); width * height];
+        let mut expected = actual.clone();
+        let mut heads = vec![0.0, 0.5];
+        for boundary in 1..=18 {
+            for delta in [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5] {
+                heads.push(boundary as f32 * 32.0 + delta);
+            }
+        }
+        // These also catch f32 re-composition just below a physical pixel edge.
+        heads.extend([128.8925, 546.0, extent - 0.5, extent]);
+        // Cross each seam in both directions, then exercise the Ended tint.
+        for faded in [false, true] {
+            partial.set_faded(faded);
+            full.set_faded(faded);
+            for head in heads.iter().chain(heads.iter().rev()) {
+                partial.set_head(*head);
+                full.set_head(*head);
+                now.set(now.get() + Duration::from_micros(16_667));
+                slint::platform::update_timers_and_animations();
+                windows[case * 2].draw_if_needed(|renderer| {
+                    renderer.render(&mut actual, width);
+                });
+                // Independent full repaint of the same production component is
+                // the oracle; area-only checks cannot catch a missing tile edge.
+                let size = full.window().size().to_logical(scale);
+                WindowInner::from_pub(full.window())
+                    .window_adapter()
+                    .renderer()
+                    .mark_dirty_region(
+                        LogicalRect::new([0.0, 0.0].into(), [size.width, size.height].into())
+                            .into(),
+                    );
+                full.window().request_redraw();
+                windows[case * 2 + 1].draw_if_needed(|renderer| {
+                    renderer.render(&mut expected, width);
+                });
+                let mismatches = actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    mismatches, 0,
+                    "scale {scale}, offset {offset}/{y_offset}, extent {extent}, head {head}, faded {faded}: partial repaint left stale pixels"
+                );
+            }
+        }
+        partial.hide().unwrap();
+        full.hide().unwrap();
     }
 }

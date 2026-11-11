@@ -338,9 +338,16 @@ impl From<audiolib_core::Error> for ApiError {
         use audiolib_core::Error;
         let message = error.to_string();
         match error {
+            Error::Validation(message) if message.starts_with("CURSOR_STALE") => {
+                Self::new(StatusCode::CONFLICT, "CURSOR_STALE", message)
+            }
             Error::Validation(_) => Self::new(StatusCode::BAD_REQUEST, "VALIDATION", message),
             Error::NotFound(_) => Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message),
             Error::Busy(_) => Self::new(StatusCode::CONFLICT, "BUSY", message),
+            Error::Migration { refusal, .. } => Self {
+                retry_after: Some("30"),
+                ..Self::new(StatusCode::SERVICE_UNAVAILABLE, refusal.code(), message)
+            },
             Error::Cancelled => Self::new(StatusCode::CONFLICT, "CANCELLED", message),
             Error::Database(_) | Error::NewerDatabase { .. } => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE", message)

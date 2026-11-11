@@ -153,12 +153,87 @@ fn reopening_output_form_restores_acknowledged_configuration() {
     ui.set_buffer_frames("bad draft".into());
     ui.set_pair_index("9".into());
     ui.set_source_pair("8".into());
+    ui.set_output_dirty(true);
     controller.restore_output_form(&ui);
     assert_eq!(ui.get_backend_index(), 1);
     assert_eq!(ui.get_rate_index(), 1);
     assert_eq!(ui.get_buffer_frames(), "256");
     assert_eq!(ui.get_pair_index(), "3");
     assert_eq!(ui.get_source_pair(), "2");
+    assert!(!ui.get_output_dirty());
+    controller.shutdown();
+}
+
+#[test]
+fn rejected_output_draft_stays_open_and_stops_the_close_save_chain() {
+    let (_root, ui, _engine, controller) = fixture();
+    let saved_playback = controller.config.lock().unwrap().playback.clone();
+    ui.set_settings_visible(true);
+    ui.set_settings_page(0);
+    ui.set_output_dirty(true);
+    ui.set_shared_sync_dirty(true);
+    ui.set_settings_close_pending(true);
+    ui.set_settings_exit_pending(true);
+    ui.set_buffer_frames("invalid buffer draft".into());
+
+    controller.apply_output(&ui, false);
+
+    assert!(ui.get_settings_visible());
+    assert_eq!(ui.get_settings_page(), 0);
+    assert_eq!(ui.get_buffer_frames(), "invalid buffer draft");
+    assert!(ui.get_output_dirty());
+    assert!(ui.get_shared_sync_dirty());
+    assert!(!ui.get_settings_close_pending());
+    assert!(!ui.get_settings_exit_pending());
+    assert!(!ui.get_output_applying());
+    assert!(ui.get_device_info().contains("Buffer"));
+    assert_eq!(controller.config.lock().unwrap().playback, saved_playback);
+    controller.shutdown();
+}
+
+#[test]
+fn repeated_audio_apply_while_busy_preserves_the_existing_close_chain() {
+    let (_root, ui, _engine, controller) = fixture();
+    ui.set_settings_visible(true);
+    ui.set_output_dirty(true);
+    ui.set_output_applying(true);
+    ui.set_settings_close_pending(true);
+    ui.set_settings_exit_pending(true);
+    controller.apply_output(&ui, false);
+    assert!(ui.get_settings_close_pending());
+    assert!(ui.get_settings_exit_pending());
+    assert!(ui.get_output_dirty());
+    ui.set_output_applying(false);
+    controller.shutdown();
+}
+
+#[test]
+fn application_close_waits_for_global_settings_drafts_and_active_saves() {
+    let (_root, ui, _engine, controller) = fixture();
+    ui.set_settings_visible(true);
+    for (audio_dirty, sync_dirty, audio_busy, sync_busy) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        ui.set_output_dirty(audio_dirty);
+        ui.set_shared_sync_dirty(sync_dirty);
+        ui.set_output_applying(audio_busy);
+        ui.set_shared_sync_busy(sync_busy);
+        ui.set_settings_exit_pending(false);
+
+        controller.request_close(&ui);
+
+        assert!(ui.get_settings_visible());
+        assert!(ui.get_settings_exit_pending());
+        assert!(!ui.get_closing());
+        assert!(!controller.closing.load(Ordering::Acquire));
+        assert!(
+            !ui.get_settings_close_pending(),
+            "app Quit must not grant consent to apply settings"
+        );
+    }
     controller.shutdown();
 }
 

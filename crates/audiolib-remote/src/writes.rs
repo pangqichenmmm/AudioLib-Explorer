@@ -177,11 +177,22 @@ pub fn apply_server_write(
 }
 
 /// Metadata writes for one server library, applied to its local cache.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RemoteWriter {
     client: RemoteClient,
     cache: RemoteCache,
     library_id: String,
+    migration_listener: Option<WriteListener>,
+}
+
+impl std::fmt::Debug for RemoteWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteWriter")
+            .field("client", &self.client)
+            .field("cache", &self.cache)
+            .field("library_id", &self.library_id)
+            .finish()
+    }
 }
 
 impl RemoteWriter {
@@ -193,11 +204,30 @@ impl RemoteWriter {
             client: client.bind_library(&library_id),
             cache,
             library_id,
+            migration_listener: None,
         }
     }
 
     pub fn library_id(&self) -> &str {
         &self.library_id
+    }
+
+    /// Retry a write the server refused only because a migration is in progress
+    /// (`migration_in_progress` / `migration_switching`). Those refusals wrote nothing.
+    fn during_migration<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        crate::retry_during_migration(5, std::thread::sleep, || {
+            let result = op();
+            if let Err(error) = &result
+                && let Some((refusal, delay)) = error.migration_refusal()
+                && let Some(listener) = &self.migration_listener
+            {
+                listener(WriteEvent::MigrationWaiting {
+                    refusal,
+                    retry_after: refusal.retry_after(delay),
+                });
+            }
+            result
+        })
     }
 
     /// The API client (capabilities, root checks and server scans, which are not
@@ -240,7 +270,7 @@ impl RemoteWriter {
         let _write = WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(self.removed(self.client.remove_audio(ids)?))
+        Ok(self.removed(self.during_migration(|| self.client.remove_audio(ids))?))
     }
 
     /// `DELETE /folders/{id}`: database records only (files untouched), then a sync.
@@ -248,7 +278,7 @@ impl RemoteWriter {
         let _write = WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(self.removed(self.client.remove_folder(id)?))
+        Ok(self.removed(self.during_migration(|| self.client.remove_folder(id))?))
     }
 
     fn finish<T>(&self, value: T, files: &[AudioFile], before: u64, after: u64) -> WriteOutcome<T> {
@@ -285,6 +315,7 @@ impl RemoteWriter {
             if file.album_id.is_none()
                 && let Ok(local) = snapshot.get_audio(file.id)
             {
+                let local = local.into_data();
                 file.album_id = local.album_id;
                 file.album_entity = local.album_entity;
             }
@@ -304,7 +335,7 @@ impl RemoteWriter {
             file,
             revision_before,
             revision,
-        } = self.client.patch_metadata(id, patch)?;
+        } = self.during_migration(|| self.client.patch_metadata(id, patch))?;
         let mut outcome = self.finish(
             file.clone(),
             std::slice::from_ref(&file),
@@ -331,7 +362,7 @@ impl RemoteWriter {
             mut files,
             revision_before,
             revision,
-        } = self.client.batch_metadata(request)?;
+        } = self.during_migration(|| self.client.batch_metadata(request))?;
         let outcome = self.finish((), &files, revision_before, revision);
         if matches!(outcome.cache, CacheUpdate::Applied { .. }) {
             self.enrich_album_projection(&mut files);
@@ -348,6 +379,11 @@ impl RemoteWriter {
 /// Cache effect of a write, reported to the GUI through [`RemoteProvider`]'s listener.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteEvent {
+    /// A migration refusal retained the pending write for a delayed retry.
+    MigrationWaiting {
+        refusal: audiolib_core::server_upgrade::MigrationRefusal,
+        retry_after: u64,
+    },
     /// The snapshot now reflects the write and is at `revision`.
     Applied { revision: u64 },
     /// Run a full snapshot sync (revision mismatch, apply failure or uncertain outcome).
@@ -380,10 +416,11 @@ pub struct RemoteProvider {
 impl RemoteProvider {
     pub fn new(
         snapshot: Arc<SqliteProvider>,
-        writer: RemoteWriter,
+        mut writer: RemoteWriter,
         chinese: bool,
         listener: Option<WriteListener>,
     ) -> Self {
+        writer.migration_listener = listener.clone();
         Self {
             snapshot,
             writer,
@@ -476,6 +513,12 @@ impl RemoteProvider {
 
 /// A classified remote failure as a core error carrying the localized text.
 pub fn core_error(error: RemoteError, chinese: bool) -> Error {
+    if let Some((refusal, delay)) = error.migration_refusal() {
+        return Error::Migration {
+            refusal,
+            retry_after: refusal.retry_after(delay),
+        };
+    }
     let text = error.localized(chinese);
     match error {
         RemoteError::NotFound(_) => Error::NotFound(text),
@@ -489,6 +532,19 @@ pub fn core_error(error: RemoteError, chinese: bool) -> Error {
 }
 
 impl DataProvider for RemoteProvider {
+    fn server_upgrade_status(
+        &self,
+    ) -> audiolib_core::Result<Option<audiolib_core::server_upgrade::ServerUpgradeStatus>> {
+        let client = self.writer.client();
+        let capabilities = client
+            .capabilities()
+            .map_err(|error| core_error(error, self.chinese))?;
+        Ok(Some(crate::upgrade_hints::server_upgrade_status(
+            client,
+            &capabilities,
+        )))
+    }
+
     fn load_search_workspace(
         &self,
         target: &audiolib_core::SearchWorkspaceTarget,
@@ -502,6 +558,152 @@ impl DataProvider for RemoteProvider {
         workspace: &audiolib_core::SearchWorkspace,
     ) -> audiolib_core::Result<()> {
         self.snapshot.save_search_workspace(target, workspace)
+    }
+
+    fn path_search_ready(&self) -> audiolib_core::Result<bool> {
+        self.snapshot.path_search_ready()
+    }
+
+    fn probe_path_search(&self, cancel: Arc<AtomicBool>) -> audiolib_core::Result<bool> {
+        if self.snapshot.path_search_ready()? {
+            return Ok(true);
+        }
+        self.writer
+            .client()
+            .probe_path_search(&cancel)
+            .map_err(|error| core_error(error, self.chinese))?;
+        Ok(false)
+    }
+
+    fn vendor_import_available(&self) -> audiolib_core::Result<bool> {
+        let capabilities = self
+            .writer
+            .client()
+            .capabilities()
+            .map_err(|error| core_error(error, self.chinese))?;
+        Ok(capabilities.may_manage() && capabilities.vendor_import.is_some())
+    }
+
+    fn vendor_import_preview_files(
+        &self,
+        files: &[std::path::PathBuf],
+        options: &audiolib_core::vendor_import::VendorImportOptions,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportPreview> {
+        self.writer
+            .during_migration(|| {
+                self.writer
+                    .client()
+                    .vendor_import_preview_files(files, options)
+            })
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_status(
+        &self,
+        id: &str,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportStatus> {
+        self.writer
+            .client()
+            .vendor_import_status(id)
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_mapping(
+        &self,
+        id: &str,
+        options: &audiolib_core::vendor_import::VendorImportOptions,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportPreview> {
+        self.writer
+            .during_migration(|| self.writer.client().vendor_import_mapping(id, options))
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_rows(
+        &self,
+        id: &str,
+        offset: u64,
+        limit: u64,
+    ) -> audiolib_core::Result<Vec<audiolib_core::vendor_import::VendorRowPreview>> {
+        self.writer
+            .client()
+            .vendor_import_rows(id, offset, limit)
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_history(
+        &self,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportHistory> {
+        self.writer
+            .client()
+            .vendor_import_history()
+            .map_err(|error| core_error(error, self.chinese))
+    }
+
+    fn vendor_import_candidates(
+        &self,
+        id: &str,
+        row_id: &str,
+        offset: u64,
+        limit: u64,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorCandidatePage> {
+        self.writer
+            .client()
+            .vendor_import_candidates(id, row_id, offset, limit)
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_templates(
+        &self,
+    ) -> audiolib_core::Result<Vec<audiolib_core::vendor_import::VendorMappingTemplate>> {
+        self.writer
+            .client()
+            .vendor_import_templates()
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_save_template(
+        &self,
+        template: &audiolib_core::vendor_import::VendorMappingTemplate,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorMappingTemplate> {
+        self.writer
+            .client()
+            .vendor_import_save_template(template)
+            .map_err(|error| core_error(error, self.chinese))
+    }
+    fn vendor_import_cancel(
+        &self,
+        id: &str,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportStatus> {
+        self.writer
+            .client()
+            .vendor_import_cancel(id)
+            .map_err(|error| core_error(error, self.chinese))
+    }
+
+    fn vendor_import_preview(
+        &self,
+        file: &std::path::Path,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportPreview> {
+        self.writer
+            .during_migration(|| self.writer.client().vendor_import_preview(file))
+            .map_err(|error| core_error(error, self.chinese))
+    }
+
+    fn vendor_import_commit(
+        &self,
+        import_id: &str,
+        idempotency_key: &str,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportResult> {
+        self.writer
+            .during_migration(|| {
+                self.writer
+                    .client()
+                    .vendor_import_commit(import_id, idempotency_key)
+            })
+            .map_err(|error| core_error(error, self.chinese))
+    }
+
+    fn vendor_import_rollback(
+        &self,
+        import_id: &str,
+    ) -> audiolib_core::Result<audiolib_core::vendor_import::VendorImportResult> {
+        self.writer
+            .during_migration(|| self.writer.client().vendor_import_rollback(import_id))
+            .map_err(|error| core_error(error, self.chinese))
     }
 
     fn search(&self, request: &SearchRequest) -> audiolib_core::Result<SearchPage> {
@@ -564,6 +766,7 @@ impl DataProvider for RemoteProvider {
         if file.album_id.is_none()
             && let Ok(local) = self.snapshot.get_audio(id)
         {
+            let local = local.into_data();
             file.album_id = local.album_id;
             file.album_entity = local.album_entity;
         }

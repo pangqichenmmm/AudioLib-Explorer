@@ -1,6 +1,7 @@
 # Windows 服务端原生发布
 
-0.8.5 的 Windows x64 服务端交付契约；发布状态以对应 GitHub Release 的实际资产和验证结果为准。API、schema 和既有 Release 保持原有契约。
+Windows x64 服务端交付契约：0.8.5 首次纳入此平台，当前 layout 2 用于下一大型版本准备。
+历史 Release 保持当时布局，发布状态以对应 GitHub Release 的实际资产和验证结果为准。
 
 ## 范围与首个纳入版本
 
@@ -15,7 +16,7 @@
 | --- | --- |
 | 归档 | `AudioLibServer-vX.Y.Z-win-x64.zip` |
 | 校验 | `AudioLibServer-vX.Y.Z-win-x64.zip.sha256`（`<SHA256> <归档名>`） |
-| 根目录 | `audiolib-server.exe`、`update-channel.txt`、`update-version.txt` |
+| 根目录 | layout 2：`audiolib-server.exe`、`audiolib-migrate.exe`、`update-channel.txt`、`update-version.txt` |
 | 公共文件 | 与 Mac/Linux 相同的 `tools/server-files.json` 清单及 `licenses/` |
 | 签名 | 与其他资产一致：SHA256 + GitHub HTTPS；不做 Authenticode（后续另议） |
 
@@ -33,17 +34,24 @@ cargo build -p audiolib-db --bin search-benchmark --release --locked --target x8
 pwsh tools/validate-server-package.ps1 -Tag vX.Y.Z -Target x86_64-pc-windows-msvc
 ```
 
-- `build-server-release.ps1` 的 Windows 分支只构建 `audiolib-server`（`cargo build -p audiolib-server --release --locked --no-default-features`），保留工作区的静态 MSVC CRT 与路径重映射。
+- `build-server-release.ps1` 仅选择 server/db 两包的 `--bin audiolib-server --bin audiolib-migrate`，以 `--no-default-features` 构建生产负载，不生成 benchmark 等其他 DB 程序、不启用 test-hooks；保留静态 MSVC CRT 与路径重映射。
 - **默认不传 `-Asio`**：服务端不打开音频设备，不依赖 ASIO；`-Asio` 仅保留给历史打包兼容，不用于正式 Windows 服务端包。
 - 打包与验收必须在 Windows x64 上执行；验收只使用临时库与临时端口，不连接生产服务。
 - 正式包须从最终 main/tag 提交构建，与其他平台相同。
 
 ## 更新策略
 
+layout 2 是下一大型版本的交付准备，不回写历史资产。0.9 之前的服务端更新器不接受新增
+迁移程序，需要正常停服后人工安装完整包作为引导升级；冻结 v0.7.8 文件策略保持真实拒绝。
+包报告标记 `automatic_upgrade_compatible=false`、`manual_bootstrap_required=true`、
+`minimum_updater_version=0.9.0`，当前程序版本已冻结为 0.9.0，尚未发布。
+原生验收必须验证两个 EXE 的 SHA、生产迁移程序拒绝 test-hooks 参数，并在独立临时库
+执行 JSON status/start/status/rollback/status，确认 8→9→8；不读取工作库。七归档、十四资产不变。
+
 - 桌面客户端更新器不管理服务端（`Product::Desktop` 与 `Product::Server` 分开）。
 - 服务端自更新沿用管理页面（`/admin/api/update*`），按运行平台选择 Windows ZIP；Windows 由独立 helper 等待原进程退出后替换。
 - 程序目录须对运行账户可写，配置与运行数据放在程序目录之外；更新保留原启动参数及工作目录。
-- **不修改 `tools/server-files.json`**：包内公共文件须继续满足 `tools/update-compatible-files.json` 冻结的 v0.7.8 基线，避免旧更新器拒绝新包。Windows 服务安装样例等新增文件不进入首版包。
+- layout 1 保持原 v0.7.8 文件边界；layout 2 的当前 `server-files.json` 仅增加两种平台的迁移程序名称。打包按实际平台只纳入一个，其他文件继续满足冻结基线，并明确记录旧更新器拒绝和人工引导要求。Windows 服务安装样例等其他新增文件仍不进入包。
 - 过渡：0.8.5 之前的源码安装若目录中有 `update-channel.txt` / `update-version.txt` 且布局为平铺包，可经管理页更新到 0.8.5；否则先手动解压 0.8.5 ZIP 到程序目录，保留数据与配置。
 
 ## 与 Mac/Linux 对齐的契约

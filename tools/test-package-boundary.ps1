@@ -12,9 +12,10 @@ try {
     $env:CARGO_TARGET_DIR = Join-Path $testRoot 'target'
     New-Item -ItemType Directory -Path (Join-Path $testRoot 'tools') | Out-Null
     Set-Content -LiteralPath (Join-Path $testRoot 'Cargo.toml') -Value "[workspace.package]`nversion = `"0.4.4`"" -Encoding ASCII
-    foreach ($script in @('package-portable.ps1','console-utf8.ps1','validate-portable.ps1','validate-portable-licenses.ps1','validate-portable-zip.ps1','validate-package-privacy.ps1','validate-update-compatibility.ps1','update-compatible-files.json','portable-files.json','Start-AudioLibExplorer.cmd','install-beta.ps1','AudioLibExplorer-beta.cmd')) {
+    foreach ($script in @('package-portable.ps1','dependency-licenses.ps1','license-notices.json','console-utf8.ps1','validate-portable.ps1','validate-portable-licenses.ps1','validate-portable-zip.ps1','validate-package-privacy.ps1','validate-update-compatibility.ps1','update-compatible-files.json','portable-files.json','Start-AudioLibExplorer.cmd','install-beta.ps1','AudioLibExplorer-beta.cmd')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination (Join-Path $testRoot 'tools')
     }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'license-notices') -Destination (Join-Path $testRoot 'tools') -Recurse
     $files = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'portable-files.json') -Raw | ConvertFrom-Json
     foreach ($file in $files) {
         $destination = Join-Path $testRoot $file
@@ -36,14 +37,21 @@ try {
     # ancestors must still be inspected rather than silently skipped or failing.
     $hiddenAncestor = Get-Item -LiteralPath (Split-Path -Parent $staleRoot) -Force
     $hiddenAncestor.Attributes = $hiddenAncestor.Attributes -bor [IO.FileAttributes]::Hidden
-    # Minimal license fixture; Cargo and application binaries remain synthetic.
+    # Native-only SoundTouch fixture catches regressions that still require the
+    # removed high-level wrapper. Cargo and application binaries remain synthetic.
     $fixturePackages = @(
         @{name='slint';version='1.17.1';manifest_path=(Join-Path $testRoot 'registry/slint/Cargo.toml')},
-        @{name='soundtouch';version='0.5.4';manifest_path=(Join-Path $testRoot 'registry/soundtouch/Cargo.toml')},
-        @{name='soundtouch-ffi';version='0.4.0';manifest_path=(Join-Path $testRoot 'registry/soundtouch-ffi/Cargo.toml')}
+        @{name='soundtouch-ffi';version='0.4.1';manifest_path=(Join-Path $testRoot 'registry/soundtouch-ffi/Cargo.toml')}
+        @{name='audiolib-desktop';version='0.4.4';manifest_path=(Join-Path $testRoot 'registry/audiolib-desktop/Cargo.toml')},
+        @{name='audiolib-cli';version='0.4.4';manifest_path=(Join-Path $testRoot 'registry/audiolib-cli/Cargo.toml')},
+        @{name='asio-sys';version='99.0.0';manifest_path=(Join-Path $testRoot 'registry/asio-sys/Cargo.toml')},
+        @{name='calamine';version='0.36.1';manifest_path=(Join-Path $testRoot 'registry/calamine/Cargo.toml')},
+        @{name='symphonia-codec-vorbis';version='0.6.1';manifest_path=(Join-Path $testRoot 'registry/symphonia-codec-vorbis/Cargo.toml')}
     )
     foreach ($package in $fixturePackages) {
         New-Item -ItemType Directory -Path (Split-Path -Parent $package.manifest_path) -Force | Out-Null
+        $package.source=if($package.name -like 'audiolib-*'){$null}else{'registry+public'};$package.license=if($package.name -like 'audiolib-*'){'GPL-3.0-only'}else{'MIT'};$package.repository=$null;$package.license_file=$null
+        Set-Content -LiteralPath (Join-Path (Split-Path -Parent $package.manifest_path) 'LICENSE') -Value 'Synthetic original crate notice.' -Encoding ASCII
     }
     $fixtureSlint = Join-Path $testRoot 'registry/slint/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md'
     $fixtureSoundTouch = Join-Path $testRoot 'registry/soundtouch-ffi/soundtouch-2_3_2/COPYING.TXT'
@@ -52,7 +60,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $license) -Force | Out-Null
         Set-Content -LiteralPath $license -Value 'Synthetic public license.' -Encoding ASCII
     }
-    function cargo { @{packages=$fixturePackages} | ConvertTo-Json -Depth 5; $global:LASTEXITCODE = 0 }
+    function cargo {if($args[0] -ceq 'metadata'){@{packages=$fixturePackages}|ConvertTo-Json -Depth 5}elseif($args[0] -ceq 'tree'){if($args -notcontains 'normal,build' -or $args -notcontains '--locked' -or $args -notcontains '--target'){throw 'Wrong selected license tree flags.'};foreach($p in $fixturePackages){if($p.name -ceq 'asio-sys' -and $args -notcontains '--features'){continue};"$($p.name) v$($p.version)"}}else{throw 'Unexpected Cargo build during synthetic package regression.'};$global:LASTEXITCODE=0}
     $compatibilityValidator = Join-Path $testRoot 'tools/validate-update-compatibility.ps1'
     & $compatibilityValidator -Product Desktop -Entries @('AudioLibExplorer.exe', 'licenses/future-dependency-9.0/LICENSE-MIT', 'licenses/dependencies.json')
     foreach ($invalid in @('doc/Rust_Future_Update.md', 'doc/../LICENSE', 'licenses/evil.exe', 'licenses/library.sqlite3-shm', 'licenses/private.settings.json', 'licenses/tokens.json', 'licenses/.env', 'licenses/cache.server-state.json', ('licenses/COM' + [char]0x00b9 + '.txt'), 'licenses/notice?.txt')) {
@@ -66,6 +74,15 @@ try {
     & (Join-Path $testRoot 'tools/package-portable.ps1') -SkipBuild -WithoutAsio
     $licenseValidator = Join-Path $testRoot 'tools/validate-portable-licenses.ps1'
     & $licenseValidator -BinaryDirectory $staleRoot -WithoutAsio
+    $fixtureNoticePath = Join-Path $staleRoot 'licenses/dependencies.json'
+    $fixtureNoticeText = [IO.File]::ReadAllText($fixtureNoticePath)
+    try {
+        $withoutNative = @((ConvertFrom-Json $fixtureNoticeText) | Where-Object name -CNE 'soundtouch-ffi')
+        [IO.File]::WriteAllText($fixtureNoticePath, ($withoutNative | ConvertTo-Json -Depth 12))
+        $rejected = $false
+        try { & $licenseValidator -BinaryDirectory $staleRoot -WithoutAsio } catch { $rejected = $_.Exception.Message -match 'SoundTouch dependency or license notice missing' }
+        if (!$rejected) { throw 'A missing native SoundTouch dependency notice was accepted.' }
+    } finally { [IO.File]::WriteAllText($fixtureNoticePath, $fixtureNoticeText) }
     $rejected = $false
     try { & $licenseValidator -BinaryDirectory $staleRoot } catch { $rejected = $_.Exception.Message -match 'ASIO SDK license missing' }
     if (!$rejected) { throw 'Default ASIO acceptance allowed a missing SDK license.' }

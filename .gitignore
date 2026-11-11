@@ -37,3 +37,4 @@ __pycache__/
 # Generated validation reports (written by tools/validate-*.ps1; not tracked).
 /doc/Rust_*.json
 /doc/Rust_*.txt
+tmp/

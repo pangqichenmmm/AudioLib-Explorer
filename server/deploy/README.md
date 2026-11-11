@@ -119,10 +119,135 @@ Program version = workspace `Cargo.toml`, API = `/api/v1/`, library schema = `SC
 
 ## Automatic release updates
 
-Every server start checks the official GitHub repository in the background. The listener
+The next 0.9.0 server payload uses layout revision 2: both `audiolib-server`
+and the production `audiolib-migrate` executable are delivered (with `.exe` on
+Windows). The frozen 0.7.8 updater policy refuses this new layout. Bootstrap it
+manually after validating the archive and checksum; do not use an older
+server's automatic install action for this transition. Package reports record
+`automatic_upgrade_compatible=false`, `manual_bootstrap_required=true` and
+`minimum_updater_version=0.9.0`. The candidate program version is frozen at 0.9.0
+but remains unpublished. See the [release runbook](../../doc/Rust_Release_0.9.0.md) for client-first deployment,
+deferred server migration and backup/rollback pairing. Keep configuration,
+credentials and the existing library outside the payload. With the service
+stopped, the delivered tool supports `audiolib-migrate status|start|rollback
+--db <owned-library-path>` and emits JSON; it has no `--version` command and
+does not include test-only fault-injection hooks.
+
+### Paired beta and manual deployment
+
+`tools/beta-refresh.sh` builds `audiolib-server` and `audiolib-migrate` together in
+one native `cargo build --release --locked --no-default-features` invocation,
+selecting only those two bins. Beta always requires the complete layout-2 pair,
+including for the version-frozen 0.9.0 candidate. Set required
+`BETA_DATABASE_PATH` to the actual absolute `library_db` from the active beta
+configuration; `BETA_DATA_DIR/library.db` is never inferred as that proof. It stages and verifies
+both files before any service stop (including `--with-db`), and does not replace
+the existing launcher, plist, configuration, credentials or TCC grants.
+
+A prebuilt beta pair must be explicit. Supply the JSON emitted by the maintained
+native `validate-server-package.ps1`, with its caller-trusted SHA256:
+
+```sh
+tools/beta-refresh.sh --no-build <accepted-server> --migrator <accepted-migrator> \
+  --accepted-receipt <native-acceptance.json> --receipt-sha256 <trusted-report-sha256>
+```
+
+The report must record success, layout 2, the fetched full beta commit, native
+`aarch64-apple-darwin` target, matching version, both executable hashes, production
+no-test-hooks validation and the owned 8→9→8 migrator lifecycle. A package creation
+report alone is insufficient. The migrator has no `--version`; no adjacent binary
+is guessed, and no library command is executed as a deployment identity probe.
+No jq or application Python dependency is added: macOS uses system `plutil`, with
+an already available `python3` as the existing optional structured-JSON fallback.
+
+For a paired manual redeploy, provide the actual configured database explicitly;
+`DATA_DIR/library.db` is not accepted as an inferred safety proof:
+
+```sh
+INSTALL_DIR=<existing-bin-dir> DATA_DIR=<data-dir> DATABASE_PATH=<configured-existing-db> \
+  SERVICE_NAME=<existing-service> REQUIRES_PAIR=1 NEW_MIGRATOR=<new-migrator> \
+  PAIR_SOURCE_COMMIT=<full-source-commit> PAIR_TARGET=<native-target> \
+  PAIR_RECEIPT=<native-acceptance.json> PAIR_RECEIPT_SHA256=<trusted-report-sha256> \
+  UPDATE_CHANNEL=beta UPDATE_VERSION=<actual-version-or-prerelease> \
+  sh server/deploy/redeploy-server.sh <new-server>
+```
+
+A trusted local native build may instead supply both `EXPECT_SERVER_SHA256` and
+`EXPECT_MIGRATOR_SHA256` plus the same full source/native target identity; this is
+build identity, not a native package-acceptance claim. The script-owned
+`server-deployment-pair.json` records the last external script-installed pair.
+Its historical hashes do not override a later Rust updater receipt: that updater
+independently verifies the official archive identity. Its presence, an installed
+migrator, or a 0.9+ server prevents a later binary-only deployment. Explicit legacy
+layout-1 generic deployments remain supported; historical archives need manual
+bootstrap and cannot satisfy the current pair requirement.
+
+Both candidates are staged and hash-checked before stopping. Generic deployment
+creates and quick-checks a read-only SQLite logical backup only after proven drain;
+it never treats live, individually copied DB/WAL/SHM files as a matching snapshot.
+The actual entry schema must still match after drain before either binary can be
+replaced. Backup/schema failure leaves files unchanged and the service stopped; a
+failed stop never bootstraps a second old instance while its PID may still drain.
+After graceful stop,
+both executables and update markers are installed and verified before restart.
+Rollback restores the previous migrator and pair record, including their prior
+absence, and restores both update markers before restarting the old server. It
+never rewrites the launcher/plist or restores a library automatically. An explicit
+existing database and `sqlite3 -readonly` schema proof are required for paired
+replacement; a missing database must be initialized or recovered separately.
+`--with-db` may prepare its existing supported read-only clone before deployment,
+but preflight alone never creates a library. If the candidate changed schema, or
+the schema cannot be verified, binary-only rollback is refused and the candidate
+pair/backups are retained for manual matching-library recovery. Structured ongoing
+migration timeout likewise retains the entire candidate pair and markers, exits
+nonzero and does not stop/restart it again.
+
+`DEPLOY_PREFLIGHT_ONLY=1` performs identity/staging validation without a service
+stop or installation. `DEPLOY_QUIESCE_ONLY=1` performs the same pair preflight and
+then the existing bounded launchd/systemd stop, PID/job/port drain, with no binary,
+marker or database replacement. A failed stop never kills a process or replaces
+the library/sidecars. Both modes are preparation steps, not deployment acceptance.
+Use the normal mode to install the complete pair after successful preparation.
+
+With `beta-refresh.sh --with-db`, both the production source and the existing beta
+library must be explicit, distinct existing files. The source is opened with
+`sqlite3 -readonly` (literal filenames including spaces and `#`, not an ambiguous
+URI) and copied to a new owned staging database. Pair preflight happens before
+any stop. The script then proves the old beta service has drained, makes and
+validates a consistent logical backup of the stopped beta library including its
+committed WAL image, and records its actual post-drain schema. It retains the old
+raw database, WAL/SHM and server-state file in an owned directory instead of deleting
+them. Only then is the staged source clone installed. The old binary is never
+restarted between library replacement and candidate-pair deployment.
+
+`refresh-state.txt` in the old logical-backup directory records the stopped schema,
+logical backup, retained raw-image location and candidate location. Keep that record
+and the matching binary backups until acceptance. A backup/move/install failure
+leaves the service quiesced with actionable paths; there is no automatic overwrite
+of a library that the candidate might already have migrated. Beta passes the
+actually queried stopped schema as `ROLLBACK_SCHEMA_VERSION`. Generic use of this
+optional numeric value is a caller-trusted expected baseline, not a way to infer or
+downgrade a library: rollback requires matching schema before **and after** graceful
+stop. A change during drain refuses old-binary startup and retains the candidate
+pair stopped for manual matching-library recovery. Stop all other beta writers
+within the maintenance window as well; stopping launchd is not a cross-process
+administration lease for arbitrary independent CLI writers.
+
+The owned synthetic script regressions exercise initial/repeated pair installation,
+receipt/hash/source rejection, staging/partial replacement failure, old-migrator
+absence restoration, marker ordering and migration retention. Owned SQLite/WAL
+fixtures additionally cover failed stop, stop timeout, backup failure, source
+filename quoting and migration completed during drain; the no-build acceptance
+fixtures themselves remain synthetic identity reports. Native macOS
+launchd/TCC, actual production migrator and real beta-library acceptance remain
+required and **unverified by synthetic fixtures**. Run the native gate on the Mac;
+Windows Git Bash syntax/mocks do not provide that evidence.
+
+For native installations with automatic updates enabled, every server start checks
+the official GitHub repository in the background. The listener
 and library opening do not wait for GitHub. Open the LAN-only `/admin` page to see the
 result, release notes, or retry a failed/offline check. Confirm the displayed release tag
-to download, validate its archive and checksum, drain requests and library work, install
+to download a layout-compatible update, validate its archive and checksum, drain requests and library work, install
 the package-owned files, and restart with the same arguments, environment and working
 directory. Database, audio files, configuration, tokens and generated runtime data stay
 outside the update payload. A running scan must finish or be cancelled before confirming.
@@ -150,8 +275,8 @@ UPDATE_CHANNEL=stable UPDATE_VERSION=0.6.2 \
 
 Use `UPDATE_CHANNEL=beta` and the complete `X.Y.Z-beta.N` or `X.Y.Z-rc.N` marker for a
 published prerelease. An untagged beta development snapshot uses `X.Y.Z-0`; do not assign
-a published prerelease sequence to an arbitrary same-version build. Unmarked existing
-installations retain their previous binary-only deployment behavior.
+a published prerelease sequence to an arbitrary same-version build. Explicit historical layout-1 installations retain their previous binary-only
+deployment behavior; an installed layout-2 pair never silently falls back to it.
 
 The install directory must be writable by the server account. The hardened systemd
 example deliberately keeps `/opt/audiolib` read-only; an administrator who opts into

@@ -616,7 +616,8 @@ impl SqliteProvider {
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
-        let reader = self.search_reader(Some(cancel.clone()))?;
+        let mut connection = self.search_reader(Some(cancel.clone()))?;
+        let reader = connection.transaction().map_err(db_error)?;
         let projection = audio_projection(&reader)?;
         let files=reader.prepare(&format!("SELECT {projection} FROM audio_files af WHERE af.album_id=?1 AND af.missing=0 ORDER BY af.id LIMIT ?2")).map_err(db_error)?.query_map(params![id,limit as i64],audio_from_row).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?;
         if cancel.load(Ordering::Acquire) {

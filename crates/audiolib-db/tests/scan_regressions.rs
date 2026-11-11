@@ -102,7 +102,10 @@ fn parallel_probes_match_serial_metadata_and_incremental_counts() {
         let records = page
             .results
             .into_iter()
-            .map(|audio| (audio.file_path, audio.attributes))
+            .map(|audio| {
+                let audio = audio.into_data();
+                (audio.file_path, audio.attributes)
+            })
             .collect::<std::collections::BTreeMap<_, _>>();
         // Runtime timestamps/encoding are hydrated as attributes; compare source fields only.
         let source: std::collections::BTreeMap<_, _> = records

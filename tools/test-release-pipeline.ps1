@@ -191,7 +191,7 @@ if(Test-Path -LiteralPath target/move-head){
     }
     New-Item -ItemType Directory -Path (Join-Path $taskRoot 'target') -Force | Out-Null
     $taskStub=@'
-param($Tag,[switch]$WithoutAsio,[switch]$SkipBuild,$BinaryDirectory,$Source,[string[]]$Package,[switch]$Asio)
+param($Tag,$Profile,[switch]$WithoutAsio,[switch]$SkipBuild,$BinaryDirectory,$Source,[string[]]$Package,[switch]$Asio)
 $ErrorActionPreference='Stop'
 $fixtureRoot=[IO.Path]::GetFullPath((Get-Location).Path)
 $fixtureTarget=Join-Path $fixtureRoot 'target'
@@ -203,9 +203,13 @@ function Write-FixtureFile([string]$Relative,[string]$Contents) {
     [IO.File]::WriteAllText($path,$Contents)
 }
 $scriptName=[IO.Path]::GetFileName($MyInvocation.MyCommand.Path)
-@{script=$scriptName;without_asio=[bool]$WithoutAsio;asio=[bool]$Asio;packages=@($Package)} | ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $fixtureTarget 'profile-calls.jsonl')
+@{script=$scriptName;profile=$Profile;without_asio=[bool]$WithoutAsio;asio=[bool]$Asio;packages=@($Package)} | ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $fixtureTarget 'profile-calls.jsonl')
 # Model what each real tool produces, independently of the plan's declarations.
 switch -Exact ($scriptName) {
+    'check-release-licenses.ps1' {
+        if ($Profile -cne 'WindowsClient') { throw 'Wrong license preflight profile.' }
+        if (Test-Path -LiteralPath (Join-Path $fixtureTarget 'missing-license')) { throw 'Synthetic external notice missing.' }
+    }
     'build-release.ps1' {
         Write-FixtureFile 'target/x86_64-pc-windows-msvc/release/AudioLibExplorer.exe' "desktop without_asio=$WithoutAsio"
         Write-FixtureFile 'target/x86_64-pc-windows-msvc/release/AudioLibCli.exe' "cli without_asio=$WithoutAsio"
@@ -244,7 +248,7 @@ switch -Exact ($scriptName) {
     $taskFailedState=Read-State
     $taskCalls=Get-Content -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl') | ForEach-Object{$_|ConvertFrom-Json}
     if($taskFailedState.stages.package.status -ne 'failed' -or $taskFailedState.stages.Contains('accept') -or $taskFailedState.stages.Contains('install') -or
-        ($taskCalls.script -join ',') -cne 'check-release.ps1,check-local.ps1,build-release.ps1,package-portable.ps1' -or
+        ($taskCalls.script -join ',') -cne 'check-release.ps1,check-local.ps1,check-release-licenses.ps1,build-release.ps1,package-portable.ps1' -or
         ($taskFailedOutput -join ' ') -notlike '*Missing stage artifact: dist/latest/AudioLibExplorer-v0.0.1-win-x64-portable.zip*') { throw 'A versioned declaration for the latest-only packager was not rejected before acceptance.' }
     Write-Host 'PASS: actual latest-only package outputs reject an incorrect versioned artifact declaration before acceptance or installation.'
     Remove-Item -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl')
@@ -254,21 +258,37 @@ switch -Exact ($scriptName) {
     Invoke-FixtureGit @('add','.'); Invoke-FixtureGit @('commit','-qm','real profile routing with declared artifacts and fake tools')
     $null=Invoke-Pipeline 'Run' 0 @('-ChecksFile',$taskChecksPath)
     $taskCalls=Get-Content -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl') | ForEach-Object{$_|ConvertFrom-Json}
-    if(($taskCalls.script -join ',') -cne 'check-release.ps1,check-local.ps1,build-release.ps1,package-portable.ps1,validate-portable.ps1,install-local-release.ps1'){throw 'Actual profile stages ran out of order or were omitted.'}
-    if(@($taskCalls | Where-Object script -eq 'check-local.ps1').Count -ne 1 -or !($taskCalls | Where-Object script -eq 'check-local.ps1').asio -or @($taskCalls | Where-Object { $_.script -in @('build-release.ps1','package-portable.ps1','validate-portable.ps1') -and $_.without_asio }).Count){throw 'Default Windows profile selected inconsistent features.'}
+    if(($taskCalls.script -join ',') -cne 'check-release.ps1,check-local.ps1,check-release-licenses.ps1,build-release.ps1,package-portable.ps1,validate-portable.ps1,install-local-release.ps1'){throw 'Actual profile stages ran out of order or were omitted.'}
+    if(@($taskCalls | Where-Object script -eq 'check-local.ps1').Count -ne 1 -or !($taskCalls | Where-Object script -eq 'check-local.ps1').asio -or @($taskCalls | Where-Object { $_.script -in @('check-release-licenses.ps1','build-release.ps1','package-portable.ps1','validate-portable.ps1') -and $_.without_asio }).Count){throw 'Default Windows profile selected inconsistent features.'}
+    Remove-Item -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl')
+    $null=Invoke-Pipeline 'Run' 0 @('-ChecksFile',$taskChecksPath)
+    $taskCalls=Get-Content -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl') | ForEach-Object{$_|ConvertFrom-Json}
+    $taskResumedState=Read-State
+    if(($taskCalls.script -join ',') -cne 'check-release-licenses.ps1' -or @('build','package','accept','install' | Where-Object { $taskResumedState.stages[$_].status -ne 'reused' }).Count){throw 'Fresh license preflight unnecessarily invalidated unchanged payload receipts.'}
+    Remove-Item -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl')
+    [IO.File]::WriteAllText((Join-Path $taskRoot 'target/missing-license'),'synthetic external change')
+    $null=Invoke-Pipeline 'Run' 1 @('-ChecksFile',$taskChecksPath)
+    $taskCalls=Get-Content -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl') | ForEach-Object{$_|ConvertFrom-Json}
+    if(($taskCalls.script -join ',') -cne 'check-release-licenses.ps1' -or (Read-State).stages['license-preflight'].status -ne 'failed' -or (Read-State).stages.Contains('build')){throw 'A cached preflight concealed a missing external notice or reached the payload.'}
+    Remove-Item -LiteralPath (Join-Path $taskRoot 'target/missing-license')
+    Remove-Item -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl')
+    $null=Invoke-Pipeline 'Run' 0 @('-ChecksFile',$taskChecksPath)
+    $taskResumedState=Read-State
+    if(@('build','package','accept','install' | Where-Object { $taskResumedState.stages[$_].status -ne 'reused' }).Count){throw 'A repaired external notice restarted unaffected payload stages.'}
+    Write-Host 'PASS: notices rechecked on resume; missing notices stop before build; unchanged and repaired notices reuse payload acceptance.'
     Remove-Item -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl')
     $taskVariables=Join-Path $taskRoot 'target/without-asio.json'
     [IO.File]::WriteAllText($taskVariables,'{"WithoutAsio":true}')
     $null=Invoke-Pipeline 'Run' 0 @('-ChecksFile',$taskChecksPath,'-VariablesFile',$taskVariables)
     $taskCalls=Get-Content -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl') | ForEach-Object{$_|ConvertFrom-Json}
-    if(($taskCalls.script -join ',') -cne 'check-local.ps1,build-release.ps1,package-portable.ps1,validate-portable.ps1,install-local-release.ps1'){throw 'Feature change repeated unrelated preflight or omitted affected stages.'}
-    if(($taskCalls | Where-Object script -eq 'check-local.ps1').asio -or @($taskCalls | Where-Object { $_.script -in @('build-release.ps1','package-portable.ps1','validate-portable.ps1') -and $_.without_asio }).Count -ne 3){throw 'Non-ASIO override did not select one consistent check/build/package/accept configuration.'}
+    if(($taskCalls.script -join ',') -cne 'check-local.ps1,check-release-licenses.ps1,build-release.ps1,package-portable.ps1,validate-portable.ps1,install-local-release.ps1'){throw 'Feature change repeated unrelated preflight or omitted affected stages.'}
+    if(($taskCalls | Where-Object script -eq 'check-local.ps1').asio -or @($taskCalls | Where-Object { $_.script -in @('check-release-licenses.ps1','build-release.ps1','package-portable.ps1','validate-portable.ps1') -and $_.without_asio }).Count -ne 4){throw 'Non-ASIO override did not select one consistent check/build/package/accept configuration.'}
     Write-Host 'PASS: actual Windows plan and checks example route both ASIO selections consistently without Cargo or application execution.'
     Remove-Item -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl')
     $env:SLINT_EMIT_DEBUG_INFO=if($taskSavedSlint -eq '1'){'0'}else{'1'}
     $null=Invoke-Pipeline 'Run' 0 @('-ChecksFile',$taskChecksPath,'-VariablesFile',$taskVariables)
     $taskCalls=Get-Content -LiteralPath (Join-Path $taskRoot 'target/profile-calls.jsonl') | ForEach-Object{$_|ConvertFrom-Json}
-    if(@($taskCalls).Count -ne 6 -or (Read-State).stages.build.status -ne 'passed'){throw 'Slint build configuration changed without invalidating receipts.'}
+    if(@($taskCalls).Count -ne 7 -or (Read-State).stages.build.status -ne 'passed'){throw 'Slint build configuration changed without invalidating receipts.'}
     Write-Host 'PASS: Slint build environment changes invalidate the selected configuration.'
 } finally {
     [Environment]::SetEnvironmentVariable('AUDIOLIB_PIPELINE_TEST',$taskSaved)

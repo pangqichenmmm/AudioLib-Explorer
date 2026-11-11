@@ -65,6 +65,67 @@ impl Drop for ArtworkActionGuard {
 }
 
 impl Controller {
+    /// Read this device's owned thumbnail-cache totals off the event loop.
+    fn refresh_artwork_cache_stats(self: &Arc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if ui.get_artwork_cache_stats_busy()
+            || self.closing.load(Ordering::Acquire)
+            || self.shutdown.load(Ordering::Acquire)
+        {
+            return;
+        }
+        ui.set_artwork_cache_stats_busy(true);
+        let cache_root = self.config.lock().unwrap().paths.cache.clone();
+        let worker = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("artwork-cache-stats".into())
+            .spawn(move || {
+                let _cache = worker.artwork_cache_lock.lock().unwrap();
+                let stats = crate::artwork::cache_stats(&cache_root);
+                // Queue under the cleanup lock: a pre-cleanup snapshot is published
+                // before cleanup's completion requests its fresh statistics.
+                post(worker.ui.clone(), move |ui| {
+                    ui.set_artwork_cache_stats_busy(false);
+                    let chinese = ui.get_chinese();
+                    ui.set_artwork_cache_stats(
+                        match stats {
+                            Ok((files, bytes)) => {
+                                let mib = bytes as f64 / 1_048_576.0;
+                                if chinese {
+                                    format!("{files} 个文件 · {mib:.1} MiB")
+                                } else {
+                                    format!("{files} files · {mib:.1} MiB")
+                                }
+                            }
+                            Err(error) => format!(
+                                "{}: {error}",
+                                cn_or(
+                                    chinese,
+                                    "无法统计封面缓存",
+                                    "Could not count cover thumbnails",
+                                )
+                            ),
+                        }
+                        .into(),
+                    );
+                });
+            });
+        if let Err(error) = spawned {
+            ui.set_artwork_cache_stats_busy(false);
+            ui.set_artwork_cache_stats(
+                format!(
+                    "{}: {error}",
+                    cn_or(
+                        ui.get_chinese(),
+                        "无法启动封面缓存统计",
+                        "Could not start the cover-cache scan",
+                    )
+                )
+                .into(),
+            );
+        }
+    }
+
     pub(super) fn begin_artwork_action(self: &Arc<Self>) -> ArtworkActionGuard {
         self.artwork_actions.lock().unwrap().pending += 1;
         ArtworkActionGuard {
@@ -271,6 +332,8 @@ impl Controller {
 
     pub(super) fn bind_artwork(self: &Arc<Self>, ui: &AppWindow) {
         let c = self.clone();
+        ui.on_artwork_cache_refresh_requested(move || c.refresh_artwork_cache_stats());
+        let c = self.clone();
         ui.on_artwork_enabled_requested(move |enabled| {
             if !c.available() {
                 return;
@@ -348,6 +411,9 @@ impl Controller {
                         chinese,
                         result.map_err(ArtworkActionError::into_message),
                     );
+                    if action == 1 {
+                        confirmed.refresh_artwork_cache_stats();
+                    }
                 });
             });
         });

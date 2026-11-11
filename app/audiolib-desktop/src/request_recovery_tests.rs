@@ -151,11 +151,11 @@ fn child_a_lone_letter_cancels_searches() {
     controller.tree.lock().unwrap().matches = retained_folders.clone();
     publish_audio_rows(
         &ui,
-        vec![audio_row(&AudioFile {
+        vec![audio_row(&AudioFile::from(audiolib_core::AudioFileData {
             id: 999,
             filename: "Retained.wav".into(),
             ..Default::default()
-        })],
+        }))],
     );
     for (query, chinese, immediate) in [("e", true, false), (" (e\u{301}) ", false, true)] {
         ui.set_query("A.wav".into());

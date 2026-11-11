@@ -499,6 +499,7 @@ fn pending_publication(controller: &Controller, ui: &AppWindow) -> u64 {
         model_published: false,
         retained_status: None,
         result_window: false,
+        viewport_anchor: None,
     });
     ui.set_status("Page pending".into());
     ui.set_searching(true);

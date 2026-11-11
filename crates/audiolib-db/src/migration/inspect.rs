@@ -508,6 +508,11 @@ fn business_digest_impl(
             sha256: format!("{:x}", hash.finalize()),
         });
     }
+    digest_tables(tables)
+}
+
+/// Recompute the aggregate after an explicitly reviewed owned-table projection.
+pub(super) fn digest_tables(tables: Vec<TableDigest>) -> Result<BusinessDigest> {
     let encoded =
         serde_json::to_vec(&tables).map_err(|error| Error::Database(error.to_string()))?;
     Ok(BusinessDigest {

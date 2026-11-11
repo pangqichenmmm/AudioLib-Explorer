@@ -53,7 +53,7 @@ fn wav(sample: i16) -> Vec<u8> {
 }
 
 fn file(bytes: &[u8]) -> AudioFile {
-    AudioFile {
+    AudioFile::from(audiolib_core::AudioFileData {
         id: 42,
         filename: "sound-a.wav".into(),
         file_path: "/sounds/sound-a.wav".into(),
@@ -63,7 +63,7 @@ fn file(bytes: &[u8]) -> AudioFile {
         channels: 1,
         duration: 0.01,
         ..Default::default()
-    }
+    })
 }
 
 fn binary(socket: &mut std::net::TcpStream, body: &[u8], etag: &str, head: bool) {

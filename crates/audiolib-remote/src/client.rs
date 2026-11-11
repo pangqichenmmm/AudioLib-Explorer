@@ -71,6 +71,10 @@ pub struct HealthInfo {
     /// `https://audiolib.example.com:8443`; `null` when not configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+    /// Library upgrade or schema migration in progress (`{phase, completed?, total?}`),
+    /// mirrored for every client; absent when idle or on older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<audiolib_core::server_upgrade::HealthUpgrade>,
 }
 
 impl HealthInfo {
@@ -516,8 +520,35 @@ impl RemoteClient {
         authenticated: bool,
     ) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{}{path}", self.api);
+        let catalog = audiolib_core::compatibility::compatibility_manifest();
+        let catalog_json =
+            serde_json::to_string(&catalog).map_err(|e| RemoteError::Protocol(e.to_string()))?;
+        let accepted = catalog.snapshot_read_formats.join(", ");
         let response = crate::abort::call_fresh(|| {
             let mut request = agent.get(&url);
+            if matches!(path, "/library" | "/capabilities") {
+                request = request
+                    .header(
+                        audiolib_core::compatibility::CLIENT_COMPATIBILITY_HEADER,
+                        &catalog_json,
+                    )
+                    .header(
+                        audiolib_core::compatibility::ACCEPT_FORMATS_HEADER,
+                        &accepted,
+                    )
+                    .header(
+                        audiolib_core::compatibility::SNAPSHOT_SCHEMA_MAX_HEADER,
+                        &audiolib_core::compatibility::SNAPSHOT_SCHEMA_MAX.to_string(),
+                    )
+                    .header(
+                        audiolib_core::compatibility::SEARCH_STORAGE_MAX_HEADER,
+                        &audiolib_core::compatibility::SEARCH_STORAGE_MAX.to_string(),
+                    )
+                    .header(
+                        audiolib_core::compatibility::TOKENIZATION_MAX_HEADER,
+                        &audiolib_core::compatibility::TOKENIZATION_MAX.to_string(),
+                    );
+            }
             if authenticated && !self.token.is_empty() {
                 request = request.header("Authorization", &format!("Bearer {}", self.token));
             }
@@ -534,6 +565,7 @@ impl RemoteClient {
         mut response: ureq::http::Response<ureq::Body>,
         context: &str,
     ) -> Result<ureq::http::Response<ureq::Body>> {
+        crate::upgrade_hints::record(&self.api, response.headers());
         let status = response.status().as_u16();
         if status >= 400 {
             let retry_after = retry_after(response.headers());
@@ -860,6 +892,96 @@ impl RemoteClient {
             .map_err(|error| RemoteError::from_transport(error, path))?;
         serde_json::from_str(&body)
             .map_err(|error| RemoteError::Protocol(format!("GET {path}: {error}")))
+    }
+
+    /// Server origin (the API base without `/api/v1`) for the admin routes.
+    pub(crate) fn origin(&self) -> &str {
+        self.api.strip_suffix("/api/v1").unwrap_or(&self.api)
+    }
+
+    /// `GET /admin/api/migration/status` (read-only; LAN admin route, no token sent).
+    pub fn migration_status(&self) -> Result<audiolib_core::server_upgrade::MigrationStatus> {
+        let path = audiolib_core::server_upgrade::MIGRATION_STATUS_PATH;
+        let url = format!("{}{path}", self.origin());
+        let response = crate::abort::call_fresh(|| self.agent.get(&url))
+            .map_err(|error| RemoteError::from_transport(error, &url))?;
+        self.read_admin_json(response, &format!("GET {path}"))
+    }
+
+    /// `POST /admin/api/migration/{action}`; refused locally without manage permission.
+    pub fn migration_action(
+        &self,
+        action: &str,
+        can_manage: bool,
+    ) -> Result<audiolib_core::server_upgrade::MigrationStatus> {
+        if !audiolib_core::server_upgrade::migration_actions(can_manage).contains(&action) {
+            return Err(if can_manage {
+                RemoteError::Validation(format!("unknown migration action: {action}"))
+            } else {
+                RemoteError::Forbidden("migration controls need manage permission".into())
+            });
+        }
+        let path = format!("/admin/api/migration/{action}");
+        let url = format!("{}{path}", self.origin());
+        let mut request = self
+            .writes
+            .post(&url)
+            .header("x-audiolib-admin", "1")
+            .header("Content-Type", "application/json");
+        if self.expected_library_id.is_some() {
+            request = request.header(LIBRARY_ID_HEADER, self.write_library_id()?);
+        }
+        let response = request
+            .send("{}")
+            .map_err(|error| RemoteError::from_transport(error, &url))?;
+        self.read_admin_json(response, &format!("POST {path}"))
+    }
+
+    fn read_admin_json<T: serde::de::DeserializeOwned>(
+        &self,
+        response: ureq::http::Response<ureq::Body>,
+        context: &str,
+    ) -> Result<T> {
+        let mut response = self.checked(response, context)?;
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_JSON_BYTES)
+            .read_to_string()
+            .map_err(|error| RemoteError::from_transport(error, context))?;
+        serde_json::from_str(&body)
+            .map_err(|error| RemoteError::Protocol(format!("{context}: {error}")))
+    }
+
+    /// Check the server's path-search gate without replacing snapshot-owned results.
+    pub(crate) fn probe_path_search(&self, cancel: &AtomicBool) -> Result<()> {
+        let request = audiolib_core::SearchRequest {
+            scope: audiolib_core::SearchScope::Path,
+            limit: 1,
+            ..Default::default()
+        };
+        let body = serde_json::to_string(&request)
+            .map_err(|error| RemoteError::Validation(error.to_string()))?;
+        let compatibility = crate::compatibility::client_header()?;
+        let url = format!("{}/search", self.api);
+        cancellable_io(cancel, || {
+            let mut request = self
+                .agent
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header(
+                    audiolib_core::compatibility::CLIENT_COMPATIBILITY_HEADER,
+                    &compatibility,
+                );
+            if !self.token.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", self.token));
+            }
+            let response = request
+                .send(&body)
+                .map_err(|error| RemoteError::from_transport(error, &url))?;
+            self.checked(response, "POST /api/v1/search")?;
+            Ok(())
+        })
     }
 
     /// `GET /health` (no authentication).

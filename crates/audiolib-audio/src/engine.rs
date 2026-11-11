@@ -1,7 +1,7 @@
 // crates/audiolib-audio/src/engine.rs
 use crate::audition::{AuditionDecoder, AuditionSettings};
 use crate::decoder::Decoder;
-use audiolib_core::{Error, Result};
+use audiolib_core::{AudioFrameRange, Error, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -109,6 +109,10 @@ pub struct PlaybackStatus {
     pub file_path: Option<PathBuf>,
     pub duration: f64,
     pub position: f64,
+    /// Active half-open selection in the original material's frame timeline.
+    /// Reconfiguring a lower-rate representation retains this source interval.
+    #[serde(default)]
+    pub playback_range: Option<AudioFrameRange>,
     pub sample_rate: u32,
     pub device_sample_rate: u32,
     pub channels: u16,
@@ -153,6 +157,13 @@ pub enum AudioCommand {
     /// Seek and then start/resume playback as one ordered control operation.
     /// A failed seek must never fall through to playback at the old position.
     SeekAndPlay(f64),
+    /// Atomically select and play a source interval, rejecting a stale loaded source.
+    PlayRange {
+        range: AudioFrameRange,
+        expected_generation: u64,
+    },
+    /// Remove the selection without starting playback or changing its position.
+    ClearRange,
     SetVolume(f32),
     SetAudition(AuditionSettings),
     /// Acknowledge after all preceding control commands have completed.
@@ -893,6 +904,7 @@ impl Output {
         source_pair: u16,
         playing: bool,
         audition: AuditionSettings,
+        playback_range: Option<AudioFrameRange>,
     ) -> Result<()> {
         let fade_drain_deadline = self.quiesce_source()?;
         self.buffering = Buffering::Off;
@@ -906,13 +918,13 @@ impl Output {
                     "Source channel pair is outside the loaded WAV channels".into(),
                 ));
             }
-            let start_frame = (position * f64::from(decoder.info.metadata.sample_rate)) as u64;
-            self.decoder = AuditionDecoder::new(
+            self.decoder = prepare_audition_decoder(
                 decoder,
                 self.sample_rate,
-                start_frame,
+                position,
                 source_pair,
                 audition,
+                playback_range,
             )?;
             self.realtime.ring.clear_suspended();
             self.realtime.consumed.store(0, Ordering::Relaxed);
@@ -1142,6 +1154,41 @@ impl RenderCallback {
 // client indefinitely while a DAW uses another backend on the same audio interface.
 const WASAPI_IDLE_RELEASE: Duration = Duration::from_millis(500);
 
+fn playback_bounds(status: &PlaybackStatus) -> (f64, f64) {
+    status
+        .playback_range
+        .map_or((0.0, status.duration), |range| {
+            (range.start_seconds(), range.end_seconds())
+        })
+}
+
+fn prepare_audition_decoder(
+    decoder: Decoder,
+    output_rate: u32,
+    position: f64,
+    pair: u16,
+    settings: AuditionSettings,
+    range: Option<AudioFrameRange>,
+) -> Result<AuditionDecoder> {
+    let rate = decoder.info.metadata.sample_rate;
+    if let Some(range) = range {
+        let mapped = range.map_inward(rate, decoder.info.metadata.frames)?;
+        let start_frame = ((position * f64::from(rate)).round() as u64)
+            .clamp(mapped.start_frame, mapped.end_frame);
+        AuditionDecoder::new_bounded(
+            decoder,
+            output_rate,
+            start_frame,
+            mapped.end_frame,
+            pair,
+            settings,
+        )
+    } else {
+        let start_frame = (position * f64::from(rate)) as u64;
+        AuditionDecoder::new(decoder, output_rate, start_frame, pair, settings)
+    }
+}
+
 struct Worker {
     config: PlaybackConfig,
     status: Arc<Mutex<PlaybackStatus>>,
@@ -1203,6 +1250,10 @@ impl Worker {
             let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
             let before = status.clone();
             action(&mut status);
+            if status.playback_range.is_some() {
+                let (start, end) = playback_bounds(&status);
+                status.position = status.position.clamp(start, end);
+            }
             if before.generation != status.generation
                 || matches!(
                     status.state,
@@ -1456,7 +1507,8 @@ impl Worker {
         };
         let mut status = self.snapshot();
         if let Some(position) = position {
-            status.position = position.clamp(0.0, status.duration);
+            let (start, end) = playback_bounds(&status);
+            status.position = position.clamp(start, end);
         }
         let path = status
             .file_path
@@ -1529,13 +1581,13 @@ impl Worker {
                 "Source channel pair is outside the loaded WAV channels".into(),
             ));
         }
-        let start_frame = (status.position * f64::from(decoder.info.metadata.sample_rate)) as u64;
-        let decoder = AuditionDecoder::new(
+        let decoder = prepare_audition_decoder(
             decoder,
             rate,
-            start_frame,
+            status.position,
             self.config.source_pair,
             self.config.audition,
+            status.playback_range,
         )?;
         let realtime = Arc::new(Realtime {
             ring: Ring::new(2 * (rate as usize / 4).max(8192)),
@@ -1701,6 +1753,7 @@ impl Worker {
                         self.config.source_pair,
                         false,
                         self.config.audition,
+                        None,
                     )?;
                 } else {
                     self.close_output();
@@ -1731,21 +1784,31 @@ impl Worker {
                 });
             }
             AudioCommand::Play => {
-                if self.snapshot().state == PlaybackState::Playing {
+                let before = self.snapshot();
+                if before.state == PlaybackState::Playing
+                    && (before.playback_range.is_none()
+                        || before.position < playback_bounds(&before).1)
+                {
                     return Ok(());
                 }
-                if self.snapshot().state == PlaybackState::Ended {
-                    let path = self.snapshot().file_path.unwrap();
+                if before.state == PlaybackState::Ended
+                    || (before.playback_range.is_some()
+                        && before.position >= playback_bounds(&before).1)
+                {
+                    let status = self.snapshot();
+                    let start = playback_bounds(&status).0;
+                    let path = status.file_path.unwrap();
                     if let Some(output) = &mut self.output {
                         output.reset_source(
                             || Decoder::open(&path),
-                            0.0,
+                            start,
                             self.config.source_pair,
                             false,
                             self.config.audition,
+                            status.playback_range,
                         )?;
                     }
-                    self.update(|status| status.position = 0.0);
+                    self.update(|status| status.position = start);
                 }
                 if let Some(output) = &mut self.output {
                     output.start_running()?;
@@ -1757,7 +1820,7 @@ impl Worker {
                     });
                 } else {
                     if self.snapshot().state == PlaybackState::Ended {
-                        self.update(|status| status.position = 0.0);
+                        self.update(|status| status.position = playback_bounds(status).0);
                     }
                     if let Err(error) = self.start_output() {
                         if self.needs_recovery && self.config.backend == AudioBackend::Asio {
@@ -1787,6 +1850,8 @@ impl Worker {
                 }
             }
             AudioCommand::Stop => {
+                let status = self.snapshot();
+                let start = playback_bounds(&status).0;
                 if let Some(output) = &mut self.output {
                     let path = self
                         .status
@@ -1797,14 +1862,15 @@ impl Worker {
                         .unwrap();
                     output.reset_source(
                         || Decoder::open(&path),
-                        0.0,
+                        start,
                         self.config.source_pair,
                         false,
                         self.config.audition,
+                        status.playback_range,
                     )?;
                 }
                 self.update_transport(|status| {
-                    status.position = 0.0;
+                    status.position = start;
                     status.error = None;
                     status.buffering = false;
                     if status.file_path.is_some() {
@@ -1818,7 +1884,8 @@ impl Worker {
                 }
                 let status = self.snapshot();
                 let playing = status.state == PlaybackState::Playing;
-                let position = seconds.clamp(0.0, status.duration);
+                let (start, end) = playback_bounds(&status);
+                let position = seconds.clamp(start, end);
                 if let Some(output) = &mut self.output {
                     output.reset_source(
                         || Decoder::open(status.file_path.as_ref().unwrap()),
@@ -1826,6 +1893,7 @@ impl Worker {
                         self.config.source_pair,
                         playing,
                         self.config.audition,
+                        status.playback_range,
                     )?;
                 } else if playing {
                     self.start_output_at(Some(position))?;
@@ -1833,7 +1901,7 @@ impl Worker {
                 }
                 self.update_transport(|current| {
                     current.position = position;
-                    if status.state == PlaybackState::Ended && position < status.duration {
+                    if status.state == PlaybackState::Ended && position < end {
                         current.state = PlaybackState::Paused;
                     }
                 });
@@ -1841,6 +1909,68 @@ impl Worker {
             AudioCommand::SeekAndPlay(seconds) => {
                 self.command(AudioCommand::Seek(seconds))?;
                 self.command(AudioCommand::Play)?;
+            }
+            AudioCommand::PlayRange {
+                range,
+                expected_generation,
+            } => {
+                let status = self.snapshot();
+                if status.generation != expected_generation || status.file_path.is_none() {
+                    return Err(Error::Validation("Stale playback range source".into()));
+                }
+                let total = (status.duration * f64::from(range.sample_rate)).ceil() as u64;
+                range.validate(total)?;
+                // Validate representation coverage before replacing any valid output.
+                let path = status.file_path.as_ref().unwrap();
+                let decoder = Decoder::open(path)?;
+                range.map_inward(
+                    decoder.info.metadata.sample_rate,
+                    decoder.info.metadata.frames,
+                )?;
+                if let Some(output) = &mut self.output {
+                    output.reset_source(
+                        || Ok(decoder),
+                        range.start_seconds(),
+                        self.config.source_pair,
+                        false,
+                        self.config.audition,
+                        Some(range),
+                    )?;
+                }
+                self.update_transport(|status| {
+                    status.playback_range = Some(range);
+                    status.position = range.start_seconds();
+                    // Play must resume the newly prepared range even if the old source ended.
+                    if matches!(status.state, PlaybackState::Ended | PlaybackState::Playing) {
+                        status.state = PlaybackState::Paused;
+                    }
+                });
+                self.command(AudioCommand::Play)?;
+            }
+            AudioCommand::ClearRange => {
+                let status = self.snapshot();
+                if status.playback_range.is_none() {
+                    return Ok(());
+                }
+                let position = self
+                    .output
+                    .as_ref()
+                    .map_or(status.position, |o| o.position())
+                    .clamp(playback_bounds(&status).0, playback_bounds(&status).1);
+                if let Some(output) = &mut self.output {
+                    output.reset_source(
+                        || Decoder::open(status.file_path.as_ref().unwrap()),
+                        position,
+                        self.config.source_pair,
+                        status.state == PlaybackState::Playing,
+                        self.config.audition,
+                        None,
+                    )?;
+                }
+                self.update_transport(|status| {
+                    status.playback_range = None;
+                    status.position = position;
+                });
             }
             AudioCommand::SetVolume(volume) => {
                 if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
@@ -1878,6 +2008,7 @@ impl Worker {
                             self.config.source_pair,
                             status.state == PlaybackState::Playing,
                             settings,
+                            status.playback_range,
                         )?;
                     }
                     Some(position)
@@ -1950,6 +2081,9 @@ impl Worker {
                 // decoder/network work stays on this worker, never in the callback.
                 let decoder = Decoder::open(&path)?;
                 let metadata = decoder.info.metadata.clone();
+                if let Some(range) = before.playback_range {
+                    range.map_inward(metadata.sample_rate, metadata.frames)?;
+                }
                 if usize::from(config.source_pair) * 2 >= usize::from(metadata.channels) {
                     return Err(Error::Validation(
                         "Source channel pair is outside the replacement WAV channels".into(),
@@ -2082,12 +2216,13 @@ impl Worker {
                     .drain_deadline
                     .is_some_and(|deadline| std::time::Instant::now() >= deadline);
             self.update(|status| {
-                status.position = position.min(status.duration);
+                status.position = position.min(playback_bounds(status).1);
                 status.underruns = underruns;
                 status.buffering = buffering;
             });
             if ended && self.config.audition.loop_enabled && self.snapshot().duration > 0.0 {
-                if let Err(error) = self.execute_command(AudioCommand::Seek(0.0)) {
+                let start = playback_bounds(&self.snapshot()).0;
+                if let Err(error) = self.execute_command(AudioCommand::Seek(start)) {
                     self.update(|status| status.error = Some(error.to_string()));
                 }
                 continue;
@@ -2099,7 +2234,7 @@ impl Worker {
                 }
                 self.update_transport(|status| {
                     status.state = PlaybackState::Ended;
-                    status.position = status.duration;
+                    status.position = playback_bounds(status).1;
                 });
             }
         }
@@ -2114,6 +2249,10 @@ mod seek_tests;
 #[cfg(test)]
 #[path = "transport_tests.rs"]
 mod transport_tests;
+
+#[cfg(test)]
+#[path = "playback_range_tests.rs"]
+mod playback_range_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2199,7 +2338,7 @@ mod tests {
         ));
     }
 
-    fn worker(status: PlaybackStatus) -> Worker {
+    pub(super) fn worker(status: PlaybackStatus) -> Worker {
         Worker::new(
             PlaybackConfig::default(),
             Arc::new(Mutex::new(status)),
@@ -2208,7 +2347,7 @@ mod tests {
     }
     // No CPAL stream is constructed: these fixtures exercise the actual ring,
     // source decoder and control transitions without accessing audio hardware.
-    fn prepared_output(path: &std::path::Path) -> Output {
+    pub(super) fn prepared_output(path: &std::path::Path) -> Output {
         crate::tests::write_wav(path, 1000, 1, 16, 1, &vec![0; 2000], false, false);
         Output {
             stream: None,
@@ -2245,6 +2384,59 @@ mod tests {
             drain_deadline: None,
         }
     }
+    #[test]
+    fn reused_output_loads_flac_oga_then_ogg_with_correct_ready_pcm_and_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut output = prepared_output(&temp.path().join("device.wav"));
+        output.sample_rate = 8000;
+        let realtime = output.realtime.clone();
+        let mut worker = worker(PlaybackStatus::default());
+        worker.output = Some(output);
+        for name in ["comments.flac", "comments.oga", "comments.ogg"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/fixtures/vorbis")
+                .join(name);
+            let expected = Decoder::open(&path).unwrap().read(4096).unwrap();
+            worker
+                .execute_command(AudioCommand::Load(path.clone()))
+                .unwrap();
+            let ready = worker.snapshot();
+            assert_eq!(ready.state, PlaybackState::Ready, "{name}");
+            assert_eq!(ready.file_path.as_ref(), Some(&path));
+            assert_eq!(ready.error, None, "{name}");
+            assert_eq!(ready.sample_rate, 8000);
+            assert!((ready.duration - 0.08).abs() < 0.000001);
+            assert!(Arc::ptr_eq(
+                &worker.output.as_ref().unwrap().realtime,
+                &realtime
+            ));
+            worker.execute_command(AudioCommand::Play).unwrap();
+            let output = worker.output.as_mut().unwrap();
+            let mut rendered = Vec::new();
+            loop {
+                while let Some(sample) = output.realtime.ring.pop() {
+                    rendered.push(sample);
+                }
+                if output.eof {
+                    break;
+                }
+                output.fill().unwrap();
+            }
+            let expected_stereo: Vec<_> = expected
+                .iter()
+                .flat_map(|sample| [*sample, *sample])
+                .collect();
+            assert_eq!(rendered, expected_stereo, "{name} complete reused-ring PCM");
+            assert_eq!(rendered.len(), 1280);
+            assert!(rendered.iter().any(|sample| sample.abs() > 0.001));
+            worker.execute_command(AudioCommand::Pause).unwrap();
+            let ended = worker.snapshot();
+            assert_eq!(ended.state, PlaybackState::Ended, "{name}");
+            assert_eq!(ended.file_path.as_ref(), Some(&path));
+            assert_eq!(ended.error, None, "{name}");
+        }
+    }
+
     #[test]
     fn idle_wasapi_output_releases_after_grace_without_changing_transport() {
         let temp = tempfile::tempdir().unwrap();
@@ -2428,7 +2620,7 @@ mod tests {
             // logical position/configuration as start_output, then use real Play.
             let mut resumed = prepared_output(&path);
             resumed
-                .reset_source(|| Decoder::open(&path), 0.25, 0, false, settings)
+                .reset_source(|| Decoder::open(&path), 0.25, 0, false, settings, None)
                 .unwrap();
             resumed.volume = worker.config.volume;
             worker.output = Some(resumed);

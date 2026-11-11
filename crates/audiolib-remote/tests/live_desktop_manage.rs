@@ -90,6 +90,9 @@ fn provider(
             WriteEvent::Applied { revision } => format!("applied {revision}"),
             WriteEvent::Resync { .. } => "resync".into(),
             WriteEvent::LibraryChanged { .. } => "library-changed".into(),
+            WriteEvent::MigrationWaiting { retry_after, .. } => {
+                format!("migration-wait {retry_after}")
+            }
         });
     });
     RemoteProvider::new(snapshot, writer, true, Some(listener))

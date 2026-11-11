@@ -5,9 +5,29 @@ use anyhow::{Context, Result};
 use audiolib_update::{PreparedUpdate, Product, ReleaseUpdate, UpdateClient};
 use slint::ComponentHandle;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+
+type ServerUpgradeHook = Arc<dyn Fn(String) + Send + Sync>;
+
+fn server_upgrade_hook() -> &'static Mutex<Option<ServerUpgradeHook>> {
+    static HOOK: OnceLock<Mutex<Option<ServerUpgradeHook>>> = OnceLock::new();
+    HOOK.get_or_init(Default::default)
+}
+
+/// Open the existing update dialog with a server-prompted message and run a check
+/// (never auto-installs). No-op when updates were not installed for this process.
+pub(crate) fn offer_client_upgrade_check(message: impl Into<String>) {
+    let message = message.into();
+    if let Some(hook) = server_upgrade_hook()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        hook(message);
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -97,6 +117,30 @@ impl DesktopUpdates {
                 );
             }
         });
+        let prompt_ui = ui.as_weak();
+        let prompt_client = client.clone();
+        let prompt_state = state.clone();
+        let prompt_stopped = stopped.clone();
+        *server_upgrade_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(move |message: String| {
+                let Some(ui) = prompt_ui.upgrade() else {
+                    return;
+                };
+                if ui.get_closing() {
+                    return;
+                }
+                ui.set_update_visible(true);
+                ui.set_update_message(message.into());
+                check(
+                    &ui,
+                    prompt_client.clone(),
+                    prompt_state.clone(),
+                    prompt_stopped.clone(),
+                );
+            }));
+
         let weak = ui.as_weak();
         let install_state = state.clone();
         let install_stopped = stopped.clone();
@@ -201,6 +245,9 @@ impl DesktopUpdates {
 impl Drop for DesktopUpdates {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        *server_upgrade_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 

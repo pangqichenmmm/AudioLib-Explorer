@@ -1,9 +1,46 @@
 {
   "capability_max": {
     "x-audiolib-search-storage-max": 1,
-    "x-audiolib-snapshot-schema-max": 8,
+    "x-audiolib-snapshot-schema-max": 9,
     "x-audiolib-tokenization-max": 3
   },
+  "extended_server": {
+    "features": {
+      "album_entities": 1,
+      "audio_sources": 1,
+      "foreign_key_indexes": 1,
+      "play_history_retired": 2,
+      "search_indexes": 1,
+      "search_path": 1,
+      "search_storage": 1,
+      "stable_audio_ids": 1,
+      "tokenization": 3,
+      "vendor_metadata": 1,
+      "vorbis_tags": 1
+    },
+    "schema_version": 9,
+    "source_search_revision": 3,
+    "source_tags_revision": 2,
+    "storage": "contentless_delete"
+  },
+  "extended_server_id": "ale-s9-cld1-t3-m2-p1-a1-sd1-af1",
+  "extended_target": {
+    "features": {
+      "album_entities": 1,
+      "audio_sources": 1,
+      "foreign_key_indexes": 1,
+      "play_history_retired": 2,
+      "search_indexes": 1,
+      "search_storage": 1,
+      "stable_audio_ids": 1,
+      "tokenization": 3
+    },
+    "schema_version": 8,
+    "source_search_revision": 2,
+    "source_tags_revision": 2,
+    "storage": "contentless_delete"
+  },
+  "extended_target_id": "ale-s8-cld1-t3-m2-p1-a1-af1",
   "legacy_compressed": {
     "features": {
       "album_entities": 1,
@@ -34,7 +71,10 @@
     "ale-s7-cld1-t3-m2-p0",
     "ale-s7-cld1-t3-m2-p1",
     "ale-s8-cld1-t3-m2-p1-a1-z1",
-    "ale-s8-cld1-t3-m2-p1-a1"
+    "ale-s8-cld1-t3-m2-p1-a1",
+    "ale-s9-cld1-t3-m2-p1-a1-sd1",
+    "ale-s8-cld1-t3-m2-p1-a1-af1",
+    "ale-s9-cld1-t3-m2-p1-a1-sd1-af1"
   ],
   "target": {
     "features": {

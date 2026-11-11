@@ -489,6 +489,9 @@ impl TransferSession {
         let parent = destination.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         if let (Some(wire), Some(output)) = (object.wire_length, object.output_length) {
+            // The resumable wire payload stays under the cache root even when
+            // the decoded snapshot is prepared on a different volume.
+            audiolib_db::ensure_free_space(&self.directory, wire.saturating_sub(offset))?;
             audiolib_db::ensure_free_space(
                 parent,
                 wire.saturating_sub(offset).saturating_add(output),

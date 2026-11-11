@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+mod server_pair_tests;
+
 /// Verified staged payload. Downloading has no effect until handoff is requested.
 pub struct PreparedUpdate {
     stage: tempfile::TempDir,

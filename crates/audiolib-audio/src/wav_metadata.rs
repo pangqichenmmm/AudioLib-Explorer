@@ -70,7 +70,7 @@ fn xml_text(bytes: &[u8]) -> String {
     decoded.trim_matches(['\0', '\u{feff}']).trim().to_string()
 }
 
-fn append(map: &mut Map<String, Value>, key: &str, value: &str) {
+pub(crate) fn append(map: &mut Map<String, Value>, key: &str, value: &str) {
     let value = value.trim_matches(['\0', '\u{feff}']).trim();
     if value.is_empty() || map.len() >= MAX_FIELDS {
         return;
@@ -462,7 +462,7 @@ fn field_name(path: &str) -> String {
         .collect()
 }
 
-fn canonical_field(group: &str, path: &str) -> Option<&'static str> {
+pub(crate) fn canonical_field(group: &str, path: &str) -> Option<&'static str> {
     if group == "id3" && (path.starts_with("COMM/") || path.starts_with("COM/")) {
         return Some("description");
     }

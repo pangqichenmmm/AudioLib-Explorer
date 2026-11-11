@@ -2293,50 +2293,55 @@ mod tests {
         let bits = capture::marker_bits(&token);
         ui.set_perf_marker_enabled(true);
         ui.set_perf_marker_bits(ModelRc::new(VecModel::from(bits.to_vec())));
-        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
-            ui.window()
-                .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
-                    scale_factor: scale,
-                });
-            ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
-            let width = (1440.0 * scale) as usize;
-            let height = (900.0 * scale) as usize;
-            let cell_width = (3.0 * scale).ceil() as usize;
-            let cell_height = (6.0 * scale).ceil() as usize;
-            let left = width - 64 * cell_width - 4;
-            let top = height - 2 * cell_height - 4;
-            ui.set_perf_marker_cell_width(cell_width as f32 / scale);
-            ui.set_perf_marker_cell_height(cell_height as f32 / scale);
-            ui.set_perf_marker_x(left as f32 / scale);
-            ui.set_perf_marker_y(top as f32 / scale);
-            ui.show().unwrap();
-            slint::platform::update_timers_and_animations();
-            let mut pixels = vec![slint::Rgb8Pixel::default(); width * height];
-            assert!(adapter.draw_if_needed(|renderer| {
-                renderer.render(&mut pixels, width);
-            }));
-            slint::platform::update_timers_and_animations();
-            assert!(
-                ui.get_perf_marker_parent_y() > 0.0,
-                "software menu must exercise a nonzero parent offset"
-            );
-            for (index, bit) in bits.iter().enumerate() {
-                let x = left + (index % 64) * cell_width;
-                let y = top + (index / 64) * cell_height;
-                let expected = if *bit { 255 } else { 0 };
-                for row in y..y + cell_height {
-                    for column in x..x + cell_width {
-                        let pixel = pixels[row * width + column];
-                        assert_eq!(
-                            [pixel.r, pixel.g, pixel.b],
-                            [expected; 3],
-                            "scale={scale}, bit={index}, pixel=({column},{row})"
-                        );
+        for native_menu in [false, true] {
+            // Exercise both platform variants through the testing backend's
+            // software menu; the client-coordinate compensation stays identical.
+            ui.set_native_macos(native_menu);
+            for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+                        scale_factor: scale,
+                    });
+                ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+                let width = (1440.0 * scale) as usize;
+                let height = (900.0 * scale) as usize;
+                let cell_width = (3.0 * scale).ceil() as usize;
+                let cell_height = (6.0 * scale).ceil() as usize;
+                let left = width - 64 * cell_width - 4;
+                let top = height - 2 * cell_height - 4;
+                ui.set_perf_marker_cell_width(cell_width as f32 / scale);
+                ui.set_perf_marker_cell_height(cell_height as f32 / scale);
+                ui.set_perf_marker_x(left as f32 / scale);
+                ui.set_perf_marker_y(top as f32 / scale);
+                ui.show().unwrap();
+                slint::platform::update_timers_and_animations();
+                let mut pixels = vec![slint::Rgb8Pixel::default(); width * height];
+                assert!(adapter.draw_if_needed(|renderer| {
+                    renderer.render(&mut pixels, width);
+                }));
+                slint::platform::update_timers_and_animations();
+                assert!(
+                    ui.get_perf_marker_parent_y() > 0.0,
+                    "software menu must exercise a nonzero parent offset"
+                );
+                for (index, bit) in bits.iter().enumerate() {
+                    let x = left + (index % 64) * cell_width;
+                    let y = top + (index / 64) * cell_height;
+                    let expected = if *bit { 255 } else { 0 };
+                    for row in y..y + cell_height {
+                        for column in x..x + cell_width {
+                            let pixel = pixels[row * width + column];
+                            assert_eq!(
+                                [pixel.r, pixel.g, pixel.b],
+                                [expected; 3],
+                                "scale={scale}, bit={index}, pixel=({column},{row})"
+                            );
+                        }
                     }
                 }
+                assert!((ui.get_perf_marker_actual_client_x() * scale - left as f32).abs() < 0.01);
+                assert!((ui.get_perf_marker_actual_client_y() * scale - top as f32).abs() < 0.01);
             }
-            assert!((ui.get_perf_marker_actual_client_x() * scale - left as f32).abs() < 0.01);
-            assert!((ui.get_perf_marker_actual_client_y() * scale - top as f32).abs() < 0.01);
         }
         ui.hide().unwrap();
     }

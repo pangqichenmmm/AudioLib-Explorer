@@ -9,6 +9,16 @@
 # database migration at the health timeout.
 #
 # Usage:  redeploy-server.sh /path/to/new/audiolib-server
+# Layout 2 additionally requires explicit NEW_MIGRATOR, full PAIR_SOURCE_COMMIT,
+# PAIR_TARGET and trusted EXPECT_SERVER_SHA256 / EXPECT_MIGRATOR_SHA256 identities.
+# PAIR_RECEIPT + PAIR_RECEIPT_SHA256 may supply hashes from native package acceptance.
+# REQUIRES_PAIR=1 forces layout 2 (beta always does); installed pair state also does.
+# DATABASE_PATH must explicitly identify the existing configured library for a pair;
+# DATA_DIR/LIBRARY_DB guesses are never accepted as a pair rollback safety proof.
+# DEPLOY_PREFLIGHT_ONLY=1 validates and stages without stopping or backing up data.
+# DEPLOY_QUIESCE_ONLY=1 stages/preflights then proves graceful stop; never installs.
+# ROLLBACK_SCHEMA_VERSION optionally supplies a trusted numeric pre-refresh schema;
+# beta derives it from the actual stopped library, never from a guessed path.
 #
 # Configuration (environment variables, all optional):
 #   INSTALL_DIR   directory holding the installed binary      (default /opt/audiolib)
@@ -63,6 +73,16 @@ log() { echo "[redeploy] $*"; }
 NEW="$1"
 [ -f "$NEW" ] && [ -x "$NEW" ] || die "$NEW is not an executable file"
 CUR="$INSTALL_DIR/$BINARY"
+MIGRATOR="${MIGRATOR:-audiolib-migrate}"
+CUR_MIGRATOR="$INSTALL_DIR/$MIGRATOR"
+PAIR_RECORD="$INSTALL_DIR/server-deployment-pair.json"
+DB="$DATA_DIR/$LIBRARY_DB"
+PAIR_MODE=0; OLD_MIGRATOR_PRESENT=0; OLD_PAIR_RECORD_PRESENT=0
+STAGED_SERVER=""; STAGED_MIGRATOR=""
+for name in "$BINARY" "$MIGRATOR"; do
+    case "$name" in ''|.|..|*/*) die "binary names must be distinct basenames" ;; esac
+done
+[ "$BINARY" != "$MIGRATOR" ] || die "server and migrator names must differ"
 [ -f "$CUR" ] || die "$CUR not found (set INSTALL_DIR/BINARY)"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 UPDATE_METADATA=0
@@ -261,11 +281,12 @@ def unique(pairs):
     return result
 value = json.load(sys.stdin, object_pairs_hook=unique, parse_constant=invalid)
 for key in sys.argv[1].split("."):
-    if type(value) is not dict: invalid()
-    value = value[key]
-kind = {"string": str, "integer": int, "dictionary": dict}[sys.argv[2]]
+    if type(value) is list and key.isdigit(): value = value[int(key)]
+    elif type(value) is dict: value = value[key]
+    else: invalid()
+kind = {"string": str, "integer": int, "dictionary": dict, "boolean": bool}[sys.argv[2]]
 if type(value) is not kind: invalid()
-print("dictionary" if kind is dict else value)
+print("dictionary" if kind is dict else (str(value).lower() if kind is bool else value))
 ' "$2" "$3" 2>/dev/null
 }
 
@@ -301,7 +322,108 @@ candidate_migration() {
     printf '%s\n' "$phase"
 }
 
+
+# Identity and staging never invoke the migrator against a library. Its version
+# is deliberately not probed: the production CLI has no --version command.
+sha256_file() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print tolower($1)}'
+    elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print tolower($1)}'
+    else die "shasum or sha256sum is required"; fi
+}
+sha_matches() { [ "$(sha256_file "$1")" = "$(printf '%s' "$2" | tr 'A-F' 'a-f')" ]; }
+receipt_check() {
+    n=0
+    while [ "$n" -lt 64 ]; do
+        check="$(health_field "$1" "checks.$n" string)" || return 1
+        [ "$check" != "$2" ] || return 0
+        n=$((n + 1))
+    done
+    return 1
+}
+preflight_pair() {
+    version_line="$("$NEW" --version)" || die "candidate version probe failed"
+    candidate_version="${version_line#audiolib-server }"
+    printf '%s\n' "$candidate_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die "unexpected candidate server version"
+    major="${candidate_version%%.*}"; rest="${candidate_version#*.}"; minor="${rest%%.*}"
+    case "${REQUIRES_PAIR:-0}" in 0|1) ;; *) die "REQUIRES_PAIR must be 0 or 1" ;; esac
+    if [ "${REQUIRES_PAIR:-0}" = 1 ] || [ -n "${NEW_MIGRATOR:-}" ] ||
+        [ -e "$CUR_MIGRATOR" ] || [ -L "$CUR_MIGRATOR" ] || [ -e "$PAIR_RECORD" ] || [ -L "$PAIR_RECORD" ] ||
+        [ "$major" -ge 1 ] || [ "$minor" -ge 9 ]; then PAIR_MODE=1; fi
+    [ "$PAIR_MODE" = 1 ] || return 0
+    [ -n "${NEW_MIGRATOR:-}" ] && [ -f "$NEW_MIGRATOR" ] && [ -x "$NEW_MIGRATOR" ] && [ ! -L "$NEW_MIGRATOR" ] || die "layout 2 requires an explicit executable NEW_MIGRATOR"
+    [ ! -L "$NEW" ] && [ ! -L "$CUR" ] || die "linked server binary is not supported"
+    for file in "$CUR_MIGRATOR" "$PAIR_RECORD"; do
+        [ ! -L "$file" ] && { [ ! -e "$file" ] || [ -f "$file" ]; } || die "installed pair object is not a regular file"
+    done
+    PAIR_SOURCE_COMMIT="${PAIR_SOURCE_COMMIT:-${EXPECT_COMMIT:-}}"
+    printf '%s\n' "$PAIR_SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || die "layout 2 requires a full source commit"
+    printf '%s\n' "${PAIR_TARGET:-}" | grep -Eq '^[a-z0-9_]+-[a-z0-9_-]+$' || die "layout 2 requires the native PAIR_TARGET"
+    [ -n "${DATABASE_PATH:-}" ] || die "layout 2 requires explicit DATABASE_PATH from the active configuration"
+    case "$DATABASE_PATH" in /*) ;; *) die "DATABASE_PATH must be absolute" ;; esac
+    [ ! -L "$DATABASE_PATH" ] || die "configured DATABASE_PATH is linked"
+    if [ "${DEPLOY_PREFLIGHT_ONLY:-0}" != 1 ]; then
+        [ -f "$DATABASE_PATH" ] || die "configured DATABASE_PATH is missing; initialize/recover it separately"
+    fi
+    DB="$DATABASE_PATH"
+    [ -z "${EXPECT_COMMIT:-}" ] || commit_matches "$EXPECT_COMMIT" "$PAIR_SOURCE_COMMIT" || die "pair source differs from expected health commit"
+    EXPECT_COMMIT="$PAIR_SOURCE_COMMIT"
+    if [ -n "${PAIR_RECEIPT:-}" ]; then
+        [ -f "$PAIR_RECEIPT" ] && [ ! -L "$PAIR_RECEIPT" ] && [ -n "${PAIR_RECEIPT_SHA256:-}" ] || die "accepted receipt and its trusted SHA256 are required"
+        sha_matches "$PAIR_RECEIPT" "$PAIR_RECEIPT_SHA256" || die "accepted receipt SHA256 differs"
+        [ "$(wc -c < "$PAIR_RECEIPT" | tr -d ' ')" -le 65536 ] || die "accepted receipt exceeds identity limit"
+        receipt="$(cat "$PAIR_RECEIPT")"
+        [ "$(health_field "$receipt" success boolean)" = true ] &&
+            [ "$(health_field "$receipt" layout_revision integer)" = 2 ] &&
+            [ "$(health_field "$receipt" commit string)" = "$PAIR_SOURCE_COMMIT" ] &&
+            [ "$(health_field "$receipt" target string)" = "$PAIR_TARGET" ] &&
+            [ "$(health_field "$receipt" version string)" = "$candidate_version" ] &&
+            receipt_check "$receipt" 'production migrator excludes test-hooks' &&
+            receipt_check "$receipt" 'owned migrator status/start/status/rollback/status 8/9/8' || die "receipt is not matching native layout-2 production acceptance"
+        server_hash="$(health_field "$receipt" binary_sha256 string)"; migrator_hash="$(health_field "$receipt" migrator_sha256 string)"
+        [ -z "${EXPECT_SERVER_SHA256:-}" ] || [ "$(printf '%s' "$EXPECT_SERVER_SHA256" | tr 'A-F' 'a-f')" = "$(printf '%s' "$server_hash" | tr 'A-F' 'a-f')" ] || die "server receipt/hash identities differ"
+        [ -z "${EXPECT_MIGRATOR_SHA256:-}" ] || [ "$(printf '%s' "$EXPECT_MIGRATOR_SHA256" | tr 'A-F' 'a-f')" = "$(printf '%s' "$migrator_hash" | tr 'A-F' 'a-f')" ] || die "migrator receipt/hash identities differ"
+        EXPECT_SERVER_SHA256="$server_hash"; EXPECT_MIGRATOR_SHA256="$migrator_hash"
+    fi
+    for hash in "${EXPECT_SERVER_SHA256:-}" "${EXPECT_MIGRATOR_SHA256:-}"; do
+        printf '%s\n' "$hash" | grep -Eq '^[0-9a-fA-F]{64}$' || die "both explicit pair SHA256 identities are required"
+    done
+    sha_matches "$NEW" "$EXPECT_SERVER_SHA256" && sha_matches "$NEW_MIGRATOR" "$EXPECT_MIGRATOR_SHA256" || die "candidate pair SHA256 differs"
+}
+cleanup_staging() {
+    [ -z "$STAGED_SERVER" ] || rm -f -- "$STAGED_SERVER"
+    [ -z "$STAGED_MIGRATOR" ] || rm -f -- "$STAGED_MIGRATOR"
+}
+stage_candidates() {
+    STAGED_SERVER="$(mktemp "$INSTALL_DIR/.$BINARY.stage.XXXXXX")" || die "cannot reserve staged server"
+    install -m 755 "$NEW" "$STAGED_SERVER" || die "cannot stage server"
+    [ "$PAIR_MODE" = 1 ] || return 0
+    STAGED_MIGRATOR="$(mktemp "$INSTALL_DIR/.$MIGRATOR.stage.XXXXXX")" || die "cannot reserve staged migrator"
+    install -m 755 "$NEW_MIGRATOR" "$STAGED_MIGRATOR" || die "cannot stage migrator"
+    sha_matches "$STAGED_SERVER" "$EXPECT_SERVER_SHA256" && sha_matches "$STAGED_MIGRATOR" "$EXPECT_MIGRATOR_SHA256" || die "staged pair SHA256 differs"
+}
+current_schema() {
+    if [ ! -e "$DB" ]; then printf '%s\n' absent; return 0; fi
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    schema="$(sqlite3 -readonly "$DB" 'PRAGMA user_version;' 2>/dev/null)" || return 1
+    case "$schema" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$schema"
+}
 preflight_service
+preflight_pair
+trap cleanup_staging EXIT
+stage_candidates
+if [ "${DEPLOY_PREFLIGHT_ONLY:-0}" = 1 ]; then
+    log "preflight passed: staged candidate identities verified; no service/data changes"
+    exit 0
+fi
+if [ "${DEPLOY_QUIESCE_ONLY:-0}" != 1 ]; then
+    ENTRY_SCHEMA="$(current_schema)" || die "cannot prove the original library schema read-only; deployment not started"
+    ORIGINAL_SCHEMA="$ENTRY_SCHEMA"
+    if [ -n "${ROLLBACK_SCHEMA_VERSION:-}" ]; then
+        printf '%s\n' "$ROLLBACK_SCHEMA_VERSION" | grep -Eq '^[0-9]+$' || die "ROLLBACK_SCHEMA_VERSION must be an explicitly trusted numeric baseline"
+        ORIGINAL_SCHEMA="$ROLLBACK_SCHEMA_VERSION"
+    fi
+fi
 
 # 1. No scan may be running.
 log "checking for a running scan"
@@ -318,23 +440,34 @@ if pgrep -fl "audiolib.*(db rebuild-search|scan)" >/dev/null 2>&1; then
     die "an audiolib maintenance command is running; wait for it to finish"
 fi
 
+# Quiesce is a standalone bounded operation for beta's explicit DB refresh.
+# Neither binaries/markers nor library/sidecars are replaced by this mode.
+if [ "${DEPLOY_QUIESCE_ONLY:-0}" = 1 ]; then
+    if ! stop_service; then
+        die "old server did not drain; binaries and library/sidecars were not replaced"
+    fi
+    log "quiesced: service/job/pid/port have stopped; no binaries or library replaced"
+    exit 0
+fi
+
 # 2. Back up the library and the old binary.
 TS="$(date +%Y%m%d-%H%M%S)"
-DEST="$BACKUP_DIR/$TS"
-mkdir -p "$DEST"
+mkdir -p "$BACKUP_DIR"
+DEST="$(mktemp -d "$BACKUP_DIR/$TS.XXXXXX")" || die "cannot reserve a unique backup"
 cp -p "$CUR" "$DEST/$BINARY.bin"
-DB="$DATA_DIR/$LIBRARY_DB"
-if [ -f "$DB" ]; then
-    log "backing up $DB to $DEST (needs free space for the library plus its WAL)"
-    # `cp -c` (APFS clone) is instant on macOS; fall back to a plain copy elsewhere.
-    for f in "$DB" "$DB-wal" "$DB-shm"; do
-        [ -f "$f" ] || continue
-        cp -c "$f" "$DEST/" 2>/dev/null || cp -p "$f" "$DEST/" || die "backup of $f failed"
-    done
-else
-    log "warning: $DB not found, library backup skipped"
-fi
+# A running SQLite DB/WAL/SHM tuple is never copied as a backup. The logical
+# backup is created only after proven drain, below, before installing either bin.
+
 cp -p "$CUR" "$CUR.prev"
+if [ "$PAIR_MODE" = 1 ]; then
+    if [ -f "$CUR_MIGRATOR" ]; then
+        OLD_MIGRATOR_PRESENT=1
+        cp -p "$CUR_MIGRATOR" "$DEST/$MIGRATOR.bin"
+        cp -p "$CUR_MIGRATOR" "$CUR_MIGRATOR.prev"
+    fi
+    printf '%s\n' "$OLD_MIGRATOR_PRESENT" > "$DEST/migrator-before-present.txt"
+    if [ -f "$PAIR_RECORD" ]; then OLD_PAIR_RECORD_PRESENT=1; cp -p "$PAIR_RECORD" "$DEST/server-deployment-pair.json"; fi
+fi
 if [ "$UPDATE_METADATA" = 1 ]; then
     OLD_CHANNEL_PRESENT=0; OLD_VERSION_PRESENT=0
     [ ! -f "$INSTALL_DIR/update-channel.txt" ] || OLD_CHANNEL_PRESENT=1
@@ -372,11 +505,41 @@ restore_markers() {
 TRANSACTION_STARTED=0; COMMITTED=0; ROLLBACK_DONE=0; RETAIN_MIGRATING=0
 rollback() {
     ROLLBACK_DONE=1
-    log "ROLLBACK: stopping the candidate, then restoring the previous binary"
+    {
+        rollback_schema="$(current_schema)" || rollback_schema=unverified
+        if [ "$rollback_schema" != "$ORIGINAL_SCHEMA" ]; then
+            RETAIN_MIGRATING=1
+            log "NOT VERIFIED: library schema changed or cannot be verified; retained candidate pair and backups at $DEST"
+            log "No binary-only downgrade performed; use the matching library backup and manual recovery."
+            return 1
+        fi
+    }
+    log "ROLLBACK: stopping the candidate, then restoring the previous binary pair"
     stop_service || { log "candidate did not stop; binary not swapped back; backup retained at $DEST"; return 1; }
+    # Graceful drain can finish a migration after the pre-stop observation.
+    # Recheck after the actual writer has stopped before admitting old binaries.
+    {
+        rollback_schema="$(current_schema)" || rollback_schema=unverified
+        if [ "$rollback_schema" != "$ORIGINAL_SCHEMA" ]; then
+            RETAIN_MIGRATING=1
+            log "NOT VERIFIED: schema changed during drain; candidate pair retained stopped, backups at $DEST"
+            log "No binary-only downgrade performed; use the matching library backup and manual recovery."
+            return 1
+        fi
+    }
     install -m 755 "$CUR.prev" "$CUR.new" && mv -f "$CUR.new" "$CUR" || {
         log "binary rollback failed; backup retained at $DEST"; return 1;
     }
+    if [ "$PAIR_MODE" = 1 ]; then
+        if [ "$OLD_MIGRATOR_PRESENT" = 1 ]; then
+            install -m 755 "$DEST/$MIGRATOR.bin" "$CUR_MIGRATOR.new" && mv -f "$CUR_MIGRATOR.new" "$CUR_MIGRATOR" || { log "migrator rollback failed; service remains stopped"; return 1; }
+        else
+            rm -f -- "$CUR_MIGRATOR" || return 1
+        fi
+        if [ "$OLD_PAIR_RECORD_PRESENT" = 1 ]; then
+            cp -p "$DEST/server-deployment-pair.json" "$PAIR_RECORD.new" && mv -f "$PAIR_RECORD.new" "$PAIR_RECORD" || return 1
+        else rm -f -- "$PAIR_RECORD" || return 1; fi
+    fi
     # The old process reads its release identity once during startup, so restore
     # both markers before restarting it, rather than after this script returns.
     restore_markers || { log "marker rollback failed; backup retained at $DEST"; return 1; }
@@ -392,25 +555,54 @@ rollback() {
 on_exit() {
     result=$?
     if [ "$TRANSACTION_STARTED" = 1 ] && [ "$COMMITTED" = 0 ] && [ "$ROLLBACK_DONE" = 0 ] && [ "$RETAIN_MIGRATING" = 0 ]; then rollback || true; fi
+    cleanup_staging
     exit "$result"
 }
 trap on_exit EXIT
 
 # 3. Stop the old server, wait for it to exit, then replace the binary and its
 #    optional release identity before starting it.
-install -m 755 "$NEW" "$CUR.new"
 if ! stop_service; then
-    rm -f "$CUR.new"
-    # Nothing was swapped; bring a booted-out old server back unchanged.
-    if [ "$SERVICE_MANAGER" = launchd ] && ! launchd_loaded; then start_service || true; fi
+    # A booted-out job can still own a draining PID/port. Never bootstrap a
+    # second instance when stopped state could not be proved.
     die "old server did not stop within ${STOP_TIMEOUT}s; binary not replaced"
+fi
+DRAINED_SCHEMA="$(current_schema)" || DRAINED_SCHEMA=unverified
+printf '%s\n' "entry_schema=$ENTRY_SCHEMA" "drained_schema=$DRAINED_SCHEMA" "rollback_baseline=$ORIGINAL_SCHEMA" > "$DEST/schema-state.txt"
+if [ -f "$DB" ]; then
+    snapshot="$DEST/$(basename "$DB")"
+    quoted_snapshot="$(printf '%s' "$snapshot" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    log "backing up the stopped library logical image to $DEST"
+    sqlite3 -readonly "$DB" ".backup \"$quoted_snapshot\"" || die "stopped-library backup failed; no binary replaced and service remains stopped"
+    # A WAL-mode backup can retain its WAL header without companion files.
+    # Finalize only this new owned image so it is independently readable.
+    [ -f "$snapshot" ] && [ ! -L "$snapshot" ] &&
+        snapshot_mode="$(sqlite3 "$snapshot" 'PRAGMA journal_mode=DELETE;')" && [ "$snapshot_mode" = delete ] || die "stopped-library backup finalization failed; no binary replaced and service remains stopped"
+    [ "$(sqlite3 -readonly "$snapshot" 'PRAGMA quick_check;')" = ok ] || die "stopped-library backup validation failed; no binary replaced and service remains stopped"
+else
+    log "library is absent after drain; no logical backup available"
+fi
+if [ "$DRAINED_SCHEMA" != "$ENTRY_SCHEMA" ]; then
+    log "No binary-only downgrade performed: library schema changed or cannot be verified during drain."
+    die "candidate not installed; keep service stopped and inspect matching library/binary backups in $DEST"
 fi
 log "installing new binary"
 TRANSACTION_STARTED=1
-mv -f "$CUR.new" "$CUR"
+mv -f "$STAGED_SERVER" "$CUR"; STAGED_SERVER=""
+if [ "$PAIR_MODE" = 1 ]; then
+    mv -f "$STAGED_MIGRATOR" "$CUR_MIGRATOR"; STAGED_MIGRATOR=""
+    sha_matches "$CUR" "$EXPECT_SERVER_SHA256" && sha_matches "$CUR_MIGRATOR" "$EXPECT_MIGRATOR_SHA256" || die "installed pair SHA256 differs"
+    pair_record="$(mktemp "$INSTALL_DIR/.server-deployment-pair.new.XXXXXX")" || die "cannot stage pair identity"
+    printf '{"layout_revision":2,"commit":"%s","target":"%s","binary_sha256":"%s","migrator_sha256":"%s"}\n' "$PAIR_SOURCE_COMMIT" "$PAIR_TARGET" "$EXPECT_SERVER_SHA256" "$EXPECT_MIGRATOR_SHA256" > "$pair_record"
+    chmod 644 "$pair_record" && mv -f "$pair_record" "$PAIR_RECORD" || die "cannot install pair identity"
+fi
 if [ "$UPDATE_METADATA" = 1 ]; then
     write_marker update-channel.txt "$UPDATE_CHANNEL"
     write_marker update-version.txt "$UPDATE_VERSION"
+    [ "$(cat "$INSTALL_DIR/update-channel.txt")" = "$UPDATE_CHANNEL" ] && [ "$(cat "$INSTALL_DIR/update-version.txt")" = "$UPDATE_VERSION" ] || die "installed update markers differ"
+fi
+if [ "$PAIR_MODE" = 1 ]; then
+    sha_matches "$CUR" "$EXPECT_SERVER_SHA256" && sha_matches "$CUR_MIGRATOR" "$EXPECT_MIGRATOR_SHA256" || die "installed pair changed before startup"
 fi
 
 # 4. Start and verify.
@@ -423,7 +615,7 @@ fi
 if migration_phase="$(candidate_migration "$LAST_HEALTH")"; then
     RETAIN_MIGRATING=1
     log "NOT VERIFIED: health wait expired while the identified candidate reports database migration ($migration_phase)"
-    log "Retained new binary, update markers and backups at $DEST; no rollback or second restart was performed."
+    log "Retained new binary pair, update markers and backups at $DEST; no rollback or second restart was performed."
     log "Check health and service logs manually; use the matching CLI migration inspect/resume/rollback workflow if recovery is needed."
     die "migration still running; deployment acceptance failed and candidate was retained"
 fi

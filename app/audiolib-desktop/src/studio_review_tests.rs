@@ -207,11 +207,19 @@ fn default_tab_navigation_reveals_the_scaled_player_before_keyboard_play() {
         let mut last_seen = None;
         for step in 0..160 {
             key(&ui, Key::Tab.into());
-            let Some(play) =
-                ElementHandle::find_by_accessible_label(&ui, if chinese { "播放" } else { "Play" })
-                    // Chinese also uses "播放" for the native Playback menu.
-                    // Only the transport button identifies the keyboard owner.
-                    .find(|element| element.accessible_role() == Some(AccessibleRole::Button))
+            let Some(play) = ElementHandle::find_by_element_type_name(&ui, "AuditionPanel")
+                .flat_map(|panel| {
+                    panel
+                        .query_descendants()
+                        .match_predicate(move |element| {
+                            element.accessible_role() == Some(AccessibleRole::Button)
+                                && element.accessible_label().is_some_and(|label| {
+                                    label == if chinese { "播放" } else { "Play" }
+                                })
+                        })
+                        .find_all()
+                })
+                .next()
             else {
                 continue;
             };

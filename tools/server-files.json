@@ -1,4 +1,6 @@
 [
+  "audiolib-migrate",
+  "audiolib-migrate.exe",
   "LICENSE",
   "THIRD_PARTY.md",
   "server/README.md",

@@ -449,6 +449,10 @@ pub struct AppConfig {
     /// Show embedded album artwork in local and server mode. Images stay outside libraries.
     #[serde(default = "default_true")]
     pub show_album_artwork: bool,
+    /// Optional user-selected directory for durable Waveform WAV slices.
+    /// `None` selects the platform Documents/AudioLib Explorer/Exports directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_export_directory: Option<PathBuf>,
     /// Local mode: pre-generate list thumbnail Waveforms in the background after scans
     /// (doc/api/README.md §9.3). New installs default on; an existing settings.json that
     /// omits the key stays off (`#[serde(default)]` on the saved field is false).
@@ -458,7 +462,7 @@ pub struct AppConfig {
     /// audition start (deferred, not dropped). Off by default.
     #[serde(default)]
     pub hold_list_waveform_batches_after_audition: bool,
-    /// Maximum open search tasks, set in Appearance and bounded to 1..=30.
+    /// Maximum open search tasks, set in global Search and tasks settings, bounded to 1..=30.
     #[serde(default = "default_max_search_tasks")]
     pub max_search_tasks: u32,
     /// Interface scale in percent: 100-200 in steps of 25, or 0 to follow the system.
@@ -477,6 +481,10 @@ pub struct AppConfig {
     /// [`AppConfig::ui_font_size`].
     #[serde(default = "default_font_size")]
     pub list_font_size: u32,
+    /// Search scope beside the query box: `all` (default), `main`, or `path`
+    /// (DESIGN-SEARCH-METADATA-V2 §2.5). Unknown values load as `all`.
+    #[serde(default = "default_search_scope")]
+    pub search_scope: String,
     /// Persistent table layout and sorting, applied to every search page.
     #[serde(default)]
     pub audio_table: AudioTablePreferences,
@@ -517,6 +525,8 @@ struct SavedPreferences {
     play_history_limit: u32,
     #[serde(default = "default_true")]
     show_album_artwork: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slice_export_directory: Option<PathBuf>,
     #[serde(default)]
     pregenerate_list_waveforms: bool,
     #[serde(default)]
@@ -534,6 +544,8 @@ struct SavedPreferences {
     ui_font_size: u32,
     #[serde(default = "default_font_size", deserialize_with = "lenient_font_size")]
     list_font_size: u32,
+    #[serde(default = "default_search_scope")]
+    search_scope: String,
     #[serde(default)]
     audio_table: AudioTablePreferences,
     #[serde(default)]
@@ -557,6 +569,18 @@ fn default_max_search_tasks() -> u32 {
     DEFAULT_MAX_SEARCH_TASKS
 }
 
+fn default_search_scope() -> String {
+    "all".into()
+}
+
+/// Keep a supported search-scope preference; anything else becomes `all`.
+pub fn normalize_search_scope(value: &str) -> String {
+    match value.trim() {
+        "main" | "path" | "all" => value.trim().to_string(),
+        _ => "all".into(),
+    }
+}
+
 fn lenient_max_search_tasks<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<u32, D::Error> {
@@ -574,7 +598,7 @@ fn lenient_max_search_tasks<'de, D: serde::Deserializer<'de>>(
         _ => DEFAULT_MAX_SEARCH_TASKS,
     })
 }
-/// Interface scale choices offered in the Appearance settings, in percent.
+/// Interface scale choices offered in Global settings, in percent.
 pub const UI_SCALE_PERCENTS: [u32; 5] = [100, 125, 150, 175, 200];
 
 /// Keep a supported interface scale; anything else (including 0) follows the system.
@@ -590,6 +614,17 @@ pub fn normalize_ui_scale_percent(percent: u32) -> u32 {
 pub const DEFAULT_THEME: &str = "default";
 /// Identifier of the opt-in Studio theme, with the redesigned audition controls.
 pub const STUDIO_THEME: &str = "studio";
+/// Identifier of the Studio workbench with the original default audition controls.
+pub const DEFAULT_V2_THEME: &str = "default-v2";
+
+/// Library workbench presentation selected independently of audition controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkbenchStyle {
+    /// Original beta navigation, search and library layout.
+    Classic,
+    /// Studio navigation, search and library layout.
+    Studio,
+}
 
 /// Audition presentation selected by a theme; playback state remains shared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -604,31 +639,42 @@ pub enum PlayerStyle {
 pub struct BuiltinTheme {
     /// Stable settings identifier; existing identifiers must retain their appearance.
     pub id: &'static str,
-    /// English name offered in Appearance settings.
+    /// English name offered in View > Theme.
     pub name: &'static str,
-    /// Chinese name offered in Appearance settings.
+    /// Chinese name offered in View > Theme.
     pub name_cn: &'static str,
+    /// Navigation, search and library layout belonging to this theme.
+    pub workbench_style: WorkbenchStyle,
     /// Audition controls and layout belonging to this theme.
     pub player_style: PlayerStyle,
 }
 
 /// Single registry of shipped themes, with the original default first.
-pub const BUILTIN_THEMES: [BuiltinTheme; 2] = [
+pub const BUILTIN_THEMES: [BuiltinTheme; 3] = [
     BuiltinTheme {
         id: DEFAULT_THEME,
         name: "Default",
         name_cn: "默认",
+        workbench_style: WorkbenchStyle::Classic,
         player_style: PlayerStyle::Classic,
     },
     BuiltinTheme {
         id: STUDIO_THEME,
         name: "Studio",
         name_cn: "工作室",
+        workbench_style: WorkbenchStyle::Studio,
         player_style: PlayerStyle::Studio,
+    },
+    BuiltinTheme {
+        id: DEFAULT_V2_THEME,
+        name: "Default v2",
+        name_cn: "默认 v2",
+        workbench_style: WorkbenchStyle::Studio,
+        player_style: PlayerStyle::Classic,
     },
 ];
 
-/// Theme identifiers offered in the Appearance settings, in display order.
+/// Theme identifiers offered by the top-level theme selector, in display order.
 pub const THEME_IDS: [&str; BUILTIN_THEMES.len()] = {
     let mut ids = [""; BUILTIN_THEMES.len()];
     let mut index = 0;
@@ -708,6 +754,31 @@ fn default_playback() -> serde_json::Value {
         "output_pair":0,"source_pair":0,"volume":0.8,"rate_policy":"device_default"})
 }
 
+#[cfg(test)]
+mod slice_export_preferences_tests {
+    use super::*;
+
+    #[test]
+    fn optional_slice_destination_round_trips_without_changing_library_or_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::load_with_roots(root.path().to_path_buf(), &[]).unwrap();
+        assert!(config.slice_export_directory.is_none());
+        let database = config.paths.database.clone();
+        config.language = "cn".into();
+        config.slice_export_directory = Some(root.path().join("中文 Exports"));
+        config.save().unwrap();
+        let saved = AppConfig::load_with_roots(root.path().to_path_buf(), &[]).unwrap();
+        assert_eq!(saved.slice_export_directory, config.slice_export_directory);
+        assert_eq!(saved.paths.database, database);
+        assert_eq!(saved.language, "cn");
+        assert_eq!(saved.playback, config.playback);
+        config.slice_export_directory = None;
+        config.save().unwrap();
+        let saved = AppConfig::load_with_roots(root.path().to_path_buf(), &[]).unwrap();
+        assert!(saved.slice_export_directory.is_none());
+    }
+}
+
 impl AppConfig {
     /// Load user preferences, finding legacy settings without modifying the old library.
     pub fn load_default() -> Result<Self> {
@@ -783,6 +854,7 @@ impl AppConfig {
             audition_play_on_single_click: true,
             play_history_limit: PLAY_HISTORY_LIMIT_PER_LIBRARY,
             show_album_artwork: true,
+            slice_export_directory: None,
             pregenerate_list_waveforms: true,
             hold_list_waveform_batches_after_audition: false,
             max_search_tasks: DEFAULT_MAX_SEARCH_TASKS,
@@ -790,6 +862,7 @@ impl AppConfig {
             theme: default_theme(),
             ui_font_size: DEFAULT_FONT_SIZE,
             list_font_size: DEFAULT_FONT_SIZE,
+            search_scope: default_search_scope(),
             audio_table: AudioTablePreferences::default(),
             spectral_peaks: SpectralPeakPreferences::default(),
             window_layout: Default::default(),
@@ -842,6 +915,7 @@ impl AppConfig {
             config.audition_play_on_single_click = saved.audition_play_on_single_click;
             config.play_history_limit = saved.play_history_limit;
             config.show_album_artwork = saved.show_album_artwork;
+            config.slice_export_directory = saved.slice_export_directory;
             config.pregenerate_list_waveforms = saved.pregenerate_list_waveforms;
             config.hold_list_waveform_batches_after_audition =
                 saved.hold_list_waveform_batches_after_audition;
@@ -850,6 +924,7 @@ impl AppConfig {
             config.theme = normalize_theme(&saved.theme);
             config.ui_font_size = clamp_font_size(i64::from(saved.ui_font_size));
             config.list_font_size = clamp_font_size(i64::from(saved.list_font_size));
+            config.search_scope = normalize_search_scope(&saved.search_scope);
             config.audio_table = saved.audio_table.normalized();
             config.spectral_peaks = saved.spectral_peaks.normalized();
             config.window_layout = saved.window_layout.normalized();
@@ -899,6 +974,7 @@ impl AppConfig {
             audition_play_on_single_click: self.audition_play_on_single_click,
             play_history_limit: self.play_history_limit,
             show_album_artwork: self.show_album_artwork,
+            slice_export_directory: self.slice_export_directory.clone(),
             pregenerate_list_waveforms: self.pregenerate_list_waveforms,
             hold_list_waveform_batches_after_audition: self
                 .hold_list_waveform_batches_after_audition,
@@ -907,6 +983,7 @@ impl AppConfig {
             theme: normalize_theme(&self.theme),
             ui_font_size: clamp_font_size(i64::from(self.ui_font_size)),
             list_font_size: clamp_font_size(i64::from(self.list_font_size)),
+            search_scope: normalize_search_scope(&self.search_scope),
             audio_table: self.audio_table.normalized(),
             spectral_peaks: self.spectral_peaks.normalized(),
             window_layout: self.window_layout.normalized(),

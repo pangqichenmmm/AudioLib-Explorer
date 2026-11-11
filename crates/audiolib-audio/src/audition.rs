@@ -3,7 +3,9 @@
 use crate::decoder::{Decoder, ResampledDecoder};
 use audiolib_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use soundtouch::SoundTouch;
+#[path = "soundtouch_processor.rs"]
+mod soundtouch_processor;
+use soundtouch_processor::SoundTouchProcessor;
 
 /// Independent semitone pitch and pitch-preserving speed, applied to the monitor pair.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,7 +47,7 @@ pub(crate) struct AuditionDecoder {
     channels: usize,
     pair: usize,
     pub settings: AuditionSettings,
-    processor: Option<SoundTouch>,
+    processor: Option<SoundTouchProcessor>,
     flushed: bool,
     remaining: u64,
 }
@@ -57,6 +59,18 @@ impl AuditionDecoder {
         pair: u16,
         settings: AuditionSettings,
     ) -> Result<Self> {
+        let end_frame = decoder.info.metadata.frames;
+        Self::new_bounded(decoder, output_rate, start_frame, end_frame, pair, settings)
+    }
+    /// Only selected source frames reach the resampler and SoundTouch input.
+    pub fn new_bounded(
+        decoder: Decoder,
+        output_rate: u32,
+        start_frame: u64,
+        end_frame: u64,
+        pair: u16,
+        settings: AuditionSettings,
+    ) -> Result<Self> {
         settings.validate()?;
         let metadata = &decoder.info.metadata;
         let channels = usize::from(metadata.channels);
@@ -65,24 +79,28 @@ impl AuditionDecoder {
                 "Source channel pair is outside the loaded WAV channels".into(),
             ));
         }
-        let remaining = ((metadata.frames.saturating_sub(start_frame)) as f64
-            * f64::from(output_rate)
+        if start_frame > end_frame || end_frame > metadata.frames {
+            return Err(Error::Validation("Invalid audition frame range".into()));
+        }
+        let remaining = ((end_frame - start_frame) as f64 * f64::from(output_rate)
             / f64::from(metadata.sample_rate)
             / f64::from(settings.rate))
         .round() as u64;
         let processor = if settings.pitch_semitones != 0.0 || settings.rate != 1.0 {
-            let mut processor = SoundTouch::new();
-            processor
-                .set_channels(2)
-                .set_sample_rate(output_rate)
-                .set_tempo(f64::from(settings.rate))
-                .set_pitch(2.0_f64.powf(f64::from(settings.pitch_semitones) / 12.0));
-            Some(processor)
+            Some(SoundTouchProcessor::new(
+                output_rate,
+                settings.rate,
+                settings.pitch_semitones,
+            )?)
         } else {
             None
         };
         Ok(Self {
-            source: ResampledDecoder::new(decoder, output_rate, start_frame)?,
+            source: if end_frame == metadata.frames {
+                ResampledDecoder::new(decoder, output_rate, start_frame)?
+            } else {
+                ResampledDecoder::new_bounded(decoder, output_rate, start_frame, end_frame)?
+            },
             channels,
             pair: usize::from(pair),
             settings,
@@ -112,7 +130,7 @@ impl AuditionDecoder {
             if let Some(processor) = &mut self.processor {
                 let frames = self.remaining.min(2048) as usize;
                 let mut output = vec![0.0; frames * 2];
-                let received = processor.receive_samples(&mut output, frames);
+                let received = processor.receive_samples(&mut output);
                 if received > 0 {
                     output.truncate(received * 2);
                     self.remaining -= received as u64;
@@ -151,7 +169,7 @@ impl AuditionDecoder {
                 stereo.extend_from_slice(&pair);
             }
             if let Some(processor) = &mut self.processor {
-                processor.put_samples(&stereo, stereo.len() / 2);
+                processor.put_samples(&stereo)?;
             } else {
                 stereo.truncate(self.remaining.min((stereo.len() / 2) as u64) as usize * 2);
                 self.remaining -= (stereo.len() / 2) as u64;

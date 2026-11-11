@@ -17,8 +17,11 @@ AudioLib Explorer is a Rust + Slint Windows desktop application with SQLite FTS5
 | [Album Artwork](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Artwork.md) | Local/server covers, custom images, hiding/restoring and thumbnail cache management |
 | [Shared Albums and Metadata Storage](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md) | Schema 8 ownership, namespaces, original Metadata TEXT and safe migration |
 | [Search Upgrade Recovery](Rust_Upgrade_Recovery.md) | Committed upgrade batches, crash recovery, startup progress, WAL and snapshot cleanup |
+| [Schema 9 server migration](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/codex/release-090-prepare/doc/Rust_Schema9_Migration.md) | Resumable directory-only migration, shared CLI/HTTP reports and rollback |
 | [Remote Mode (client)](Rust_Remote_Mode.md) | Server data source: settings/secrets, snapshot sync, WebDAV URL mapping, read-only rules and playback cache |
 | [Server API](api/README.md) | `server/audiolib-server` HTTP contract and client behaviour |
+| [Server deployment](Server_Deployment.md) | Install a release server, configure it, run systemd/launchd/Docker, upgrade, migrate schema 9 and check health |
+| [Managing sound libraries on the server](Server_Library_Guide.md) | Roots, full and incremental scans, sidecar-v1 spreadsheets, covers, snapshots and scan errors |
 | [Spectral Peaks and Audition](Rust_Spectral_Audition.md) | Waveform colors, bounded analysis and playback transforms |
 | [Debug Mode and Bug Reports](Rust_Debug_Reports.md) | Session-only diagnostic recording, private-data boundaries, report preview and GitHub handoff |
 | [Rust Validation](Rust_Validation.md) | Actual checks, performance measurements and hardware limits |
@@ -30,8 +33,12 @@ AudioLib Explorer is a Rust + Slint Windows desktop application with SQLite FTS5
 | First GUI search measurements | Fresh-process 1M-row GUI and directory statistics, including 20001 database folders with stale ANALYZE |
 | [Scan and Search Performance](Rust_Scan_Search_Performance.md) | Bounded Metadata workers, batch writes and measured scan/search latency |
 | [Large-library GUI Search](Rust_GUI_Search_Performance.md) | Query cancellation, directory facet reuse, virtualized tree models and GUI benchmark |
-| [Release Notes](Rust_Release_Notes.md) | Changes in the current Windows portable release |
+| [Release Notes](Rust_Release_Notes.md) | Candidate changes and published client/server release history |
+| [0.9.5 release record](Rust_Release_0.9.5.md) | Published 7d payloads and hashes, fourteen online assets, fixed-install synchronization, original versus new checks and actual platform limits |
+| [0.9.4 release record](Rust_Release_0.9.4.md) | Published f6 payloads and checksums, af1 upgrade boundaries, actual remote verification and fixed-install synchronization |
+| [0.9.3 release record](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/beta/doc/Rust_Release_0.9.3.md) | Published assets, checksums, validation identities and platform coverage |
 | [0.8.7 release preparation](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/beta/doc/Rust_Release_0.8.7.md) | Beta scope, original validation evidence, unresolved gates and delivery plan |
+| [0.9.0 release and migration preparation](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/codex/release-090-prepare/doc/Rust_Release_0.9.0.md) | Proposed next-version scope, client/server migration matrix, evidence identities and pending delivery gates |
 | [Automatic updates](Rust_Auto_Update.md) | Startup GitHub release checks, stable/beta channels, verified downloads and deployment |
 | [Linux and Docker delivery](Rust_Linux_Docker_Release.md) | Native Linux server archives, offline amd64/arm64 Docker images, Compose and platform acceptance |
 | [Review Fixes](Rust_Review_Fixes.md) | Reviewed defects, corrections and regression coverage |
@@ -86,7 +93,7 @@ Rust unit and integration tests live with the Cargo workspace packages. Select t
 | [Rust search benchmark](../crates/audiolib-db/src/bin/search-benchmark.rs) | Actual-service P50/P95/P99 measurements on 1M+ records |
 | [Local checks](../tools/check-local.ps1) | Format and selected package Clippy/tests once; -Package scopes checks, -Asio / -NoDefaultFeatures match the shipped configuration |
 | [Build cache maintenance](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Build_Cache.md) | Owned Cargo caches only; preview, budget/age, build leases and post-delivery cleanup |
-| [Release pipeline](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Release_Pipeline.md) | One native plan per host; compact JSON, private logs and verified stage reuse |
+| [Release pipeline](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Release_Pipeline.md) | Native plans, early notice checks, parallel payload coordination, verified recovery and release efficiency review |
 | [Windows release compatibility entry](../tools/ci-release.ps1) | Manual tagged Windows build/package entry, replacing separate build/package calls; runtime report remains `not-run` |
 | [Published release verifier](../.github/workflows/release.yml) | Optional manual, read-only release identity, exact asset-set and SHA256 checks |
 

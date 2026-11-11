@@ -3,6 +3,7 @@
 param([switch]$SkipBuild, [switch]$WithoutAsio, [string]$Tag)
 $ErrorActionPreference = 'Stop'
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
 $workspaceText = Get-Content -LiteralPath (Join-Path $taskRoot 'Cargo.toml') -Raw
 $versionMatch = [regex]::Match($workspaceText, '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"(\d+\.\d+\.\d+)"')
 if (!$versionMatch.Success) { throw 'Cannot identify the portable workspace version.' }
@@ -62,40 +63,20 @@ Set-Content -LiteralPath (Join-Path $portableRoot 'update-channel.txt') -Value $
 Set-Content -LiteralPath (Join-Path $portableRoot 'update-version.txt') -Value $Tag.Substring(1) -Encoding ASCII
 $licenseRoot = Join-Path $portableRoot 'licenses'
 New-Item -ItemType Directory -Force -Path $licenseRoot | Out-Null
-Push-Location -LiteralPath $taskRoot
-try {
-    $metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw 'Dependency metadata generation failed.' }
-    $manifest = @()
-    foreach ($package in $metadata.packages) {
-        $manifest += [PSCustomObject]@{ name=$package.name; version=$package.version; license=$package.license; repository=$package.repository }
-        $sourceRoot = Split-Path -Parent $package.manifest_path
-        if ($package.name -eq 'soundtouch-ffi') {
-            Copy-Item -LiteralPath (Join-Path $sourceRoot 'soundtouch-2_3_2/COPYING.TXT') -Destination (Join-Path $licenseRoot 'SoundTouch-2.3.2-LGPL.txt') -Force
-        }
-        $notices = Get-ChildItem -LiteralPath $sourceRoot -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE)' }
-        if ($notices) {
-            $destination = Join-Path $licenseRoot ($package.name + '-' + $package.version)
-            New-Item -ItemType Directory -Force -Path $destination | Out-Null
-            $notices | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $destination -Force }
-        }
-        $noticeDirectories = Get-ChildItem -LiteralPath $sourceRoot -Directory | Where-Object { $_.Name -match '^(LICENSES?|COPYING|NOTICE)$' }
-        foreach ($noticeDirectory in $noticeDirectories) {
-            $destination = Join-Path $licenseRoot ($package.name + '-' + $package.version)
-            New-Item -ItemType Directory -Force -Path $destination | Out-Null
-            Copy-Item -LiteralPath $noticeDirectory.FullName -Destination $destination -Recurse -Force
-        }
-        if ($package.license_file -and (Test-Path -LiteralPath $package.license_file -PathType Leaf)) {
-            $destination = Join-Path $licenseRoot ($package.name + '-' + $package.version)
-            New-Item -ItemType Directory -Force -Path $destination | Out-Null
-            Copy-Item -LiteralPath $package.license_file -Destination $destination -Force
-        }
-    }
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $licenseRoot 'dependencies.json') -Encoding UTF8
-} finally { Pop-Location }
-if (!$WithoutAsio) {
-    Copy-Item -LiteralPath (Join-Path $taskRoot 'tools/.build-tools/asio-2.3.4/ASIOSDK/LICENSE.txt') -Destination (Join-Path $licenseRoot 'Steinberg-ASIO-SDK-2.3.4.txt') -Force
-}
+$licenseFeatures=if($WithoutAsio){@()}else{@('audiolib-desktop/asio','audiolib-cli/asio')}
+$licenseGraph=Get-AudioLibLicenseGraph -Root $taskRoot -Packages @('audiolib-desktop','audiolib-cli') -Target 'x86_64-pc-windows-msvc' -Features $licenseFeatures
+$soundtouch=@($licenseGraph.packages|Where-Object name -CEQ 'soundtouch-ffi')
+if($soundtouch.Count -ne 1){throw 'Selected portable dependency graph lacks SoundTouch.'}
+$licenseExtras=@{'SoundTouch-2.3.2-LGPL.txt'=(Join-Path (Split-Path -Parent $soundtouch[0].manifest_path) 'soundtouch-2_3_2/COPYING.TXT')}
+if(!$WithoutAsio){$licenseExtras['Steinberg-ASIO-SDK-2.3.4.txt']=Join-Path $taskRoot 'tools/.build-tools/asio-2.3.4/ASIOSDK/LICENSE.txt'}
+$null=Write-AudioLibLicenseBundle -Graph $licenseGraph -Root $taskRoot -PayloadRoot $portableRoot -Artifacts @{'AudioLibExplorer.exe'=(Join-Path $portableRoot 'AudioLibExplorer.exe');'AudioLibCli.exe'=(Join-Path $portableRoot 'AudioLibCli.exe')} -ExtraFiles $licenseExtras
+& (Join-Path $PSScriptRoot 'validate-portable-licenses.ps1') -BinaryDirectory $portableRoot -WithoutAsio:$WithoutAsio
+# Inspect actual staged names against the policy embedded in old clients before
+# replacing the last verified package, even if today's manifest accepts them.
+$compatibilityEntries = @(Get-ChildItem -LiteralPath $portableRoot -Recurse -Force -File | ForEach-Object {
+    $_.FullName.Substring($portableRoot.Length).TrimStart('\', '/').Replace('\', '/')
+})
+& (Join-Path $PSScriptRoot 'validate-update-compatibility.ps1') -Product Desktop -Entries $compatibilityEntries
 & (Join-Path $PSScriptRoot 'validate-package-privacy.ps1') -BinaryDirectory $portableRoot
 # Replace only the verified generated output, never local_release or runtime data.
 if (Test-Path -LiteralPath $outputRoot) {

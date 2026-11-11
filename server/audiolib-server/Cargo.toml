@@ -15,6 +15,9 @@ categories = ["multimedia::audio"]
 name = "audiolib-server"
 path = "src/main.rs"
 
+[features]
+test-hooks = ["audiolib-db/test-hooks"]
+
 [dependencies]
 audiolib-update = { path = "../../crates/audiolib-update" }
 audiolib-core = { path = "../../crates/audiolib-core" }
@@ -23,8 +26,10 @@ audiolib-core = { path = "../../crates/audiolib-core" }
 audiolib-db = { path = "../../crates/audiolib-db", features = ["scanner"] }
 # Waveform peaks for GET /audio/{id}/waveform (decode only; no playback device is opened).
 audiolib-audio = { path = "../../crates/audiolib-audio", default-features = false }
+# On-demand cover thumbnails (`GET /audio/{id}/artwork`). JPEG and PNG only.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 anyhow.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["multipart"] }
 futures-core.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -56,6 +61,7 @@ libc = "0.2"
 
 [dev-dependencies]
 audiolib-remote = { path = "../../crates/audiolib-remote" }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 audiolib-db = { path = "../../crates/audiolib-db", features = ["scanner"] }
 http-body-util.workspace = true
 # Backdate directory mtimes in snapshot cleanup tests (already in Cargo.lock).

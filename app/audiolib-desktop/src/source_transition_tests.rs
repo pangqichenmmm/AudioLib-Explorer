@@ -90,6 +90,8 @@ pub(super) fn configuration(preferences: &Path) -> AppConfig {
         .unwrap(),
         audition_play_on_single_click: false,
         play_history_limit: audiolib_core::config::PLAY_HISTORY_LIMIT_PER_LIBRARY,
+        show_album_artwork: true,
+        slice_export_directory: None,
         pregenerate_list_waveforms: false,
         hold_list_waveform_batches_after_audition: false,
         max_search_tasks: 6,
@@ -98,10 +100,12 @@ pub(super) fn configuration(preferences: &Path) -> AppConfig {
         ui_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         list_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         audio_table: Default::default(),
+        spectral_peaks: Default::default(),
         window_layout: Default::default(),
         allowed_scan_roots: Vec::new(),
         data_source: Default::default(),
         data_source_fallback: None,
+        search_scope: "all".into(),
     };
     config.save().unwrap();
     config
@@ -175,6 +179,71 @@ pub(super) fn respond(socket: &mut std::net::TcpStream, status: &str, body: &str
     write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
 }
 
+/// A cached provider may refresh its capability gate without syncing or playing.
+/// Keep that background probe separate from the writes/downloads under test.
+pub(super) struct CapabilityProbeServer {
+    pub(super) url: String,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+impl CapabilityProbeServer {
+    pub(super) fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            loop {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept capability-only mock: {error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                let head = request(&mut socket);
+                assert!(
+                    head.starts_with("GET /api/v1/capabilities "),
+                    "Unexpected request while sync/play is suppressed: {head}"
+                );
+                seen.fetch_add(1, Ordering::AcqRel);
+                // This fixture has no live capability service. Fail the optional
+                // read promptly rather than leaving an unserved socket to time out.
+                respond(
+                    &mut socket,
+                    "500 Internal Server Error",
+                    r#"{"error_code":"INTERNAL","message":"capability service unavailable in this fixture"}"#,
+                );
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            worker,
+        }
+    }
+
+    pub(super) fn request_count(&self) -> usize {
+        self.requests.load(Ordering::Acquire)
+    }
+
+    pub(super) fn finish(self) {
+        self.stop.store(true, Ordering::Release);
+        self.worker.join().unwrap();
+    }
+}
+
 fn legacy_peer_preflight(listener: &std::net::TcpListener) {
     for (path, status, body) in [
         (
@@ -197,15 +266,22 @@ fn legacy_peer_preflight(listener: &std::net::TcpListener) {
 pub(super) fn run_until(ui: &AppWindow, ready: impl Fn() -> bool + 'static) {
     let started = Instant::now();
     let timer = slint::Timer::default();
+    let finished = std::cell::Cell::new(false);
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(10),
         move || {
+            // The testing backend can tick again before consuming Quit. A second
+            // Quit would prematurely end the next transition's event loop.
+            if finished.get() {
+                return;
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(12),
                 "GUI transition timed out"
             );
             if ready() {
+                finished.set(true);
                 slint::quit_event_loop().unwrap();
             }
         },
@@ -216,11 +292,11 @@ pub(super) fn run_until(ui: &AppWindow, ready: impl Fn() -> bool + 'static) {
 }
 
 fn selected(controller: &Controller, ui: &AppWindow, notes: &str) {
-    let file = AudioFile {
+    let file = AudioFile::from(audiolib_core::AudioFileData {
         id: 1,
         filename: "server A sound.wav".into(),
         ..Default::default()
-    };
+    });
     *controller.selected.lock().unwrap() = Some(file.clone());
     present_file(ui, &file);
     ui.set_edit_notes(notes.into());
@@ -2320,11 +2396,11 @@ fn source_switch_flow(edit_active_profile: bool) {
         let mut socket = accept(&a);
         sent.send(request(&mut socket)).unwrap();
         wait_release.recv_timeout(Duration::from_secs(8)).unwrap();
-        let file = AudioFile {
+        let file = AudioFile::from(audiolib_core::AudioFileData {
             id: 1,
             notes: "draft belongs to A".into(),
             ..Default::default()
-        };
+        });
         let body = serde_json::json!({"file":file,"revision_before":1,"revision":2}).to_string();
         respond(&mut socket, "200 OK", &body);
     });
@@ -2670,9 +2746,23 @@ fn child_ready_preview_viewport() {
     config.data_source.poll_interval_secs = 0;
     let (sent, received) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        for _ in 0..5 {
+        let mut waveforms = 0;
+        while waveforms < 5 {
             let mut socket = accept(&listener);
-            sent.send(request(&mut socket)).unwrap();
+            let head = request(&mut socket);
+            if head.starts_with("HEAD /api/v1/audio/42/stream?download=1 ") {
+                // These version probes are independent of the five viewport
+                // GETs. Supply the real original layout's stable byte length
+                // and strong validator instead of weakening version admission.
+                let original_length = 44 + 96_000_u64 * 6 * 2 * 2;
+                write!(socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {original_length}\r\nETag: \"original-viewport-v1\"\r\nConnection: close\r\n\r\n"
+                ).unwrap();
+                continue;
+            }
+            assert!(head.starts_with("GET /api/v1/audio/42/waveform?"), "{head}");
+            sent.send(head).unwrap();
+            waveforms += 1;
             respond(
                 &mut socket,
                 "403 Forbidden",
@@ -2726,7 +2816,7 @@ fn child_ready_preview_viewport() {
     let controller = Controller::new(&ui, provider, engine.handle(), config, playback);
     controller.remote_mode.store(true, Ordering::Release);
     controller.remote_busy.store(true, Ordering::Release);
-    let file = AudioFile {
+    let file = AudioFile::from(audiolib_core::AudioFileData {
         id: 42,
         filename: "original.wav".into(),
         file_path: "/server/original.wav".into(),
@@ -2734,7 +2824,7 @@ fn child_ready_preview_viewport() {
         channels: 6,
         duration: 2.0,
         ..Default::default()
-    };
+    });
     {
         let mut remote = controller.remote.lock().unwrap();
         remote.state = Some(CacheState {

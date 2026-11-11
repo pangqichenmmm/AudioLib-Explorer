@@ -5,26 +5,123 @@ use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEve
 /// Install once, before the first show, on the event-loop-owned desktop window.
 pub(crate) fn install(window: &slint::Window) {
     window.on_winit_window_event(|window, event| {
+        if matches!(event, WindowEvent::Focused(_) | WindowEvent::Resized(_)) {
+            install_native_redraw_guard(window);
+        }
         crate::gui_search_benchmark::window_event(window, event);
+        log_native_window_state(window, event);
         handle_event(window, event);
         EventResult::Propagate
     });
 }
 
+/// Bind after first show, and again if winit recreates the native window.
+pub(crate) fn install_native_redraw_guard(_window: &slint::Window) {
+    #[cfg(windows)]
+    {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        _window.with_winit_window(|native| {
+            if let Ok(handle) = native.window_handle()
+                && let RawWindowHandle::Win32(handle) = handle.as_raw()
+            {
+                match audiolib_windows::window_redraw::install(handle.hwnd.get() as usize) {
+                    Ok(true) => tracing::info!("Desktop native-menu visibility guard installed"),
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(%error, "Desktop visibility guard unavailable"),
+                }
+            }
+        });
+    }
+}
+
+// Record native state without activating or changing the window. This lets an
+// intermittent loss of foreground be distinguished from minimization or exit;
+// no other window's identity, folder names or credentials enter the log.
+fn log_native_window_state(window: &slint::Window, event: &WindowEvent) {
+    let reason = match event {
+        WindowEvent::Focused(true) => "focus-gained",
+        WindowEvent::Focused(false) => "focus-lost",
+        WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => "zero-sized",
+        WindowEvent::MouseInput {
+            state: slint::winit_030::winit::event::ElementState::Released,
+            button: slint::winit_030::winit::event::MouseButton::Left,
+            ..
+        } if tracing::enabled!(tracing::Level::DEBUG) => "left-button-released",
+        _ => return,
+    };
+    window.with_winit_window(|native| {
+        let focused = native.has_focus();
+        let minimized = native.is_minimized();
+        let visible = native.is_visible();
+        if reason == "left-button-released" {
+            tracing::debug!(
+                reason,
+                focused,
+                ?minimized,
+                ?visible,
+                "Desktop native window state"
+            );
+        } else {
+            tracing::info!(
+                reason,
+                focused,
+                ?minimized,
+                ?visible,
+                "Desktop native window state"
+            );
+        }
+    });
+}
+
+thread_local! {
+    /// A focus, restore or resize asked for the next frame to repaint everything.
+    static FULL_REPAINT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn handle_event(window: &slint::Window, event: &WindowEvent) {
+    if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
+        crate::waveform_cursor::scale_factor_changed();
+    }
     match event {
-        WindowEvent::Focused(true) | WindowEvent::Occluded(false) => window.request_redraw(),
+        WindowEvent::Focused(true) | WindowEvent::Occluded(false) => {
+            FULL_REPAINT_PENDING.with(|pending| pending.set(true));
+            window.request_redraw();
+        }
         WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+            FULL_REPAINT_PENDING.with(|pending| pending.set(true));
             window.request_redraw();
         }
         // On Windows Occluded is not emitted for ordinary covering/uncovering.
         // WM_PAINT exposure arrives as RedrawRequested; softbuffer's age may
         // still say "reused" even though Windows cleared the presented surface.
         // Invalidate before rendering, even when no application property changed.
+        // Slint's own frames (animations, the moving playhead) also arrive as
+        // RedrawRequested; they stay partial unless Windows invalidated pixels or
+        // a focus/restore/resize asked for a full frame, so playback does not
+        // repaint the whole window every frame.
         // No timer or additional redraw is requested here, so idle stays idle.
-        WindowEvent::RedrawRequested if cfg!(windows) => mark_full_damage(window),
+        WindowEvent::RedrawRequested if cfg!(windows) => {
+            let requested = FULL_REPAINT_PENDING.with(|pending| pending.replace(false));
+            // Always consume the exposure record, even when a full frame is pending.
+            if native_exposure(window) | requested {
+                mark_full_damage(window);
+            }
+        }
         _ => {}
     }
+}
+
+/// Whether Windows invalidated this window's pixels since the last redraw. A
+/// window without a Win32 handle (headless tests) or an unwatchable one reports
+/// `true`, keeping the conservative full repaint.
+#[cfg(windows)]
+fn native_exposure(window: &slint::Window) -> bool {
+    audiolib_windows::paint_exposure::take_exposure(crate::dialogs::owner_handle(window))
+}
+
+#[cfg(not(windows))]
+fn native_exposure(_window: &slint::Window) -> bool {
+    true
 }
 
 fn mark_full_damage(window: &slint::Window) {

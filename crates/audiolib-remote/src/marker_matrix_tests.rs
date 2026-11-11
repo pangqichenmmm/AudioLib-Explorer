@@ -92,7 +92,7 @@ fn fixture(peer: Peer) -> Fixture {
                 ("GET", "/api/v1/library") => TestResponse::json(
                     200,
                     &serde_json::json!({
-                        "library_id":LIBRARY, "revision":3, "schema_version":6,
+                        "library_id":LIBRARY, "revision":3, "schema_version":audiolib_db::SCHEMA_VERSION,
                         "identity_bound_writes":true,
                         "snapshot_format":SnapshotFormat{id:PLAN_B_FORMAT.into(),format:LibraryFormat::target()},
                     })
@@ -122,7 +122,7 @@ fn fixture(peer: Peer) -> Fixture {
                             SERVER_COMPATIBILITY_HEADER,
                             peer.catalog.as_ref().map(|c| c.to_string()).unwrap_or_default(),
                         ),
-                        ("x-schema-version", "6".into()),
+                        ("x-schema-version", audiolib_db::SCHEMA_VERSION.to_string()),
                         ("x-search-storage-revision", "1".into()),
                         ("x-tokenization-revision", "3".into()),
                         ("x-source-search-revision", "2".into()),

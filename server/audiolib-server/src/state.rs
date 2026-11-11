@@ -80,8 +80,11 @@ pub struct BatchWriteResponse {
 /// `GET /library` reply: the core `LibraryInfo` fields plus identity and revision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LibraryResponse {
-    /// Completed persistent format positively identified from the actual library.
+    /// Completed format of the negotiated representation, positively identified.
     pub snapshot_format: audiolib_core::compatibility::SnapshotFormat,
+    /// Actual server library schema, which can differ from a negotiated legacy snapshot.
+    #[serde(default)]
+    pub library_schema: i64,
     /// Stable library identifier (see [`crate::revision`]).
     pub library_id: String,
     /// Monotonic change revision.
@@ -178,6 +181,9 @@ pub enum OpenError {
         /// Path-free reason.
         reason: String,
     },
+    /// Every cover decode slot stayed in use for [`crate::artwork::ARTWORK_SLOT_WAIT`]
+    /// (answered as 503 `BUSY` with `Retry-After`).
+    ArtworkBusy,
 }
 
 impl From<Error> for OpenError {
@@ -385,7 +391,7 @@ impl OpenProgress {
         }
     }
     /// The open finished; later work (e.g. decoding) is not an open.
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         if let Ok(mut target) = self.target.lock() {
             *target = None;
         }
@@ -453,6 +459,13 @@ pub fn clone_error(error: &Error) -> Error {
         Error::Io(io) => Error::Io(std::io::Error::new(io.kind(), io.to_string())),
         Error::Cancelled => Error::Cancelled,
         Error::Busy(m) => Error::Busy(m.clone()),
+        Error::Migration {
+            refusal,
+            retry_after,
+        } => Error::Migration {
+            refusal: *refusal,
+            retry_after: *retry_after,
+        },
         Error::NotFound(m) => Error::NotFound(m.clone()),
         Error::NewerDatabase {
             what,
@@ -564,6 +577,8 @@ struct Inner {
     root_policy: RootPolicy,
     /// `GET /library` statistics cache (see [`StatsCache`]).
     stats: StatsCache,
+    /// One bounded main-search response while schema-9 backfill is active.
+    migration_search: Mutex<Option<crate::migration::CachedSearch>>,
     /// Serializes root additions and removals from the admin page.
     roots_edit: Mutex<()>,
     stream_open_delay_ms: AtomicU64,
@@ -573,9 +588,12 @@ struct Inner {
     snapshot_dir: Option<PathBuf>,
     snapshot_slots: Arc<Semaphore>,
     snapshot_cache: Mutex<Option<Arc<PreparedSnapshot>>>,
+    legacy_snapshot_cache: Mutex<Option<(Arc<PreparedSnapshot>, LibraryInfo)>>,
+    legacy_info_cache: Mutex<Option<(String, u64, LibraryInfo)>>,
+    legacy_snapshots_enabled: AtomicBool,
     snapshot_registry: SnapshotRegistry,
     /// The snapshot preparation in flight (or last finished), per [`SnapshotEncoding`].
-    snapshot_jobs: Mutex<[Option<SnapshotJob>; 2]>,
+    snapshot_jobs: Mutex<[Option<SnapshotJob>; 4]>,
     /// How long `GET /library/snapshot` waits for a preparation (`snapshot_wait_secs`).
     snapshot_wait: Duration,
     stream_slots: Arc<Semaphore>,
@@ -594,6 +612,8 @@ struct Inner {
     list: Arc<ListWaveforms>,
     ffmpeg_path: PathBuf,
     transcode_slots: Arc<Semaphore>,
+    /// Cover decode slots ([`crate::artwork::ARTWORK_SLOTS`]); cache hits and 304s skip them.
+    artwork_slots: Arc<Semaphore>,
     transcodes: TranscodeRegistry,
     scans: ScanManager,
     /// Read-only connection for the `/roots` aggregates (missing counts, last scans).
@@ -735,7 +755,7 @@ impl AppState {
         // Allow another instance to finish creating and locking a new owner marker.
         remove_stale_snapshots(&snapshot_dir, Some(Duration::from_secs(30)));
         let opened = Instant::now();
-        let provider = Arc::new(SqliteProvider::open_existing_with_progress_cancellable(
+        let provider = Arc::new(SqliteProvider::open_server_existing(
             &config.library_db,
             cancel,
             |progress| {
@@ -831,6 +851,7 @@ impl AppState {
                 root_policy: config.root_policy(),
                 roots_edit: Mutex::new(()),
                 stats: StatsCache::load(provider_path),
+                migration_search: Mutex::new(None),
                 stream_open_delay_ms: AtomicU64::new(0),
                 snapshot_delay_ms: AtomicU64::new(0),
                 stat_delay_ms: AtomicU64::new(0),
@@ -838,8 +859,11 @@ impl AppState {
                 snapshot_dir: Some(snapshot_dir),
                 snapshot_slots: Arc::new(Semaphore::new(SNAPSHOT_SLOTS)),
                 snapshot_cache: Mutex::new(None),
+                legacy_snapshot_cache: Mutex::new(None),
+                legacy_info_cache: Mutex::new(None),
+                legacy_snapshots_enabled: AtomicBool::new(config.legacy_snapshot_enabled),
                 snapshot_registry: SnapshotRegistry::default(),
-                snapshot_jobs: Mutex::new([None, None]),
+                snapshot_jobs: Mutex::new([None, None, None, None]),
                 snapshot_wait: Duration::from_secs(config.snapshot_wait_secs),
                 stream_slots: Arc::new(Semaphore::new(config.max_streams)),
                 preview_slots: Arc::new(Semaphore::new(config.max_previews)),
@@ -856,6 +880,7 @@ impl AppState {
                 list,
                 ffmpeg_path: config.ffmpeg_path.clone(),
                 transcode_slots: Arc::new(Semaphore::new(config.max_transcodes)),
+                artwork_slots: Arc::new(Semaphore::new(crate::artwork::ARTWORK_SLOTS)),
                 transcodes: TranscodeRegistry::default(),
                 scans: ScanManager::default(),
                 roots_db: Mutex::new(roots_db),
@@ -908,6 +933,10 @@ impl AppState {
             OpenError::RootOffline { root, .. } => StatFailure::RootOffline { root },
             OpenError::Library(Error::NotFound(_)) => StatFailure::Missing,
             OpenError::Library(error) => StatFailure::Other(error),
+            // Only cover decodes report this; a metadata read never waits for one.
+            OpenError::ArtworkBusy => {
+                StatFailure::Other(Error::Busy("Artwork slots are busy".into()))
+            }
         };
         let unavailable = || Error::NotFound(format!("Audio {id} file is missing on the server"));
         let delay = self.inner.stat_delay_ms.load(Ordering::Relaxed);
@@ -992,6 +1021,10 @@ impl AppState {
     /// The library provider; future endpoints use it for all business data access.
     pub fn provider(&self) -> &Arc<SqliteProvider> {
         &self.inner.provider
+    }
+
+    pub(crate) fn migration_search_cache(&self) -> &Mutex<Option<crate::migration::CachedSearch>> {
+        &self.inner.migration_search
     }
 
     /// Immutable library identity pinned by this AppState and its DataProvider.
@@ -1106,6 +1139,12 @@ impl AppState {
 
     pub(crate) fn transcode_slots(&self) -> Arc<Semaphore> {
         self.inner.transcode_slots.clone()
+    }
+
+    /// Cover decode slots. Public only so tests can hold every slot.
+    #[doc(hidden)]
+    pub fn artwork_slots(&self) -> Arc<Semaphore> {
+        self.inner.artwork_slots.clone()
     }
 
     pub(crate) fn transcodes(&self) -> &TranscodeRegistry {
@@ -1285,6 +1324,9 @@ impl AppState {
         if let Ok(mut cache) = self.inner.snapshot_cache.lock() {
             *cache = None;
         }
+        if let Ok(mut cache) = self.inner.legacy_snapshot_cache.lock() {
+            *cache = None;
+        }
     }
 
     /// After a write that cannot change the `GET /library` aggregates (plays, metadata
@@ -1298,6 +1340,13 @@ impl AppState {
                 outcome.revision_before,
                 outcome.revision,
             );
+            if let Ok(mut cache) = self.inner.legacy_info_cache.lock()
+                && let Some((library_id, revision, _)) = cache.as_mut()
+                && library_id == &current.library_id
+                && *revision == outcome.revision_before
+            {
+                *revision = outcome.revision;
+            }
         }
     }
 
@@ -1369,6 +1418,7 @@ impl AppState {
             .unwrap_or_default();
         Ok(LibraryResponse {
             snapshot_format: self.snapshot_format()?,
+            library_schema: info.schema_version,
             library_id: revision.library_id,
             revision: revision.revision,
             identity_bound_writes: true,
@@ -1379,6 +1429,90 @@ impl AppState {
     /// Inspect the actual ready library without copying it or scanning business rows.
     pub fn snapshot_format(&self) -> Result<audiolib_core::compatibility::SnapshotFormat> {
         inspected_snapshot_format(self.inner.provider.database_path(), &self.inner.stopping)
+    }
+
+    /// Enable the transitional schema-8 read representation. Actual-library writes
+    /// always retain their schema-9 gate, regardless of this setting.
+    pub fn set_legacy_snapshots_enabled(&self, enabled: bool) {
+        self.inner
+            .legacy_snapshots_enabled
+            .store(enabled, Ordering::Release);
+        if !enabled && let Ok(mut cache) = self.inner.legacy_snapshot_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    /// Whether schema-9 sources may serve a transitional schema-8 read copy.
+    pub fn legacy_snapshots_enabled(&self) -> bool {
+        self.inner.legacy_snapshots_enabled.load(Ordering::Acquire)
+    }
+
+    /// Select a peer's read representation, including the transition-period switch.
+    pub(crate) fn read_format_for_peer(
+        &self,
+        headers: &axum::http::HeaderMap,
+        info_only: bool,
+    ) -> std::result::Result<audiolib_core::compatibility::SnapshotFormat, crate::ApiError> {
+        let actual = self.snapshot_format()?;
+        let selected = crate::compatibility::read_format(headers, &actual, info_only)?;
+        if selected != actual && !self.inner.legacy_snapshots_enabled.load(Ordering::Acquire) {
+            return Err(crate::ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "SNAPSHOT_FORMAT_UNSUPPORTED",
+                "Legacy snapshots are disabled; upgrade the client",
+            ));
+        }
+        Ok(selected)
+    }
+
+    /// Blocking negotiated `/library` information. Legacy unmarked requests see the
+    /// exact WAV-only counts/format of their derived copy, sharing the source identity
+    /// and revision. Modern peers explicitly accepting schema 9 always see schema 9.
+    pub fn library_info_for_peer(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> std::result::Result<LibraryResponse, crate::ApiError> {
+        let selected = self.read_format_for_peer(headers, true)?;
+        let actual = self.snapshot_format()?;
+        if selected == actual {
+            return Ok(self.library_response()?);
+        }
+        let revision = self.poll_revision()?;
+        let info = {
+            let mut cache = self.inner.legacy_info_cache.lock().map_err(|_| {
+                Error::Database("Legacy information cache lock was poisoned".into())
+            })?;
+            if let Some((_, _, info)) = cache.as_ref().filter(|(library_id, cached_revision, _)| {
+                library_id == &revision.library_id && *cached_revision == revision.revision
+            }) {
+                info.clone()
+            } else {
+                let info = SqliteProvider::legacy_snapshot_info_cancellable(
+                    self.inner.provider.database_path(),
+                    &self.inner.stopping,
+                )?;
+                *cache = Some((revision.library_id.clone(), revision.revision, info.clone()));
+                info
+            }
+        };
+        let mut info = self.inner.provider.library_info_with_stats(info.stats)?;
+        info.schema_version = 8;
+        info.database_bytes = info.database_bytes.saturating_add(info.wal_bytes);
+        info.database = self
+            .inner
+            .provider
+            .database_path()
+            .file_name()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        Ok(LibraryResponse {
+            snapshot_format: selected,
+            library_schema: actual.format.schema_version as i64,
+            library_id: revision.library_id,
+            revision: revision.revision,
+            identity_bound_writes: true,
+            info,
+        })
     }
 
     /// Library statistics for `GET /library`. The aggregates scan the whole `audio_files`
@@ -1866,7 +2000,10 @@ impl AppState {
                     .and_then(std::sync::Weak::upgrade)
                     .is_some_and(|job| job.finished().is_none())
             };
-            [busy(&jobs[0]), busy(&jobs[1])]
+            [
+                busy(&jobs[0]) || busy(&jobs[2]),
+                busy(&jobs[1]) || busy(&jobs[3]),
+            ]
         };
         let cached = self
             .inner
@@ -1903,7 +2040,41 @@ impl AppState {
     /// `None` when the preparation takes longer; it then continues in the background and
     /// a later call joins it (single flight per encoding). Must run inside the runtime.
     pub async fn snapshot_within_budget(&self, zstd: bool) -> Option<Result<SnapshotOutput>> {
-        let job = self.snapshot_job(zstd);
+        self.snapshot_within_budget_selected(zstd, false).await
+    }
+
+    /// Negotiate a native or transitional snapshot, keeping preparation jobs and
+    /// cached files separate. Admission errors are returned before any copy is made.
+    pub async fn snapshot_for_peer(
+        &self,
+        zstd: bool,
+        headers: &axum::http::HeaderMap,
+    ) -> std::result::Result<Option<Result<SnapshotOutput>>, crate::ApiError> {
+        let state = self.clone();
+        let request_headers = headers.clone();
+        let legacy = tokio::task::spawn_blocking(move || {
+            let format = state.read_format_for_peer(&request_headers, false)?;
+            Ok::<_, crate::ApiError>(
+                state.snapshot_format()?.format.schema_version == 9
+                    && format.format.schema_version == 8,
+            )
+        })
+        .await
+        .map_err(|_| crate::ApiError::internal("Snapshot negotiation worker failed"))??;
+        let output = self.snapshot_within_budget_selected(zstd, legacy).await;
+        if legacy && !self.inner.legacy_snapshots_enabled.load(Ordering::Acquire) {
+            // An already running preparation may finish after the transition closes.
+            self.read_format_for_peer(headers, false)?;
+        }
+        Ok(output)
+    }
+
+    async fn snapshot_within_budget_selected(
+        &self,
+        zstd: bool,
+        legacy: bool,
+    ) -> Option<Result<SnapshotOutput>> {
+        let job = self.snapshot_job(zstd, legacy);
         let wait = async {
             loop {
                 let notified = job.done.notified();
@@ -1924,13 +2095,13 @@ impl AppState {
         })
     }
 
-    fn snapshot_job(&self, zstd: bool) -> Arc<SnapshotJobState> {
+    fn snapshot_job(&self, zstd: bool, legacy: bool) -> Arc<SnapshotJobState> {
         let mut jobs = self
             .inner
             .snapshot_jobs
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let slot = &mut jobs[usize::from(zstd)];
+        let slot = &mut jobs[usize::from(zstd) + 2 * usize::from(legacy)];
         if let Some(job) = slot
             .as_ref()
             .and_then(std::sync::Weak::upgrade)
@@ -1956,7 +2127,13 @@ impl AppState {
             }
             let result = state
                 .with_snapshot_space(state.revision().ok().map(|info| info.revision), || {
-                    state.prepare_snapshot()
+                    if legacy {
+                        state
+                            .prepare_legacy_snapshot()
+                            .map(|(snapshot, _)| snapshot)
+                    } else {
+                        state.prepare_snapshot()
+                    }
                 })
                 .and_then(|prepared| {
                     let file = if zstd {
@@ -2054,6 +2231,94 @@ impl AppState {
         });
         *cache = Some(entry.clone());
         Ok(entry)
+    }
+
+    fn prepare_legacy_snapshot(&self) -> Result<(Arc<PreparedSnapshot>, LibraryInfo)> {
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let mut cache = self
+            .inner
+            .legacy_snapshot_cache
+            .lock()
+            .map_err(|_| Error::Database("Legacy snapshot cache lock was poisoned".into()))?;
+        let native = self.prepare_snapshot()?;
+        if native.schema_version != 9 {
+            return Err(Error::Busy(
+                "Library changed format during legacy snapshot preparation; retry".into(),
+            ));
+        }
+        if let Some((prepared, info)) = cache.as_ref().filter(|(prepared, _)| {
+            prepared.library_id == native.library_id
+                && prepared.revision == native.revision
+                && prepared.plain.path.is_file()
+        }) {
+            return Ok((prepared.clone(), info.clone()));
+        }
+        *cache = None;
+        let started = Instant::now();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(SNAPSHOT_PREFIX);
+        let directory = match &self.inner.snapshot_dir {
+            Some(dir) => {
+                fs::create_dir_all(dir)?;
+                builder.tempdir_in(dir)?
+            }
+            None => builder.tempdir()?,
+        };
+        let owner = snapshot_owner(directory.path())?;
+        // The immutable native backup is a coherent source generation. Reserve an
+        // owned copy plus journal/FTS slack before copying; no source library writes.
+        audiolib_db::ensure_free_space(directory.path(), native.plain.bytes.saturating_mul(2))?;
+        let path = directory.path().join("library-snapshot.db");
+        copy_snapshot_cancellable(&native.plain.path, &path, &self.inner.stopping)?;
+        let info = SqliteProvider::derive_legacy_snapshot_cancellable(&path, &self.inner.stopping)?;
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let bytes = fs::metadata(&path)?.len();
+        let prepared = Arc::new(PreparedSnapshot {
+            snapshot_format: inspected_snapshot_format(&path, &self.inner.stopping)?,
+            plain: Arc::new(SnapshotFile {
+                _owner: owner,
+                directory,
+                path,
+                bytes,
+                id: uuid::Uuid::new_v4().to_string(),
+            }),
+            zstd: Mutex::new(None),
+            library_id: native.library_id.clone(),
+            revision: native.revision,
+            schema_version: 8,
+        });
+        tracing::info!(
+            revision = native.revision,
+            bytes,
+            millis = started.elapsed().as_millis() as u64,
+            "Prepared legacy library snapshot"
+        );
+        *cache = Some((prepared.clone(), info.clone()));
+        Ok((prepared, info))
+    }
+}
+
+fn copy_snapshot_cancellable(source: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        output.write_all(&buffer[..count])?;
     }
 }
 

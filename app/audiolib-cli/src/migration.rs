@@ -229,7 +229,10 @@ mod tests {
         drop(SqliteProvider::open(&path).unwrap());
         let before = std::fs::read(&path).unwrap();
         let result = execute(&path, &command, &cancel, &mut |_| Ok(())).unwrap();
-        assert_eq!(result["format"]["schema_version"], 6);
+        assert_eq!(
+            result["format"]["schema_version"],
+            audiolib_db::SCHEMA_VERSION
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(migration::discover(&path).unwrap().is_none());
     }
@@ -253,7 +256,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result["automatic_rebuild_allowed"], false);
-        assert_eq!(result["inspection"]["format"]["schema_version"], 6);
+        assert_eq!(
+            result["inspection"]["format"]["schema_version"],
+            audiolib_db::SCHEMA_VERSION
+        );
         assert_eq!(result["findings"], json!([]));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(migration::discover(&path).unwrap().is_none());

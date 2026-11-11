@@ -210,7 +210,7 @@ mod tests {
         set_rows(&conn, 16_000);
         let request = including(&["engine"], &["rain"]);
         let inclusion = Inclusion::plan(&conn, &request, true).unwrap().unwrap();
-        let shared = search_sql(&load_tokenizer(), &request, true, true).unwrap();
+        let shared = search_sql(&conn, &load_tokenizer(), &request, true, true).unwrap();
         let where_sql = shared.conditions.join(" AND ");
         let count = plan_of(
             &conn,

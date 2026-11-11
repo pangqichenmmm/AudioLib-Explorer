@@ -1,6 +1,6 @@
 // crates/audiolib-db/tests/restore_page_size.rs
 use audiolib_core::{DataProvider, LibraryExportFormat, MetadataPatch, SearchRequest};
-use audiolib_db::SqliteProvider;
+use audiolib_db::{SCHEMA_VERSION, SqliteProvider};
 use rusqlite::Connection;
 use std::fs;
 
@@ -42,7 +42,10 @@ fn official_backups_with_different_page_sizes_restore_into_wal_without_modifying
         );
         drop(source_conn);
         let source_provider = SqliteProvider::open_existing(&source).unwrap();
-        assert_eq!(source_provider.library_info().unwrap().schema_version, 6);
+        assert_eq!(
+            source_provider.library_info().unwrap().schema_version,
+            SCHEMA_VERSION
+        );
         assert!(source_provider.check_library().unwrap().is_ok());
         let official_backup = temp.path().join("official-backup.db");
         source_provider.backup_library(&official_backup).unwrap();
@@ -62,7 +65,7 @@ fn official_backups_with_different_page_sizes_restore_into_wal_without_modifying
             1
         );
         let report = provider.restore_library(&official_backup).unwrap();
-        assert_eq!(report.library.schema_version, 6);
+        assert_eq!(report.library.schema_version, SCHEMA_VERSION);
         assert!(provider.check_library().unwrap().is_ok());
         assert_eq!(provider.get_audio(1).unwrap().tags, "saved-state");
 
@@ -170,6 +173,9 @@ fn page_size_adaptation_refuses_to_renumber_implicit_extension_identities() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(ids, [-20, 100]);
-    assert_eq!(provider.library_info().unwrap().schema_version, 6);
+    assert_eq!(
+        provider.library_info().unwrap().schema_version,
+        SCHEMA_VERSION
+    );
     assert!(provider.check_library().unwrap().is_ok());
 }

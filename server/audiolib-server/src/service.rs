@@ -38,7 +38,7 @@ struct ServiceInner {
     readiness: RwLock<Readiness>,
     progress: RwLock<Option<audiolib_db::SnapshotUpgradeProgress>>,
     updates: crate::update::UpdateManager,
-    stopping: AtomicBool,
+    stopping: Arc<AtomicBool>,
 }
 
 /// Router state: authentication and admin settings ([`Security`], known before the
@@ -68,7 +68,7 @@ impl Service {
                 readiness: RwLock::new(readiness),
                 progress: RwLock::new(None),
                 updates: crate::update::UpdateManager::default(),
-                stopping: AtomicBool::new(false),
+                stopping: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -85,6 +85,10 @@ impl Service {
     /// Stop startup retries and request a durable-boundary cancellation of an upgrade.
     pub fn request_stop(&self) {
         self.inner.stopping.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn migration_cancellation(&self) -> Arc<AtomicBool> {
+        self.inner.stopping.clone()
     }
 
     /// Last upgrade phase; contains only stage names and committed row counts.

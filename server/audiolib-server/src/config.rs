@@ -37,6 +37,9 @@ pub const MIN_TOKEN_CHARS: usize = 32;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Offer derived read-only schema-8 snapshots during the client-upgrade transition.
+    #[serde(default = "default_legacy_snapshot_enabled")]
+    pub legacy_snapshot_enabled: bool,
     /// Listen address, default [`DEFAULT_BIND`].
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
@@ -145,6 +148,10 @@ pub struct ServerConfig {
     /// Scan roots exposed to clients by name.
     #[serde(default)]
     pub roots: Vec<RootConfig>,
+}
+
+fn default_legacy_snapshot_enabled() -> bool {
+    true
 }
 
 /// One configured scan root shared with clients.

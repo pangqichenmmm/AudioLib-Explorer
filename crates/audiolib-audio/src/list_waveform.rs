@@ -2,7 +2,7 @@
 //! List thumbnail Waveforms (doc/api/README.md §9.1 and §9.3): one mono 128-column
 //! min/max summary of a whole file, shared by the local library (`waveform_cache`) and
 //! the server (`POST /waveforms`) so both produce byte-identical values.
-use crate::waveform::{CACHE_VERSION, WaveformPeak, WaveformRequest, waveform_with_cancel};
+use crate::waveform::{CACHE_VERSION, WaveformPeak, summary_waveform_with_read_buffer};
 use audiolib_core::{LIST_WAVEFORM_COLUMNS, ListWaveform, Result};
 use std::{path::Path, sync::atomic::AtomicBool};
 
@@ -10,6 +10,9 @@ use std::{path::Path, sync::atomic::AtomicBool};
 /// version 4 and list encoding version 1. Rows with another value are stale.
 pub const LIST_WAVEFORM_ZOOM_LEVEL: &str = "list128-v4-l1";
 const _: () = assert!(CACHE_VERSION == 4 && LIST_WAVEFORM_COLUMNS == 128);
+/// Bounded sequential-read buffer, matching the server's whole-file summary pass.
+/// Each local decoder owns at most this much read-ahead, regardless of file length.
+const LIST_WAVEFORM_READ_BUFFER: usize = 2 * 1024 * 1024;
 
 /// `samples_per_pixel = ceil(frames / 128)`, at least 1.
 pub fn list_samples_per_pixel(frames: u64) -> u32 {
@@ -57,27 +60,22 @@ pub fn merge_list_channels(peaks: &[Vec<WaveformPeak>]) -> Vec<i16> {
     values
 }
 
-/// Blocking: decode the whole file and compute its list Waveform with
-/// `waveform_with_cancel` (`include_colors = false`, `start_frame = 0`,
-/// `samples_per_pixel = ceil(frames / 128)`). A 0-frame file has no columns. `cancel`
-/// stops the decode at its next 4096-frame block with `Error::Cancelled`.
+/// Blocking: decode the whole file into the same 128-column summary as the server.
+/// The decoder's layout supplies the frame count without a separate Metadata probe;
+/// bounded 2 MiB reads keep plain network files streaming. Registered stream sources
+/// retain their own buffering. A 0-frame file has no columns. `cancel` stops the
+/// decode at its next 4096-frame block with `Error::Cancelled`.
 pub fn list_waveform_with_cancel(path: &Path, cancel: &AtomicBool) -> Result<ListWaveform> {
-    let metadata = crate::wav::probe(path)?;
-    if metadata.frames == 0 {
-        return ListWaveform::new(1, Vec::new());
-    }
-    let samples_per_pixel = list_samples_per_pixel(metadata.frames);
-    let waveform = waveform_with_cancel(
+    let waveform = summary_waveform_with_read_buffer(
         path,
-        WaveformRequest {
-            samples_per_pixel,
-            start_frame: 0,
-            end_frame: None,
-            include_colors: false,
-        },
+        LIST_WAVEFORM_COLUMNS,
         cancel,
+        LIST_WAVEFORM_READ_BUFFER,
     )?;
-    ListWaveform::new(samples_per_pixel, merge_list_channels(&waveform.peaks))
+    ListWaveform::new(
+        waveform.samples_per_pixel,
+        merge_list_channels(&waveform.peaks),
+    )
 }
 
 #[cfg(test)]
@@ -308,6 +306,87 @@ mod tests {
             list_waveform_with_cancel(&files[0].1, &cancel),
             Err(audiolib_core::Error::Cancelled)
         ));
+    }
+
+    #[test]
+    fn buffered_summary_matches_the_previous_probe_and_decode_with_trailing_metadata() {
+        use crate::waveform::{WaveformRequest, waveform_with_cancel};
+
+        fn previous(path: &Path, cancel: &AtomicBool) -> ListWaveform {
+            let metadata = crate::wav::probe(path).unwrap();
+            if metadata.frames == 0 {
+                return ListWaveform::new(1, Vec::new()).unwrap();
+            }
+            let samples_per_pixel = list_samples_per_pixel(metadata.frames);
+            let waveform = waveform_with_cancel(
+                path,
+                WaveformRequest {
+                    samples_per_pixel,
+                    start_frame: 0,
+                    end_frame: None,
+                    include_colors: false,
+                },
+                cancel,
+            )
+            .unwrap();
+            ListWaveform::new(samples_per_pixel, merge_list_channels(&waveform.peaks)).unwrap()
+        }
+
+        fn append_chunk(wav: &mut Vec<u8>, id: &[u8; 4], data: &[u8]) {
+            wav.extend_from_slice(id);
+            wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            wav.extend_from_slice(data);
+            if !data.len().is_multiple_of(2) {
+                wav.push(0);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = write_fixtures(directory.path());
+        // Exercise PCM32 and float64 without changing the shared server wire vectors.
+        for (name, bits, tag, samples) in [
+            (
+                "stereo32_70001",
+                32,
+                1,
+                (0..140_002_i32)
+                    .flat_map(|i| i.wrapping_mul(1_234_567).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "float64_33333",
+                64,
+                3,
+                (0..33_333)
+                    .flat_map(|i| ((f64::from(i) * 0.003).sin()).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let path = directory.path().join(format!("{name}.wav"));
+            let channels = if tag == 1 { 2 } else { 1 };
+            write_wav(&path, 48_000, channels, bits, tag, &samples, true, false);
+            files.push((name.into(), path));
+        }
+        let cancel = AtomicBool::new(false);
+        for (name, path) in files {
+            for trailing in [false, true] {
+                if trailing {
+                    let mut wav = fs::read(&path).unwrap();
+                    append_chunk(&mut wav, b"ID3 ", b"ID3\x04\0\0\0\0\0\0");
+                    append_chunk(&mut wav, b"iXML", b"<BWFXML><TAKE>3</TAKE></BWFXML>");
+                    append_chunk(&mut wav, b"SMED", &[7; 333]);
+                    append_chunk(&mut wav, b"LIST", b"INFOINAM\x04\0\0\0tail");
+                    let size = (wav.len() - 8) as u32;
+                    wav[4..8].copy_from_slice(&size.to_le_bytes());
+                    fs::write(&path, wav).unwrap();
+                }
+                assert_eq!(
+                    list_waveform_with_cancel(&path, &cancel).unwrap(),
+                    previous(&path, &cancel),
+                    "{name} trailing={trailing}"
+                );
+            }
+        }
     }
 
     /// Writes the fixture WAVs to `AUDIOLIB_LIST_WAVEFORM_FIXTURE_DIR` so another

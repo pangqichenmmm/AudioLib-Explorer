@@ -71,6 +71,21 @@ pub struct RemoveFolderResponse {
 pub struct CapabilitiesResponse {
     /// Shared application/version and database-format compatibility catalog.
     pub compatibility: audiolib_core::compatibility::CompatibilityManifest,
+    /// Actual source-library schema and formats offered during the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_schema: Option<audiolib_core::server_upgrade::LibrarySchemaInfo>,
+    /// Explicit migration readiness and its managed endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_migration: Option<audiolib_core::server_upgrade::SchemaMigrationInfo>,
+    /// Real importer handlers and enforced resource limits, absent while not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_import: Option<audiolib_core::server_upgrade::VendorImportInfo>,
+    /// Upgrade hint for the representation selected for this client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_upgrade: Option<audiolib_core::server_upgrade::ClientUpgradeInfo>,
+    /// Query scopes implemented by this server, including strict filename matching.
+    #[serde(default)]
+    pub search_scopes: Vec<String>,
     /// Effective `manage_mode`: `all`, `lan` or `off`.
     pub manage_mode: ManageMode,
     /// Whether this request was classified as external (through a reverse proxy or from

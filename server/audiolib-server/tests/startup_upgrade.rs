@@ -87,7 +87,7 @@ fn server_startup_logs_upgrade_phases_rows_and_elapsed_time() {
 fn startup_fixture(format: &str) -> (tempfile::TempDir, ServerConfig) {
     let root = tempfile::tempdir().unwrap();
     let database = root.path().join("library.db");
-    if matches!(format, "p0" | "p1") {
+    if matches!(format, "p0" | "p1" | "z1") {
         drop(SqliteProvider::open(&database).unwrap());
     }
     let conn = Connection::open(&database).unwrap();
@@ -113,7 +113,21 @@ fn startup_fixture(format: &str) -> (tempfile::TempDir, ServerConfig) {
         }
     } else if format == "p0" {
         conn.execute_batch(
-            "ALTER TABLE audio_files ADD COLUMN last_played_at TEXT;
+            "DROP TRIGGER IF EXISTS audiolib_album_audio_insert;
+             DROP TRIGGER IF EXISTS audiolib_album_audio_update;
+             DROP TRIGGER IF EXISTS audiolib_album_folder_delete;
+             DROP TRIGGER IF EXISTS audiolib_album_id_high_water;
+             DROP INDEX idx_audio_visible_album;
+             DROP INDEX IF EXISTS idx_audio_album_members;
+             ALTER TABLE audio_files DROP COLUMN album_id;
+             DROP TABLE albums;
+             DROP TABLE audiolib_album_id_sequence;
+             ALTER TABLE audio_files ADD COLUMN album TEXT NOT NULL DEFAULT '';
+             CREATE INDEX idx_audio_visible_album ON audio_files(album,id) WHERE missing=0;
+             DELETE FROM audiolib_schema_features WHERE feature IN ('album_entities','metadata_storage');
+             DELETE FROM library_meta WHERE key='metadata_storage_policy';
+             PRAGMA user_version=7;
+             ALTER TABLE audio_files ADD COLUMN last_played_at TEXT;
              UPDATE audiolib_schema_features SET version=1 WHERE feature='play_history_retired';",
         )
         .unwrap();
@@ -137,6 +151,14 @@ fn startup_fixture(format: &str) -> (tempfile::TempDir, ServerConfig) {
             "UPDATE audio_files SET last_played_at='2026-10-21T09:00:00Z' WHERE id=42;",
         )
         .unwrap();
+    } else if format == "z1" {
+        // Experimental z1 permits TEXT rows too. Preserve its real format marker
+        // and native album domain when the current server prepares plain storage.
+        conn.execute_batch(
+            "INSERT INTO audiolib_schema_features(feature,version) VALUES('metadata_storage',1);
+             UPDATE audiolib_album_id_sequence SET compression=1 WHERE singleton=1;",
+        )
+        .unwrap();
     }
     drop(conn);
     let config = ServerConfig::from_toml_str(
@@ -153,8 +175,14 @@ fn server_startup_auto_migrates_supported_formats_preserves_data_and_honors_roll
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let cancel = AtomicBool::new(false);
-    for format in ["schema3", "schema4", "schema5", "p0", "p1"] {
+    for format in ["schema3", "schema4", "schema5", "p0", "p1", "z1"] {
         let (_root, config) = startup_fixture(format);
+        let original_album_domain = (format == "z1").then(|| {
+            Connection::open(&config.library_db).unwrap().query_row(
+                "SELECT album_id,namespace FROM audio_files,audiolib_album_id_sequence WHERE audio_files.id=42 AND singleton=1",
+                [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+        });
         let source =
             migration::inspect(&config.library_db, LibraryAccess::Read, true, &cancel).unwrap();
         let mut phases = Vec::new();
@@ -165,7 +193,7 @@ fn server_startup_auto_migrates_supported_formats_preserves_data_and_honors_roll
             .unwrap();
         assert_eq!(
             state.provider().library_info().unwrap().schema_version,
-            6,
+            audiolib_db::SCHEMA_VERSION,
             "{format}"
         );
         let audio = state.audio(42).unwrap();
@@ -188,6 +216,20 @@ fn server_startup_auto_migrates_supported_formats_preserves_data_and_honors_roll
             ("retained extension".into(), 4),
             "{format}"
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT typeof(metadata_json) FROM audio_files WHERE id=42",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "text",
+            "{format}"
+        );
+        if let Some((album_id, namespace)) = original_album_domain {
+            assert_eq!(audio.album_id, Some(album_id));
+            assert_eq!(state.provider().album_namespace(), namespace);
+        }
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_xinfo('audio_files') WHERE name IN ('play_count','last_played_at')", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "{format}");
         assert_eq!(
             conn.query_row(

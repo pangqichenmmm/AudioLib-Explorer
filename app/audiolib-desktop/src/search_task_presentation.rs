@@ -121,6 +121,21 @@ pub(super) fn task_presentation(task: &SearchTask, chinese: bool) -> TaskPresent
         .to_owned(),
     );
     let filters = &definition.filters;
+    if let Some(binding) = &definition.album_binding {
+        lines.push(format!(
+            "{}: {}",
+            text("专辑", "Album"),
+            super::album_bindings::binding_label(binding, chinese)
+        ));
+    } else if let Some(name) = &filters.album {
+        lines.push(format!("{}: {name}", text("专辑", "Album")));
+    } else if let Some(id) = filters.album_id {
+        lines.push(format!(
+            "{}: {id} ({})",
+            text("专辑", "Album"),
+            text("身份不可用", "identity unavailable")
+        ));
+    }
     lines.push(format!(
         "{}: {}",
         text("文件状态", "File status"),
@@ -304,6 +319,8 @@ mod tests {
             include_tags: vec!["outside".into()],
             exclude_tags: vec!["thunder".into()],
             color: Some("#123456".into()),
+            album: None,
+            album_id: None,
         };
         task.definition.include_subfolders = false;
         task.definition.order_by = SortOrder::Filename;

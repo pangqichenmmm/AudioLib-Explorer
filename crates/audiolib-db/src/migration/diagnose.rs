@@ -283,8 +283,12 @@ pub(super) fn diagnose_connection(
         }),
         Err(error) => report.findings.push(unavailable(None, error)),
     }
-    if format.schema_version == 6
-        && evidence.pending.is_none()
+    // The current target format is repaired in place, so its identity/relationship evidence
+    // must be inspected too; a damaged one stays Blocked instead of becoming migratable.
+    if matches!(
+        format.schema_version,
+        6 | audiolib_core::compatibility::TARGET_SCHEMA
+    ) && evidence.pending.is_none()
         && let Err(error) = schema::definition::check_repair_source(conn)
     {
         report.findings.push(DiagnosticFinding {

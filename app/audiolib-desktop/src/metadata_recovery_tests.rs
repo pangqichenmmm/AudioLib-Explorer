@@ -277,13 +277,34 @@ fn assert_no_mutations(fixture: &Fixture) {
             .lock()
             .unwrap()
             .iter()
-            .all(|head| head.starts_with("GET "))
+            .all(|head| head.starts_with("GET ") || head.starts_with("HEAD "))
     );
     assert_eq!(
         fixture.provider.get_audio(fixture.file.id).unwrap().notes,
         "original baseline"
     );
     assert_eq!(std::fs::read(&fixture.file.file_path).unwrap(), wav());
+}
+
+/// Count Metadata/preflight attempts, retaining all non-audio requests so a
+/// repeated GET /library or an actual write still fails the no-retry assertion.
+/// Original-version HEAD and its read-only error-detail GET are independent
+/// Waveform reads that may finish after the recovery action was requested.
+fn metadata_request_count(fixture: &Fixture) -> usize {
+    fixture
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|head| {
+            let mut request = head.split_whitespace();
+            let method = request.next().unwrap_or_default();
+            let path = request.next().unwrap_or_default();
+            !(matches!(method, "GET" | "HEAD")
+                && path.starts_with("/api/v1/audio/")
+                && path.ends_with("/stream?download=1"))
+        })
+        .count()
 }
 
 #[test]
@@ -438,6 +459,9 @@ fn child_local_switch() {
         .database
         .clone();
     drop(SqliteProvider::open(&local_path).unwrap());
+    // Enter through the real manager so its rows carry the registered source IDs;
+    // the window's pre-open placeholder is not a selectable local registration.
+    fixture.ui.invoke_open_library(0);
     fixture.ui.invoke_sm_source_selected(0);
     fixture.ui.invoke_sm_switch_requested();
     drain_operation(&fixture);
@@ -463,7 +487,15 @@ fn child_local_switch() {
             .drafts
             .is_empty()
     );
-    assert!(artifact(&fixture).0.is_file());
+    let recovery_path = artifact(&fixture).0;
+    assert!(recovery_path.is_file());
+    assert!(
+        fixture
+            .ui
+            .get_ds_message()
+            .contains(recovery_path.to_string_lossy().as_ref()),
+        "the completed local switch must retain the recovery file's location"
+    );
     assert_no_mutations(&fixture);
     fixture.controller.shutdown();
     fixture.ui.hide().unwrap();
@@ -485,11 +517,10 @@ fn child_close_retry() {
     run_until(&fixture.ui, move || !c.closing.load(Ordering::Acquire));
     assert!(fixture.ui.window().is_visible());
     assert!(fixture.ui.get_metadata_dirty());
+    let status = fixture.ui.get_status().to_string();
     assert!(
-        fixture
-            .ui
-            .get_status()
-            .contains("original drafts were retained")
+        status.contains("original drafts were retained"),
+        "unexpected status after rejected close: {status:?}"
     );
     assert!(
         fixture
@@ -624,7 +655,7 @@ fn child_explicit_recovery_exit() {
     let c = fixture.controller.clone();
     run_until(&fixture.ui, move || !c.closing.load(Ordering::Acquire));
     assert!(fixture.ui.get_close_recovery_available());
-    let request_count = fixture.requests.lock().unwrap().len();
+    let request_count = metadata_request_count(&fixture);
     let sequence = fixture.controller.metadata.lock().unwrap().sequence;
     // Recovery must preserve even an invalid editor value without resubmitting it.
     fixture.ui.set_edit_tags("x".repeat(16_385).into());
@@ -656,7 +687,7 @@ fn child_explicit_recovery_exit() {
         fixture.controller.metadata.lock().unwrap().sequence,
         sequence
     );
-    assert_eq!(fixture.requests.lock().unwrap().len(), request_count);
+    assert_eq!(metadata_request_count(&fixture), request_count);
     let (path, payload) = artifact(&fixture);
     assert!(path.is_file());
     assert_eq!(payload["reason"], "user_requested_recovery_exit");
@@ -781,10 +812,10 @@ fn child_restore_confirmed_server_metadata() {
                 let job = state.next().unwrap();
                 state.complete(
                     &job,
-                    &Ok(AudioFile {
+                    &Ok(AudioFile::from(audiolib_core::AudioFileData {
                         id,
                         ..Default::default()
-                    }),
+                    })),
                 );
             }
             assert!(!state.saved.contains_key(&confirmed.id));

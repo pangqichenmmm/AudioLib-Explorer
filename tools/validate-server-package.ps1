@@ -6,11 +6,13 @@
 param(
     [Parameter(Mandatory)][string]$Tag,
     [Parameter(Mandatory)]
-    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')]
+    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin')]
     [string]$Target,
     [switch]$Asio
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
+. (Join-Path $PSScriptRoot 'server-package-layout.ps1')
 . (Join-Path $PSScriptRoot 'console-utf8.ps1')
 try {
 Set-StrictMode -Version Latest
@@ -21,14 +23,19 @@ $tagMatch = [regex]::Match($Tag, '^v(\d+\.\d+\.\d+)(?:-(?:rc|beta)\.(?:0|[1-9]\d
 if (!$tagMatch.Success) { throw 'Tag must be vMAJOR.MINOR.PATCH, vMAJOR.MINOR.PATCH-rc.N or vMAJOR.MINOR.PATCH-beta.N.' }
 $version = $tagMatch.Groups[1].Value
 if ($Asio -and ($Target -cne 'x86_64-pc-windows-msvc' -or !$IsWindows)) { throw '-Asio requires the native Windows server target.' }
+$taskProcessArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
 switch ($Target) {
     'x86_64-pc-windows-msvc' {
         if (!$IsWindows) { throw 'Validate the Windows package on Windows.' }
         $suffix = 'win-x64'; $binaryName = 'audiolib-server.exe'; $extension = 'zip'
     }
     'x86_64-unknown-linux-gnu' {
-        if (!$IsLinux) { throw 'Validate the Linux package on Linux.' }
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'Validate the Linux x64 package on Linux x64.' }
         $suffix = 'linux-x64'; $binaryName = 'audiolib-server'; $extension = 'tar.gz'
+    }
+    'aarch64-unknown-linux-gnu' {
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) { throw 'Validate the Linux arm64 package on Linux arm64.' }
+        $suffix = 'linux-arm64'; $binaryName = 'audiolib-server'; $extension = 'tar.gz'
     }
     'aarch64-apple-darwin' {
         if (!$IsMacOS) { throw 'Validate the macOS package on macOS.' }
@@ -98,12 +105,14 @@ $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
 $checksum = (Get-Content -LiteralPath ($archive + '.sha256') -Raw).TrimEnd("`r", "`n")
 if ($checksum -cne ($archiveHash + '  ' + $archiveName)) { throw 'Server archive checksum differs from its sidecar.' }
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json -AsHashtable
-Assert-Keys $report @('success', 'version', 'tag', 'commit', 'target', 'binary_sha256', 'archive_sha256', 'checks')
+Assert-Keys $report @('success','version','tag','commit','target','binary_sha256','migrator_sha256','archive_sha256','checks','layout_revision','automatic_upgrade_compatible','manual_bootstrap_required','minimum_updater_version','old_updater_policy')
+Assert-ServerLayoutMetadata $report
 Assert-Keys $report.checks @('version', 'allowlist', 'unlinked_paths', 'privacy', 'archive_contents', 'executable_mode')
 if ($report.success -isnot [bool] -or !$report.success -or
     @($report.checks.Values | Where-Object { $_ -isnot [bool] -or !$_ }).Count -or
     $report.version -cne $version -or $report.tag -cne $Tag -or $report.target -cne $Target -or
     $report.binary_sha256 -isnot [string] -or $report.binary_sha256 -cnotmatch '^[0-9A-F]{64}$' -or
+    $report.migrator_sha256 -isnot [string] -or $report.migrator_sha256 -cnotmatch '^[0-9A-F]{64}$' -or
     $report.archive_sha256 -cne $archiveHash) { throw 'Server package report identity/checks are invalid.' }
 Push-Location -LiteralPath $taskRoot
 try {
@@ -113,12 +122,15 @@ try {
     if ($LASTEXITCODE -ne 0 -or $shortCommit -cnotmatch '^[0-9a-f]{7,40}$') { throw 'Cannot obtain server validation short commit.' }
 } finally { Pop-Location }
 if ($report.commit -cne $commit) { throw 'Server package report differs from the current source commit.' }
-$publicFiles = @(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server-files.json') -Raw | ConvertFrom-Json)
+$publicFiles = @(Get-ServerPublicDocuments)
+$migratorName=Get-ServerMigratorName $binaryName
 $required = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $null = $required.Add($binaryName)
+$null = $required.Add($migratorName)
 $null = $required.Add('update-channel.txt')
 $null = $required.Add('update-version.txt')
 $null = $required.Add('licenses/dependencies.json')
+$null = $required.Add('licenses/inventory.json')
 $sdkLicenseRelative = 'licenses/Steinberg-ASIO-SDK-2.3.4.txt'
 if ($Asio) { $null = $required.Add($sdkLicenseRelative) }
 foreach ($relative in $publicFiles) {
@@ -189,6 +201,8 @@ try {
             !$licenseRoots.Add('licenses/' + $dependency.name + '-' + $dependency.version + '/')) { throw 'Server dependency notice schema is invalid.' }
     }
     if (!$dependencies.Count -or !($dependencies | Where-Object { $_.name -ceq 'audiolib-server' -and $_.version -ceq $version })) { throw 'Server dependency notice identity is missing.' }
+    $licenseFeatures=if($Asio){@('audiolib-desktop/asio','audiolib-cli/asio')}else{@()}
+    $null=Test-ServerPackageLayout -ServerBinaryName $binaryName -Entries @($archiveFiles)
     $hasAsio = @($dependencies | Where-Object { $_.name -ceq 'asio-sys' }).Count -gt 0
     if ($hasAsio -ne [bool]$Asio -or (!$Asio -and $archiveFiles.Contains($sdkLicenseRelative))) { throw 'Server ASIO notices differ from the selected -Asio mode.' }
     if ($Asio) {
@@ -215,6 +229,7 @@ try {
             if ((Get-FileHash -LiteralPath (Join-Path $extractRoot $cpalNotice) -Algorithm SHA256).Hash -cne $expectedCpalHash) { throw 'Packaged asio-sys shared CPAL license differs from the audited upstream notice.' }
         }
     }
+    $null=Test-AudioLibLicenseBundle -PayloadRoot $extractRoot -ExpectedRoots @('audiolib-server','audiolib-db') -Target $Target -Features $licenseFeatures -NoDefaultFeatures:(!$Asio) -ExpectedArtifacts @($binaryName,$migratorName)
     $privatePrefixes = @($taskRoot, $env:USERPROFILE, $env:HOME, $env:CARGO_HOME, $env:RUSTUP_HOME, $env:CARGO_TARGET_DIR) | Where-Object { $_ }
     foreach ($file in $files) {
         Assert-Within $file.FullName $extractRoot
@@ -226,7 +241,7 @@ try {
             $file.Name -match '(?:-wal|-shm|\.server-state\.json)$' -or $relative -match '(?:^|/)(?:logs?|cache|recovery)/') { throw 'Server archive contains a non-public file.' }
         $bytes = [IO.File]::ReadAllBytes($file.FullName)
         $texts = @([Text.Encoding]::UTF8.GetString($bytes))
-        if ($relative -ceq $binaryName) {
+        if ($relative -cin @($binaryName,$migratorName)) {
             $texts += [Text.Encoding]::Unicode.GetString($bytes)
             if ($bytes.Length -gt 1) { $texts += [Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1) }
         }
@@ -238,7 +253,7 @@ try {
             }
         }
         if (!$IsWindows) {
-            $expectedMode = if ($relative -in @($binaryName, 'server/deploy/redeploy-server.sh')) { 493 } else { 420 }
+            $expectedMode = if ($relative -in @($binaryName,$migratorName, 'server/deploy/redeploy-server.sh')) { 493 } else { 420 }
             if ([int][IO.File]::GetUnixFileMode($file.FullName) -ne $expectedMode) { throw 'Extracted server file permissions differ from the package contract.' }
         }
     }
@@ -247,6 +262,8 @@ try {
         (Get-Content -LiteralPath (Join-Path $extractRoot 'update-version.txt') -Raw).Trim() -cne $Tag.Substring(1)) { throw 'Server update metadata differs from the release tag.' }
     $binary = Join-Path $extractRoot $binaryName
     if ((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash -cne $report.binary_sha256) { throw 'Extracted server binary SHA256 differs from its report.' }
+    $migrator=Join-Path $extractRoot $migratorName
+    if((Get-FileHash -LiteralPath $migrator -Algorithm SHA256).Hash -cne $report.migrator_sha256){throw 'Extracted migration tool SHA256 differs from its report.'}
     $versionProcess = Start-OwnedProcess $binary @('--version') 'version' $extractRoot
     Wait-OwnedProcess $versionProcess 30000 'Extracted server version check failed or timed out.'
     if ((Get-Content -LiteralPath (Join-Path $testRoot 'version.stdout') -Raw).Trim() -cne "audiolib-server $version") { throw 'Extracted server version differs from the tag.' }
@@ -264,6 +281,24 @@ try {
     }
     Wait-OwnedProcess $seed 600000 'Synthetic server library generation failed or timed out.'
     if (!(Test-Path -LiteralPath $database -PathType Leaf)) { throw 'Synthetic server library was not created.' }
+    # Generate a separate owned fixture; never copy a SQLite main file while
+    # assuming that every committed WAL frame was checkpointed by process exit.
+    $migrationDb=Join-Path $testRoot 'migration-package.db';Assert-Within $migrationDb $testRoot
+    $migrationSeed=if($IsWindows){Start-OwnedProcess $benchmark @('--db',$migrationDb,'--records','1','--queries','100') 'migration-seed' $testRoot}else{Start-OwnedProcess $cargo @('run','-p','audiolib-db','--bin','search-benchmark','--locked','--target',$Target,'--','--db',$migrationDb,'--records','1','--queries','100') 'migration-seed' $taskRoot}
+    Wait-OwnedProcess $migrationSeed 600000 'Owned migration library generation failed or timed out.'
+    $beforeGuardHash=(Get-FileHash -LiteralPath $migrationDb -Algorithm SHA256).Hash
+    $trace=Join-Path $testRoot 'must-not-exist.sql';$guard=Start-OwnedProcess $migrator @('status','--db',$migrationDb,'--sql-trace',$trace) 'migrator-production-guard' $testRoot
+    if(!$guard.WaitForExit(30000) -or $guard.ExitCode -eq 0 -or (Get-Content -Raw -LiteralPath (Join-Path $testRoot 'migrator-production-guard.stderr')) -notmatch 'fault injection requires test-hooks' -or (Test-Path -LiteralPath $trace) -or (Get-FileHash -LiteralPath $migrationDb -Algorithm SHA256).Hash -cne $beforeGuardHash){throw 'Packaged migrator must exclude test-hooks and refuse fault-injection flags without changing its library.'}
+    $migrationStates=@();$step=0
+    foreach($action in @('status','start','status','rollback','status')){
+        $name='migrator-step-'+$step;$process=Start-OwnedProcess $migrator @($action,'--db',$migrationDb) $name $testRoot;Wait-OwnedProcess $process 300000 'Packaged migration tool failed or timed out on its owned library.'
+        $reply=Get-Content -Raw -LiteralPath (Join-Path $testRoot ($name+'.stdout'))|ConvertFrom-Json -AsHashtable
+        $expectedVersion=if($step -in @(1,2)){9}else{8}
+        $expectedState=@('idle','done','done','rolled_back','rolled_back')[$step]
+        if($reply.error_code -ne $null -or $reply.state -cne $expectedState -or !$reply.Contains('switch') -or $reply.switch.user_version -ne $expectedVersion){throw 'Packaged migration tool status/start/rollback markers differ from the migration contract.'}
+        if($expectedVersion -eq 9 -and ($reply.switch.source_search_rev -ne 3 -or @(@('search_path','vorbis_tags','vendor_metadata')|Where-Object {$_ -cnotin $reply.switch.features}).Count)){throw 'Packaged migration tool did not publish the complete schema-9 source/feature contract.'}
+        $migrationStates+=$reply.state;$step++
+    }
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     try { $listener.Start(); $port = $listener.LocalEndpoint.Port } finally { $listener.Stop() }
     $config = Join-Path $testRoot 'server.toml'
@@ -289,20 +324,30 @@ try {
         Start-Sleep -Milliseconds 200
     } while ([datetime]::UtcNow -lt $deadline)
     if ($null -eq $health -or $health.status -cne 'ok' -or $health.version -cne $version -or
-        $health.api_version -cne 'v1' -or $health.schema_version -ne 6 -or $health.commit -cne $shortCommit) { throw 'Extracted server health identity/API/schema check failed.' }
+        $health.api_version -cne 'v1' -or $health.schema_version -ne 8 -or $health.commit -cne $shortCommit) { throw 'Extracted server health identity/API/schema check failed.' }
+    $capabilities = Read-Endpoint '/capabilities'
+    if ($capabilities.compatibility.features.album_entities -ne 1 -or
+        $capabilities.compatibility.features.album_entity_artwork -ne 1 -or
+        $capabilities.compatibility.features.Contains('metadata_storage')) {
+        throw 'Extracted server shared-album capabilities differ from the plain Metadata contract.'
+    }
     $library = Read-Endpoint '/library'
     if ($server.HasExited -or $library.library_id -isnot [string] -or !$library.library_id -or
-        $library.schema_version -ne 6 -or $library.identity_bound_writes -isnot [bool] -or !$library.identity_bound_writes -or
+        $library.schema_version -ne 8 -or $library.identity_bound_writes -isnot [bool] -or !$library.identity_bound_writes -or
         $library.stats.audio_files -ne 1 -or $library.database -cne [IO.Path]::GetFileName($database)) { throw 'Extracted server could not serve its isolated synthetic library.' }
-    if ($library.snapshot_format.id -cne 'ale-s6-cld1-t3-m2-p1' -or
-        $library.snapshot_format.format.features.play_history_retired -ne 2) {
-        throw 'Extracted server snapshot format does not declare playback-history retirement.'
+    if ($library.snapshot_format.id -cne 'ale-s8-cld1-t3-m2-p1-a1' -or
+        $library.snapshot_format.format.schema_version -ne 8 -or
+        $library.snapshot_format.format.features.play_history_retired -ne 2 -or
+        $library.snapshot_format.format.features.album_entities -ne 1 -or
+        $library.snapshot_format.format.features.Contains('metadata_storage')) {
+        throw 'Extracted server snapshot format differs from the current schema 8 contract.'
     }
     # Safe public result only: neither endpoint responses nor process logs are exported.
     [ordered]@{
         success=$true; tag=$Tag; version=$version; target=$Target; commit=$commit
-        archive_sha256=$archiveHash; binary_sha256=$report.binary_sha256
-        checks=@('archive checksum/report schema', 'public archive contents', 'extracted binary version/hash', 'isolated health API v1/schema 6/commit', 'synthetic library available')
+        archive_sha256=$archiveHash; binary_sha256=$report.binary_sha256;migrator_sha256=$report.migrator_sha256
+        layout_revision=2;automatic_upgrade_compatible=$false;manual_bootstrap_required=$true;minimum_updater_version='0.9.0';old_updater_policy='refused'
+        checks=@('archive checksum/report schema','new layout accepted and frozen old updater genuinely refused','public archive contents','extracted binaries/hash','production migrator excludes test-hooks','owned migrator status/start/status/rollback/status 8/9/8','isolated health API v1/schema 8/commit','schema 8 shared albums/plain Metadata format','synthetic library available')
         shutdown=$(if ($IsWindows) { 'owned test process termination; graceful drain not tested' } else { 'owned test process SIGTERM with bounded termination fallback' })
     } | ConvertTo-Json -Depth 4
 } finally {

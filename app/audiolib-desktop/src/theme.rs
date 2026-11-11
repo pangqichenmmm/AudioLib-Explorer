@@ -1,11 +1,14 @@
 // app/audiolib-desktop/src/theme.rs
-//! Appearance themes and font sizes. A theme is a palette of Slint `Theme` color
-//! tokens set from Rust; only the default theme (the original look) ships for now.
+//! Appearance themes and font sizes. Built-in definitions live in core so settings
+//! validation, bilingual names and presentation selection share one registry.
 //! Font sizes are whole pixels; `Theme.font()` / `Theme.list-font()` combine them
 //! with the interface scale.
 use crate::AppWindow;
-use audiolib_core::config::{DEFAULT_THEME, THEME_IDS, clamp_font_size, normalize_theme};
-use slint::{Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use audiolib_core::config::{
+    BUILTIN_THEMES, DEFAULT_THEME, DEFAULT_V2_THEME, PlayerStyle, THEME_IDS, WorkbenchStyle,
+    clamp_font_size, normalize_theme,
+};
+use slint::{Color, ComponentHandle, Image, ModelRc, SharedString, VecModel};
 
 /// Color tokens of one theme, as `0xAARRGGBB`.
 pub(crate) struct Palette {
@@ -20,6 +23,9 @@ pub(crate) struct Palette {
     pub muted: u32,
     pub accent: u32,
     pub accent_hover: u32,
+    pub mint: u32,
+    pub apricot: u32,
+    pub coral: u32,
     pub on_accent: u32,
     pub selected: u32,
     pub checked: u32,
@@ -48,6 +54,9 @@ pub(crate) const DEFAULT_PALETTE: Palette = Palette {
     muted: 0xff95_a0ac,
     accent: 0xff8f_aea6,
     accent_hover: 0xffa8_c3bb,
+    mint: 0xff8f_aea6,
+    apricot: 0xffc3_b48e,
+    coral: 0xffcf_9696,
     on_accent: 0xff20_2b28,
     selected: 0xff2b_3a38,
     checked: 0xff35_4744,
@@ -63,13 +72,68 @@ pub(crate) const DEFAULT_PALETTE: Palette = Palette {
     overlay: 0xa800_0000,
 };
 
-/// Palette and English/Chinese display names for a known theme identifier.
-fn theme_entry(id: &str) -> (&'static Palette, &'static str, &'static str) {
-    match id {
-        DEFAULT_THEME => (&DEFAULT_PALETTE, "Default", "默认"),
-        _ => (&DEFAULT_PALETTE, "Default", "默认"),
-    }
-}
+/// The PR #185 workbench palette, retained as the opt-in Studio theme.
+pub(crate) const STUDIO_PALETTE: Palette = Palette {
+    bg: 0xff20_2226,
+    panel: 0xff24_272b,
+    raised: 0xff39_3c43,
+    hover: 0xff34_383e,
+    border: 0xff38_3c43,
+    strong_border: 0xff62_6873,
+    ink: 0xffec_ebe7,
+    dim: 0xffad_b0b7,
+    muted: 0xff85_8b94,
+    accent: 0xff2b_bfbd,
+    accent_hover: 0xff66_d2c9,
+    mint: 0xff79_d5bc,
+    apricot: 0xffef_c4a5,
+    coral: 0xffea_8b75,
+    on_accent: 0xff10_2a2a,
+    selected: 0xff29_3e40,
+    checked: 0xff30_3c3e,
+    alternate: 0xff27_2a2f,
+    warning: 0xffd6_ba98,
+    trough: 0xff1e_2024,
+    segment: 0xff3b_4148,
+    danger: 0xffdf_9e98,
+    danger_surface: 0xff40_3033,
+    player: 0xff29_2c31,
+    player_border: 0xff41_454c,
+    tooltip: 0xff19_1b1f,
+    overlay: 0xa800_0000,
+};
+
+/// Neutral graphite workbench with soft sage actions, joining the Studio shell
+/// to the original player without the Studio theme's saturated cyan accents.
+pub(crate) const DEFAULT_V2_PALETTE: Palette = Palette {
+    bg: 0xff1c_2024,
+    panel: 0xff23_282d,
+    raised: 0xff2e_353c,
+    hover: 0xff3a_444c,
+    border: 0xff38_4149,
+    strong_border: 0xff6a_7881,
+    ink: 0xffdf_e5e7,
+    dim: 0xffaf_bbc1,
+    muted: 0xff96_a5ad,
+    accent: 0xff94_b5ad,
+    accent_hover: 0xffb0_cbc3,
+    mint: 0xffa0_c2b8,
+    apricot: 0xffce_bd9d,
+    coral: 0xffce_a39b,
+    on_accent: 0xff20_2c29,
+    selected: 0xff30_4442,
+    checked: 0xff39_504b,
+    alternate: 0xff26_2d33,
+    warning: 0xffce_bd9d,
+    trough: 0xff19_1e22,
+    segment: 0xff3c_484f,
+    danger: 0xffd2_a3a1,
+    danger_surface: 0xff3d_2e32,
+    player: DEFAULT_PALETTE.player,
+    player_border: DEFAULT_PALETTE.player_border,
+    tooltip: 0xff16_1b1f,
+    overlay: 0xa800_0000,
+};
 
 /// Appearance combo index for a theme identifier; unknown themes select the default.
 pub(crate) fn theme_index(id: &str) -> i32 {
@@ -88,24 +152,44 @@ pub(crate) fn theme_id(index: i32) -> String {
         .map_or_else(|| DEFAULT_THEME.to_owned(), |id| (*id).to_owned())
 }
 
-/// List the themes, select `id` and apply its palette to the Slint `Theme` global.
+/// List and apply a complete theme (palette and presentation) on the UI thread.
 pub(crate) fn apply_theme(ui: &AppWindow, id: &str) {
     let names = |chinese: bool| {
-        let names = THEME_IDS
+        let names = BUILTIN_THEMES
             .iter()
-            .map(|id| {
-                let (_, english, chinese_name) = theme_entry(id);
-                SharedString::from(if chinese { chinese_name } else { english })
-            })
+            .map(|entry| SharedString::from(if chinese { entry.name_cn } else { entry.name }))
             .collect::<Vec<_>>();
         ModelRc::new(VecModel::from(names))
     };
     ui.set_theme_names(names(false));
     ui.set_theme_names_cn(names(true));
     let id = normalize_theme(id);
-    ui.set_theme_index(theme_index(&id));
-    let (palette, _, _) = theme_entry(&id);
+    let index = theme_index(&id);
+    ui.set_theme_index(index);
+    let entry = &BUILTIN_THEMES[index as usize];
+    // A new design gets its own palette and presentation. Preserve the original
+    // default, while spectral frequency colors remain independent audio data.
+    let palette = match entry.id {
+        DEFAULT_V2_THEME => &DEFAULT_V2_PALETTE,
+        _ if entry.player_style == PlayerStyle::Studio => &STUDIO_PALETTE,
+        _ => &DEFAULT_PALETTE,
+    };
     let theme = ui.global::<crate::Theme>();
+    let modern_style = entry.workbench_style == WorkbenchStyle::Studio;
+    let modern_player = entry.player_style == PlayerStyle::Studio;
+    let presentation_changed =
+        theme.get_modern_style() != modern_style || theme.get_modern_player() != modern_player;
+    if presentation_changed {
+        ui.invoke_prepare_workbench_switch();
+        // Clear transient events before Slint creates the new presenter and binds
+        // its change trackers. Clearing on a deferred style-changed handler is late.
+        ui.invoke_clear_audition_input_feedback();
+    }
+    if modern_style {
+        install_studio_surfaces(&theme);
+    }
+    theme.set_modern_style(modern_style);
+    theme.set_modern_player(modern_player);
     let color = Color::from_argb_encoded;
     theme.set_bg(color(palette.bg));
     theme.set_panel(color(palette.panel));
@@ -118,6 +202,9 @@ pub(crate) fn apply_theme(ui: &AppWindow, id: &str) {
     theme.set_muted(color(palette.muted));
     theme.set_accent(color(palette.accent));
     theme.set_accent_hover(color(palette.accent_hover));
+    theme.set_mint(color(palette.mint));
+    theme.set_apricot(color(palette.apricot));
+    theme.set_coral(color(palette.coral));
     theme.set_on_accent(color(palette.on_accent));
     theme.set_selected(color(palette.selected));
     theme.set_checked(color(palette.checked));
@@ -131,6 +218,87 @@ pub(crate) fn apply_theme(ui: &AppWindow, id: &str) {
     theme.set_player_border(color(palette.player_border));
     theme.set_tooltip(color(palette.tooltip));
     theme.set_overlay(color(palette.overlay));
+    if presentation_changed {
+        ui.invoke_restore_workbench_switch();
+    }
+}
+
+/// Studio surface artwork in the order of the `Theme.studio-*` images.
+const STUDIO_SURFACES: [&str; 7] = [
+    include_str!("../ui/surfaces/toolbar.svg"),
+    include_str!("../ui/surfaces/rail.svg"),
+    include_str!("../ui/surfaces/library.svg"),
+    include_str!("../ui/surfaces/inspector.svg"),
+    include_str!("../ui/surfaces/player.svg"),
+    include_str!("../ui/surfaces/transport.svg"),
+    include_str!("../ui/surfaces/tab-indicator.svg"),
+];
+
+thread_local! {
+    /// Rasterized once per UI thread; images share their pixels when cloned.
+    static STUDIO_SURFACE_IMAGES: Vec<Image> =
+        STUDIO_SURFACES.iter().map(|svg| rasterize_surface(svg)).collect();
+}
+
+/// Give the Studio backdrops bitmaps. The software renderer has no cache for
+/// rasterized SVG: an SVG backdrop is rasterized at its full drawn size on every
+/// repaint that touches it, which cost a whole frame budget per playback frame.
+/// Bitmaps are only sampled inside the repainted region.
+fn install_studio_surfaces(theme: &crate::Theme) {
+    STUDIO_SURFACE_IMAGES.with(|images| {
+        let [
+            toolbar,
+            rail,
+            library,
+            inspector,
+            player,
+            transport,
+            tab_indicator,
+        ] = images.as_slice()
+        else {
+            return;
+        };
+        theme.set_studio_toolbar(toolbar.clone());
+        theme.set_studio_rail(rail.clone());
+        theme.set_studio_library(library.clone());
+        theme.set_studio_inspector(inspector.clone());
+        theme.set_studio_player(player.clone());
+        theme.set_studio_transport(transport.clone());
+        theme.set_studio_tab_indicator(tab_indicator.clone());
+    });
+}
+
+/// Rasterize one surface at twice its design size, so typical HiDPI windows
+/// scale it down or barely up. The surfaces are smooth gradients that stretch
+/// (`preserveAspectRatio="none"`), so a fixed raster keeps their look.
+fn rasterize_surface(svg: &str) -> Image {
+    let doubled = double_svg_size(svg);
+    Image::load_from_svg_data(doubled.as_bytes())
+        .ok()
+        .and_then(|image| image.to_rgba8())
+        .map(Image::from_rgba8)
+        .unwrap_or_default()
+}
+
+/// Double the root element's `width` and `height`; the viewBox keeps the art.
+fn double_svg_size(svg: &str) -> String {
+    let Some(root_end) = svg.find('>') else {
+        return svg.to_owned();
+    };
+    let (root, rest) = svg.split_at(root_end);
+    let mut root = root.to_owned();
+    for attribute in [" width=\"", " height=\""] {
+        let Some(start) = root.find(attribute).map(|at| at + attribute.len()) else {
+            continue;
+        };
+        let Some(length) = root[start..].find('"') else {
+            continue;
+        };
+        if let Ok(value) = root[start..start + length].parse::<f64>() {
+            root.replace_range(start..start + length, &(value * 2.0).to_string());
+        }
+    }
+    root + rest
 }
 
 /// Show and apply the interface and list font sizes (clamped to the supported range).
@@ -142,4 +310,42 @@ pub(crate) fn apply_font_sizes(ui: &AppWindow, ui_font: u32, list_font: u32) {
     let theme = ui.global::<crate::Theme>();
     theme.set_ui_font_px(ui_font);
     theme.set_list_font_px(list_font);
+    crate::detail_presentation::relayout(ui);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studio_surfaces_rasterize_at_twice_their_design_size() {
+        assert_eq!(
+            double_svg_size(
+                r#"<svg xmlns="x" width="56" height="668" viewBox="0 0 100 1000"><path/></svg>"#
+            ),
+            r#"<svg xmlns="x" width="112" height="1336" viewBox="0 0 100 1000"><path/></svg>"#
+        );
+        STUDIO_SURFACE_IMAGES.with(|images| {
+            assert_eq!(images.len(), STUDIO_SURFACES.len());
+            let sizes: Vec<_> = images
+                .iter()
+                .map(|image| (image.size().width, image.size().height))
+                .collect();
+            assert_eq!(
+                sizes,
+                [
+                    (3832, 112),
+                    (112, 1336),
+                    (416, 1336),
+                    (592, 1336),
+                    (3832, 256),
+                    (200, 200),
+                    (448, 6)
+                ]
+            );
+            for image in images {
+                assert!(image.to_rgba8().is_some(), "a surface is a bitmap");
+            }
+        });
+    }
 }

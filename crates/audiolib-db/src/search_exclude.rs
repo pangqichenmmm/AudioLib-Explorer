@@ -224,7 +224,7 @@ mod tests {
         let request = excluding(&["Door", "ÜBER"]);
         let exclusion = Exclusion::plan(&conn, &request, true).unwrap().unwrap();
         // The subtraction must test exactly the terms the shared statement binds.
-        let shared = search_sql(&load_tokenizer(), &request, true, true).unwrap();
+        let shared = search_sql(&conn, &load_tokenizer(), &request, true, true).unwrap();
         assert_eq!(shared.values, [exclusion.terms]);
         for eligible in [
             SearchRequest {
@@ -339,7 +339,7 @@ mod tests {
         );
         assert!(!plan.iter().any(|line| line == "SCAN af"), "{plan:?}");
 
-        let shared = search_sql(&load_tokenizer(), &request, true, true).unwrap();
+        let shared = search_sql(&conn, &load_tokenizer(), &request, true, true).unwrap();
         // A 200-file first page needs at least 800 matches to use the index walk.
         let from = exclusion.page_from(&conn, &request, 800).unwrap().unwrap();
         let plan = plan_of(

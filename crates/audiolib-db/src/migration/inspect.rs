@@ -301,6 +301,34 @@ pub(super) fn business_digest_retained(
     retired_tables: &[String],
     cancel: &AtomicBool,
 ) -> Result<BusinessDigest> {
+    business_digest_impl(conn, reference, retired_tables, cancel, None)
+}
+
+/// Reconstruct only the two explicitly admitted local identity values while
+/// hashing every retained business byte; never remove namespace from the digest.
+pub(super) fn business_digest_before_import(
+    conn: &Connection,
+    reference: &BusinessDigest,
+    namespace: &str,
+    legacy_scope: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<BusinessDigest> {
+    business_digest_impl(
+        conn,
+        Some(reference),
+        &[],
+        cancel,
+        Some((namespace, legacy_scope)),
+    )
+}
+
+fn business_digest_impl(
+    conn: &Connection,
+    reference: Option<&BusinessDigest>,
+    retired_tables: &[String],
+    cancel: &AtomicBool,
+    identity: Option<(&str, Option<&str>)>,
+) -> Result<BusinessDigest> {
     let mut tables = Vec::new();
     let names = match reference {
         Some(reference) => reference
@@ -341,9 +369,12 @@ pub(super) fn business_digest_retained(
         let mut columns: Vec<String> = info
             .iter()
             .filter(|(name, _)| {
-                !table.eq_ignore_ascii_case("audio_files")
+                (!table.eq_ignore_ascii_case("audio_files")
                     || (!search_storage::is_derived_column(name)
-                        && !name.eq_ignore_ascii_case("source_tags_text"))
+                        && !name.eq_ignore_ascii_case("source_tags_text")
+                        && !name.eq_ignore_ascii_case("album")))
+                    && !(table.eq_ignore_ascii_case("audiolib_album_id_sequence")
+                        && name.eq_ignore_ascii_case("compression"))
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -424,8 +455,29 @@ pub(super) fn business_digest_retained(
                 check_cancel(cancel)?;
             }
             hash.update([0xff]);
-            for i in 0..columns.len() {
-                match row.get_ref(i).map_err(db_error)? {
+            for (i, column) in columns.iter().enumerate() {
+                let value = if table.eq_ignore_ascii_case("audiolib_album_id_sequence") {
+                    match (identity, column.as_str()) {
+                        (Some((namespace, _)), "namespace") => ValueRef::Text(namespace.as_bytes()),
+                        (Some((_, scope)), "legacy_scope") => {
+                            scope.map_or(ValueRef::Null, |value| ValueRef::Text(value.as_bytes()))
+                        }
+                        _ => row.get_ref(i).map_err(db_error)?,
+                    }
+                } else {
+                    row.get_ref(i).map_err(db_error)?
+                };
+                if table.eq_ignore_ascii_case("audio_files")
+                    && column.eq_ignore_ascii_case("metadata_json")
+                    && matches!(value, ValueRef::Blob(_))
+                {
+                    let decoded = crate::metadata_storage::decode_value(value)?;
+                    hash.update([3]);
+                    hash.update((decoded.len() as u64).to_le_bytes());
+                    hash.update(decoded.as_bytes());
+                    continue;
+                }
+                match value {
                     ValueRef::Null => hash.update([0]),
                     ValueRef::Integer(value) => {
                         hash.update([1]);
@@ -456,6 +508,11 @@ pub(super) fn business_digest_retained(
             sha256: format!("{:x}", hash.finalize()),
         });
     }
+    digest_tables(tables)
+}
+
+/// Recompute the aggregate after an explicitly reviewed owned-table projection.
+pub(super) fn digest_tables(tables: Vec<TableDigest>) -> Result<BusinessDigest> {
     let encoded =
         serde_json::to_vec(&tables).map_err(|error| Error::Database(error.to_string()))?;
     Ok(BusinessDigest {

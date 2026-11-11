@@ -130,9 +130,18 @@ pub struct UpdateClient {
 }
 
 impl UpdateClient {
-    /// Full installed version, including the release marker's prerelease suffix.
+    /// Full installed version, including the marker's prerelease and build metadata.
     pub fn current_version(&self) -> String {
         self.current.to_string()
+    }
+
+    /// Whether the installed version uses the local-development prerelease `0`.
+    /// This recognizes both legacy `X.Y.Z-0` markers and identified local builds
+    /// such as `X.Y.Z-0+local.<exe_sha12>`. Stable and tagged beta/rc releases are
+    /// not development installations. Callers choose their update policy; this
+    /// predicate does not change release discovery, selection or preparation.
+    pub fn is_development(&self) -> bool {
+        self.current.pre.as_str() == "0"
     }
 
     /// Update channel selected by this installation.

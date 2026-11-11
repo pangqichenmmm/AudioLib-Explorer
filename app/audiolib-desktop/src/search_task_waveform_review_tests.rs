@@ -19,6 +19,7 @@ fn pending_waveform(controller: &Arc<Controller>, ui: &AppWindow, file: &AudioFi
     let cancel = Arc::new(AtomicBool::new(false));
     *controller.waveform_cancel.lock().unwrap() = cancel.clone();
     let job = WaveJob {
+        source: waveform_selection::WaveSource::capture(controller, file),
         path: PathBuf::from(&file.file_path),
         remote_id: None,
         sample_rate: file.sample_rate,
@@ -239,7 +240,7 @@ fn child_remote_loaded_waveform_priority() {
     wait_for(ui, |ui| ui.get_audio_ready() && ui.get_waveform_ready());
     let before = fixture.engine.handle().status();
     assert_eq!(before.state, PlaybackState::Ready);
-    let loaded = AudioFile {
+    let loaded = AudioFile::from(audiolib_core::AudioFileData {
         id: 900_001,
         filename: "loaded.wav".into(),
         file_path: "/server/Audio/loaded.wav".into(),
@@ -247,13 +248,13 @@ fn child_remote_loaded_waveform_priority() {
         channels: source.channels,
         duration: source.duration,
         ..Default::default()
-    };
-    let selected = AudioFile {
+    });
+    let selected = AudioFile::from(audiolib_core::AudioFileData {
         id: 900_002,
         filename: "selected.wav".into(),
         file_path: "/server/Audio/selected.wav".into(),
-        ..loaded.clone()
-    };
+        ..loaded.clone().into_data()
+    });
     controller.set_remote_wave_file_for_test(PathBuf::from(&source.file_path), loaded.clone());
     controller.remote_mode.store(true, Ordering::Release);
     controller.remote_busy.store(true, Ordering::Release);
@@ -297,15 +298,15 @@ fn child_remote_loaded_waveform_priority() {
     );
 
     assert!(controller.task_selection_is_loaded(&loaded, &before));
-    let wrong_case = AudioFile {
+    let wrong_case = AudioFile::from(audiolib_core::AudioFileData {
         file_path: "/server/audio/loaded.wav".into(),
-        ..loaded.clone()
-    };
+        ..loaded.clone().into_data()
+    });
     assert!(!controller.task_selection_is_loaded(&wrong_case, &before));
-    let wrong_id = AudioFile {
+    let wrong_id = AudioFile::from(audiolib_core::AudioFileData {
         id: loaded.id + 1,
-        ..loaded.clone()
-    };
+        ..loaded.clone().into_data()
+    });
     assert!(!controller.task_selection_is_loaded(&wrong_id, &before));
 
     // A Windows reader must not case-fold a POSIX snapshot source in either the

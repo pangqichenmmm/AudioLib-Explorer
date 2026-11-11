@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["playback"]
 # Audio output (device I/O + audition time-stretch). Headless users (the server) opt out.
-playback = ["dep:cpal", "dep:soundtouch"]
+playback = ["dep:cpal", "dep:soundtouch-ffi"]
 asio = ["playback", "cpal/asio", "audiolib-windows/asio"]
 
 [[example]]
@@ -33,10 +33,11 @@ serde.workspace = true
 serde_json.workspace = true
 rustfft = "6.4"
 audioadapter-buffers = "5.2"
-soundtouch = { version = "=0.5.4", features = ["bundled"], optional = true }
+soundtouch-ffi = { version = "=0.4.1", features = ["bundled"], optional = true }
 roxmltree = "=0.21.1"
 encoding_rs = "0.8.35"
 blowfish = "=0.9.1"
+base64 = "=0.23.1"
 
 [dev-dependencies]
 tempfile.workspace = true

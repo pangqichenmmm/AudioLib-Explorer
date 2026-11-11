@@ -1,7 +1,9 @@
 # server/audiolib-server/config.example.toml
 # Example configuration for audiolib-server. Copy it outside the repository and adjust it.
 # Typical locations: /etc/audiolib/config.toml (Linux), /usr/local/var/audiolib/config.toml
-# (macOS). All values below are documentation placeholders (192.0.2.0/24, example.com).
+# (macOS), or the recommended %ProgramData%\AudioLibServer\config.toml (Windows).
+# The server requires --config or AUDIOLIB_SERVER_CONFIG; it does not discover this path.
+# All values below are documentation placeholders (192.0.2.0/24, example.com).
 # Start with:  audiolib-server --config /path/to/server.toml
 # (optional env token:  AUDIOLIB_SERVER_TOKEN='<secret>' audiolib-server --config ...)
 # (AUDIOLIB_SERVER_CONFIG=/path/to/server.toml may replace --config).
@@ -10,10 +12,12 @@
 # Listen address (default "0.0.0.0:8790": all interfaces, LAN access).
 bind = "0.0.0.0:8790"
 
-# Existing AudioLib library (older schemas are migrated on open; current schema 6). The server never creates a library: create or
+# Existing AudioLib library (supported older formats are migrated on open; current schema 8). The server never creates a library: create or
 # import one first, e.g. `AudioLibCli db create <path>`. A sidecar
 # `<library_db>.server-state.json` (library_id + revision) is written next to it.
 library_db = "/var/lib/audiolib/library.db"
+# Windows: replace with an existing library, e.g. library_db = 'C:\ProgramData\AudioLibServer\library.db'.
+# Also replace every [[roots]].server_path below with a real Windows audio directory.
 
 # Legacy switch: auth = true is the same as auth_mode = "all" and makes the environment
 # token mandatory at startup. Leave it false and use auth_mode instead.
@@ -124,6 +128,7 @@ revision_poll_secs = 3
 # for a slot, then gets 503 BUSY with Retry-After: 1.
 # max_previews = 8
 # ffmpeg_path = "/usr/bin/ffmpeg"        # Linux; Homebrew on Apple silicon: /opt/homebrew/bin/ffmpeg
+# Windows: ffmpeg_path = 'C:\Tools\ffmpeg\bin\ffmpeg.exe' (install separately; absolute path).
 # max_transcodes = 4
 
 # server_path should be the real path (no symlinks), as stored by the scanner.

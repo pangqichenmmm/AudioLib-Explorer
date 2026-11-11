@@ -2,7 +2,8 @@
 //! Owned loopback regressions for pause, startup suppression and source-sync close.
 use super::super::*;
 use super::source_transition_tests::{
-    accept, configuration, indexed_sounds, isolated_module, request, respond, root, run_until,
+    CapabilityProbeServer, accept, configuration, indexed_sounds, isolated_module, request,
+    respond, root, run_until,
 };
 use super::*;
 use audiolib_core::config::{ActiveSource, ServerProfile};
@@ -321,9 +322,8 @@ fn manual_pause_survives_startup_and_does_not_block_revision_status_updates() {
 fn child_paused_startup() {
     i_slint_backend_testing::init_integration_test_with_system_time();
     let root = root();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = CapabilityProbeServer::start();
+    let url = server.url.clone();
     let mut config = configuration(&root.join("preferences"));
     config.data_source.mode = DataSourceMode::Server;
     config.data_source.server_url = url.clone();
@@ -399,10 +399,10 @@ fn child_paused_startup() {
         generation
     );
     assert!(ui.get_remote_notice().contains("Sync paused"));
-    assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    // Opening the retained cache may probe /capabilities, while the strict mock
+    // still refuses all sync/download and playback/mutation requests.
     assert!(cache.pending_sync(&url).unwrap().unwrap().manual_paused);
     controller.shutdown();
     ui.hide().unwrap();
+    server.finish();
 }

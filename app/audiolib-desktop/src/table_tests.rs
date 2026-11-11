@@ -195,7 +195,8 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
     ui.show().unwrap();
     settle();
     let before = element(&ui, "table-name-header").absolute_position().x;
-    scroll_table(&ui, "empty-result-list", -900.0);
+    // Saturate the scroll range: the album column extends beyond the Tags divider.
+    scroll_table(&ui, "empty-result-list", -10_000.0);
     let empty_offset = element(&ui, "table-name-header").absolute_position().x - before;
     assert!(
         empty_offset < -600.0,
@@ -217,7 +218,7 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
     crate::ui_tests::send_keys(&ui, &[slint::platform::Key::RightArrow.into()]);
     near(ui.get_table_tags_width(), 300.0);
     settle();
-    scroll_table(&ui, "empty-result-list", -900.0);
+    scroll_table(&ui, "empty-result-list", -10_000.0);
     let resized_offset = element(&ui, "table-name-header").absolute_position().x - before;
     near(resized_offset, empty_offset + 40.0);
 
@@ -249,7 +250,7 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
         populated_offset,
     );
     assert_eq!(ui.get_rows().row_count(), 0);
-    scroll_table(&ui, "empty-result-list", -900.0);
+    scroll_table(&ui, "empty-result-list", -10_000.0);
     near(
         element(&ui, "table-name-header").absolute_position().x - before,
         resized_offset,
@@ -269,7 +270,7 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
         resized_offset + 20.0,
     );
     assert_cell_alignment(&ui);
-    scroll_table(&ui, "result-list", 900.0);
+    scroll_table(&ui, "result-list", 10_000.0);
     near(
         element(&ui, "table-name-header").absolute_position().x,
         before,
@@ -284,7 +285,7 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
     ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
     rows.set_vec(Vec::new());
     settle();
-    scroll_table(&ui, "empty-result-list", -900.0);
+    scroll_table(&ui, "empty-result-list", -10_000.0);
     let fractional_offset = element(&ui, "table-name-header").absolute_position().x - before;
     assert!(fractional_offset < -600.0);
     rows.push(row.clone());
@@ -298,10 +299,10 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
     // Narrow columns have no horizontal range in either view. The fixed empty
     // overlay still accepts its clear action over the independent viewport.
     rows.set_vec(Vec::new());
-    ui.set_table_name_width(240.5);
+    ui.set_table_name_width(120.5);
     ui.set_table_tags_width(160.25);
     settle();
-    scroll_table(&ui, "empty-result-list", -900.0);
+    scroll_table(&ui, "empty-result-list", -10_000.0);
     near(
         element(&ui, "table-name-header").absolute_position().x,
         before,
@@ -319,7 +320,7 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
     assert_eq!(filters.get(), 1);
     rows.push(row.clone());
     settle();
-    scroll_table(&ui, "result-list", -900.0);
+    scroll_table(&ui, "result-list", -10_000.0);
     near(
         element(&ui, "table-name-header").absolute_position().x,
         before,
@@ -333,7 +334,7 @@ fn empty_table_keeps_horizontal_extent_and_right_columns_operable_across_model_c
         element(&ui, "table-name-header").absolute_position().x,
         before,
     );
-    scroll_table_for(&ui, "empty-result-list", -900.0, 60);
+    scroll_table_for(&ui, "empty-result-list", -10_000.0, 60);
     // The public PointerScrolled API uses Slint's immediate (Cancelled) phase.
     // Rapid model switches must preserve that input's offset in both views.
     let moving_offset = element(&ui, "table-name-header").absolute_position().x - before;
@@ -419,12 +420,13 @@ fn child_table_controller_preferences() {
     wav.extend(b"data");
     wav.extend(2u32.to_le_bytes());
     wav.extend(0i16.to_le_bytes());
-    for index in 0..205 {
-        std::fs::write(sounds.join(format!("Sound {index:03}.wav")), &wav).unwrap();
+    for index in 0..1005 {
+        std::fs::write(sounds.join(format!("Sound {index:04}.wav")), &wav).unwrap();
     }
     let mut config = AppConfig::load_in(root.join("preferences")).unwrap();
     config.language = "cn".into();
     config.audition_play_on_single_click = true;
+    config.pregenerate_list_waveforms = false;
     config.audio_table = AudioTablePreferences {
         name_width: 280.0,
         duration_width: 70.0,
@@ -449,8 +451,13 @@ fn child_table_controller_preferences() {
             |_| {},
         )
         .unwrap();
+    // Table interactions exercise a library whose path-index upgrade is complete.
+    provider.rebuild_directory_search().unwrap();
     let engine = audiolib_audio::AudioEngine::new(playback.clone()).unwrap();
     let ui = AppWindow::new().unwrap();
+    // This fixture exercises scrolling and preferences. Disable both background
+    // and on-demand Waveform derivation to keep provider revisions stable.
+    ui.set_list_waveforms_enabled(false);
     ui.window().set_size(slint::LogicalSize::new(1800.0, 900.0));
     let controller = Controller::new(&ui, provider, engine.handle(), config, playback);
     assert!(ui.get_chinese());
@@ -461,29 +468,106 @@ fn child_table_controller_preferences() {
     assert!(ui.get_sort_descending());
 
     let phase = Rc::new(Cell::new(0));
+    let range_requests = Rc::new(Cell::new(0));
+    let cancel_next_range = Rc::new(Cell::new(false));
+    let range_superseded = Rc::new(Cell::new(false));
+    // Keep the production range handler, and supersede the last queued range
+    // synchronously so the test cannot miss a fast local query's pending phase.
+    let range_controller = controller.clone();
+    let range_ui = ui.as_weak();
+    let observed_requests = range_requests.clone();
+    let should_supersede = cancel_next_range.clone();
+    let superseded = range_superseded.clone();
+    ui.on_result_range_requested(move |direction| {
+        let ui = range_ui.upgrade().unwrap();
+        let before = range_controller.request.lock().unwrap().clone();
+        if !range_controller.extend_result_window(&ui, direction) {
+            return;
+        }
+        observed_requests.set(observed_requests.get() + 1);
+        assert!(ui.get_searching());
+        let displayed = range_controller.request.lock().unwrap().clone();
+        assert_eq!(
+            (displayed.offset, displayed.limit),
+            (before.offset, before.limit)
+        );
+        if should_supersede.replace(false) {
+            let pending_generation = range_controller.search_generation.load(Ordering::Acquire);
+            click(&ui, midpoint(&element(&ui, "table-name-header")));
+            click(&ui, midpoint(&element(&ui, "table-name-header")));
+            assert!(
+                range_controller.search_generation.load(Ordering::Acquire) > pending_generation,
+                "Sorting must invalidate the pending continuous-scroll generation"
+            );
+            superseded.set(true);
+        }
+    });
+    let anchor_before_wheel = Rc::new(Cell::new(0.0));
     let timer_phase = phase.clone();
     let timer_controller = controller.clone();
     let weak = ui.as_weak();
     let preferences = root.join("preferences");
     let saved_preferences = preferences.clone();
     let started = Instant::now();
+    let mut layout_model: Option<(ModelRc<AudioRow>, usize)> = None;
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(10),
         move || {
-            assert!(
-                started.elapsed() < Duration::from_secs(15),
-                "Table phase {} timed out",
-                timer_phase.get()
-            );
             let ui = weak.upgrade().unwrap();
-            if timer_phase.get() < 4 && !page_published(&timer_controller) {
+            assert!(
+                started.elapsed() < Duration::from_secs(25),
+                "Table phase {} timed out: rows={}, request={:?}, searching={}, restoring={}, range_requests={}, publication={:?}, search_generation={}, search_queue={}, cancelled={:?}, status={}",
+                timer_phase.get(),
+                ui.get_rows().row_count(),
+                {
+                    let request = timer_controller.request.lock().unwrap();
+                    (request.offset, request.limit)
+                },
+                ui.get_searching(),
+                ui.get_task_restoring(),
+                range_requests.get(),
+                timer_controller.search_publication.lock().unwrap().as_ref().map(|state| {
+                    let page = match state.page {
+                        SearchPagePhase::Pending => "pending",
+                        SearchPagePhase::Published => "published",
+                        SearchPagePhase::Failed => "failed",
+                    };
+                    (page, state.model_published)
+                }),
+                timer_controller.search_generation.load(Ordering::Acquire),
+                match timer_controller.search_job.try_lock() {
+                    Ok(queued) => format!("{:?}", queued.as_ref().map(|job| {
+                        (job.generation, job.request.offset, job.request.limit, job.cancel.load(Ordering::Acquire))
+                    })),
+                    Err(error) => error.to_string(),
+                },
+                timer_controller.search_cancel.try_lock()
+                    .map(|cancel| cancel.load(Ordering::Acquire))
+                    .map_err(|error| error.to_string()),
+                ui.get_status()
+            );
+            // The system-time testing loop does not render. Instantiate each new
+            // result range once; traversing the full tree every tick starves posted
+            // worker replies behind the status timer's event-loop messages.
+            let model = ui.get_rows();
+            let count = model.row_count();
+            if layout_model
+                .as_ref()
+                .is_none_or(|(previous, previous_count)| previous != &model || *previous_count != count)
+            {
+                let _ = ElementHandle::find_by_element_id(&ui, "AppWindow::table-name-cell").next();
+                layout_model = Some((model, count));
+            }
+            if timer_phase.get() < 12
+                && (!page_published(&timer_controller) || ui.get_task_restoring())
+            {
                 return;
             }
             match timer_phase.get() {
                 0 => {
-                    assert_names(&ui, (5..205).rev());
+                    assert_names(&ui, (805..1005).rev());
                     click(&ui, midpoint(&element(&ui, "table-name-header")));
                     timer_phase.set(1);
                 }
@@ -492,26 +576,104 @@ fn child_table_controller_preferences() {
                     // without a query is filename ascending.
                     assert_eq!((ui.get_sort_index(), ui.get_sort_descending()), (0, false));
                     assert_names(&ui, 0..200);
-                    ui.invoke_page_requested(1);
+                    prepare_result_window_edge(&ui, true);
                     timer_phase.set(2);
                 }
-                2 => {
-                    assert_eq!(timer_controller.request.lock().unwrap().offset, 200);
-                    assert_names(&ui, 200..205);
-                    // Ascending, then descending; only the latest request publishes.
-                    click(&ui, midpoint(&element(&ui, "table-name-header")));
-                    click(&ui, midpoint(&element(&ui, "table-name-header")));
-                    timer_phase.set(3);
+                2 | 4 | 6 | 8 | 10 => {
+                    // Programmatic restoration prepares the fixture; only real wheel
+                    // movement may request the adjoining portion of the result range.
+                    anchor_before_wheel.set(result_window_anchor(&ui, &timer_controller));
+                    let direction = if timer_phase.get() == 8 { 1.0 } else { -1.0 };
+                    for _ in 0..2 {
+                        wheel_results(&ui, direction * 120.0);
+                    }
+                    timer_phase.set(timer_phase.get() + 1);
                 }
                 3 => {
-                    assert!(ui.get_sort_descending());
-                    assert_eq!(timer_controller.request.lock().unwrap().offset, 0);
-                    assert_names(&ui, (5..205).rev());
-                    drag(&ui, "table-duration-divider", 40.0);
-                    near(ui.get_table_duration_width(), 110.0);
+                    if ui.get_rows().row_count() != 400 {
+                        return;
+                    }
+                    assert_result_window(
+                        &ui,
+                        &timer_controller,
+                        0,
+                        400,
+                        anchor_before_wheel.get(),
+                        timer_phase.get(),
+                    );
+                    assert_eq!(
+                        range_requests.get(),
+                        1,
+                        "A wheel burst must queue one range"
+                    );
+                    prepare_result_window_edge(&ui, true);
                     timer_phase.set(4);
                 }
-                4 => {
+                5 => {
+                    if ui.get_rows().row_count() != 600 {
+                        return;
+                    }
+                    assert_result_window(
+                        &ui,
+                        &timer_controller,
+                        0,
+                        600,
+                        anchor_before_wheel.get(),
+                        timer_phase.get(),
+                    );
+                    assert_eq!(range_requests.get(), 2);
+                    prepare_result_window_edge(&ui, true);
+                    timer_phase.set(6);
+                }
+                7 => {
+                    if timer_controller.request.lock().unwrap().offset != 200 {
+                        return;
+                    }
+                    assert_result_window(
+                        &ui,
+                        &timer_controller,
+                        200,
+                        600,
+                        anchor_before_wheel.get(),
+                        timer_phase.get(),
+                    );
+                    assert_eq!(range_requests.get(), 3);
+                    prepare_result_window_edge(&ui, false);
+                    timer_phase.set(8);
+                }
+                9 => {
+                    if timer_controller.request.lock().unwrap().offset != 0 {
+                        return;
+                    }
+                    assert_result_window(
+                        &ui,
+                        &timer_controller,
+                        0,
+                        600,
+                        anchor_before_wheel.get(),
+                        timer_phase.get(),
+                    );
+                    assert_eq!(range_requests.get(), 4);
+                    // The next wheel queues another downward window. Its handler
+                    // immediately sorts twice before that generation can publish.
+                    cancel_next_range.set(true);
+                    prepare_result_window_edge(&ui, true);
+                    timer_phase.set(10);
+                }
+                11 => {
+                    if !range_superseded.get() {
+                        return;
+                    }
+                    assert_eq!(range_requests.get(), 5);
+                    assert!(ui.get_sort_descending());
+                    let request = timer_controller.request.lock().unwrap().clone();
+                    assert_eq!((request.offset, request.limit), (0, 200));
+                    assert_names(&ui, (805..1005).rev());
+                    drag(&ui, "table-duration-divider", 40.0);
+                    near(ui.get_table_duration_width(), 110.0);
+                    timer_phase.set(12);
+                }
+                12 => {
                     let saved = AppConfig::load_in(saved_preferences.clone()).unwrap();
                     if saved.audio_table.duration_width != 110.0
                         || saved.audio_table.order_by != SortOrder::Filename
@@ -522,12 +684,13 @@ fn child_table_controller_preferences() {
                     assert_eq!(saved.language, "cn");
                     assert_eq!(saved.playback["volume"], serde_json::json!(0.25));
                     assert!(saved.audition_play_on_single_click);
-                    timer_phase.set(5);
+                    assert_names(&ui, (805..1005).rev());
+                    timer_phase.set(13);
                     slint::quit_event_loop().unwrap();
                 }
                 // Quit is queued; an already-ready timer callback can run once
                 // more before the event loop returns. Completion is idempotent.
-                5 => {}
+                13 => {}
                 _ => unreachable!(),
             }
         },
@@ -537,7 +700,7 @@ fn child_table_controller_preferences() {
     timer.stop();
     assert_eq!(
         phase.get(),
-        5,
+        13,
         "Sort and resize requests must save before shutdown"
     );
 
@@ -582,7 +745,7 @@ fn child_table_controller_preferences() {
 
 fn assert_names(ui: &AppWindow, indices: impl Iterator<Item = usize>) {
     let expected = indices
-        .map(|index| format!("Sound {index:03}.wav"))
+        .map(|index| format!("Sound {index:04}.wav"))
         .collect::<Vec<_>>();
     let actual = ui
         .get_rows()
@@ -590,6 +753,65 @@ fn assert_names(ui: &AppWindow, indices: impl Iterator<Item = usize>) {
         .map(|row| row.name.to_string())
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+fn prepare_result_window_edge(ui: &AppWindow, down: bool) {
+    let height = element(ui, "result-list").size().height;
+    let y = if down {
+        -(ui.get_rows().row_count() as f32 * ui.get_task_result_row_height() - height * 2.0)
+    } else {
+        -height
+    };
+    ui.invoke_restore_search_task_viewport(
+        y,
+        ui.get_task_result_scroll_x(),
+        ui.get_task_folder_scroll_y(),
+        ui.get_task_filter_scroll_y(),
+        ui.get_task_inspector_scroll_y(),
+    );
+}
+
+fn wheel_results(ui: &AppWindow, delta_y: f32) {
+    let origin = element(ui, "result-list").absolute_position();
+    let position = slint::LogicalPosition::new(origin.x + 40.0, origin.y + 40.0);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y,
+    });
+}
+
+fn result_window_anchor(ui: &AppWindow, controller: &Controller) -> f32 {
+    controller.request.lock().unwrap().offset as f32 * ui.get_task_result_row_height()
+        - ui.get_task_result_scroll_y()
+}
+
+fn assert_result_window(
+    ui: &AppWindow,
+    controller: &Controller,
+    offset: usize,
+    limit: usize,
+    anchor_before: f32,
+    phase: i32,
+) {
+    let request = controller.request.lock().unwrap().clone();
+    assert_eq!((request.offset, request.limit), (offset, limit));
+    assert_names(ui, offset..offset + limit);
+    let y = ui.get_task_result_scroll_y();
+    let anchor_after = result_window_anchor(ui, controller);
+    assert!(
+        y < -100.0,
+        "Prefetch must retain a scrolled viewport: phase={phase}, offset={offset}, limit={limit}, y={y}, anchor_before={anchor_before}, anchor_after={anchor_after}, restoring={}, selected_row={}",
+        ui.get_task_restoring(),
+        ui.get_selected_row()
+    );
+    assert!(
+        (result_window_anchor(ui, controller) - anchor_before).abs()
+            < element(ui, "result-list").size().height,
+        "Growing or sliding the window must retain the same visible sounds: phase={phase}, offset={offset}, limit={limit}, y={y}, anchor_before={anchor_before}, anchor_after={anchor_after}"
+    );
 }
 
 fn page_published(controller: &Controller) -> bool {

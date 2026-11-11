@@ -109,6 +109,8 @@ fn child_real_pointer_preview_modes() {
         playback: serde_json::to_value(&playback).unwrap(),
         audition_play_on_single_click: false,
         play_history_limit: audiolib_core::config::PLAY_HISTORY_LIMIT_PER_LIBRARY,
+        show_album_artwork: true,
+        slice_export_directory: None,
         pregenerate_list_waveforms: false,
         hold_list_waveform_batches_after_audition: false,
         max_search_tasks: 6,
@@ -117,10 +119,12 @@ fn child_real_pointer_preview_modes() {
         ui_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         list_font_size: audiolib_core::config::DEFAULT_FONT_SIZE,
         audio_table: Default::default(),
+        spectral_peaks: Default::default(),
         window_layout: Default::default(),
         allowed_scan_roots: vec![sounds.canonicalize().unwrap()],
         data_source: Default::default(),
         data_source_fallback: None,
+        search_scope: "all".into(),
     };
     config.save().unwrap();
     let provider = Arc::new(SqliteProvider::open(&config.paths.database).unwrap());

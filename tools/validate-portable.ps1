@@ -3,11 +3,18 @@
 param(
     [string]$BinaryDirectory = 'dist/latest/portable',
     [switch]$CleanCheckout,
+    # Routine acceptance uses synthetic data. Opt in only for legacy-import changes.
+    [switch]$LegacyImport,
+    # Match build-release/package-portable; ASIO remains required by default.
+    [switch]$WithoutAsio,
     [string]$PublishedReleaseReport,
     [string]$ExpectedTag,
     [string]$ExpectedCommit
 )
 $ErrorActionPreference = 'Stop'
+if ($CleanCheckout -and $LegacyImport) { throw 'Choose synthetic acceptance or -LegacyImport, not both.' }
+# Keep -CleanCheckout as a compatible explicit spelling of the default.
+$CleanCheckout = !$LegacyImport
 . (Join-Path $PSScriptRoot 'console-utf8.ps1')
 try {
 if ($PublishedReleaseReport -and $PSVersionTable.PSVersion -lt [version]'7.3') { throw 'Published release validation requires pwsh (PowerShell 7.3 or newer).' }
@@ -15,6 +22,8 @@ $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $binaryRoot = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($BinaryDirectory)) { $BinaryDirectory } else { Join-Path $taskRoot $BinaryDirectory }))
 $cli = Join-Path $binaryRoot 'AudioLibCli.exe'
 $desktop = Join-Path $binaryRoot 'AudioLibExplorer.exe'
+# Reject incomplete packages before reading the legacy fixture or starting apps.
+& (Join-Path $PSScriptRoot 'validate-portable-licenses.ps1') -BinaryDirectory $binaryRoot -WithoutAsio:$WithoutAsio
 $tempParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar)
 $testRoot = [IO.Path]::GetFullPath((Join-Path $tempParent ('AudioLibPortable-' + [guid]::NewGuid().ToString('N'))))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $taskRoot '.rust-validation/portable-smoke'))
@@ -149,12 +158,6 @@ try {
     $fatalLog = Join-Path $badRoot 'logs/AudioLibExplorer-startup-error.log'
     if ($failure.ExitCode -ne 1 -or !(Test-Path -LiteralPath $fatalLog)) { throw 'Fatal preference failure did not return code 1 and persist a startup diagnostic.' }
     if ((Get-Content -LiteralPath $fatalLog -Raw) -notmatch 'Load AudioLib preferences') { throw 'Fatal log does not contain the startup context.' }
-    $notices = Get-Content -LiteralPath (Join-Path $binaryRoot 'licenses/dependencies.json') -Raw | ConvertFrom-Json
-    if (!($notices | Where-Object { $_.name -eq 'slint' -and $_.version -eq '1.17.1' })) { throw 'Slint dependency notice missing.' }
-    if (!(Test-Path -LiteralPath (Join-Path $binaryRoot 'licenses/slint-1.17.1/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md'))) { throw 'Selected Slint license text missing.' }
-    if (!(Test-Path -LiteralPath (Join-Path $binaryRoot 'licenses/Steinberg-ASIO-SDK-2.3.4.txt'))) { throw 'ASIO SDK license missing.' }
-    if (!($notices | Where-Object { $_.name -eq 'soundtouch' -and $_.version -eq '0.5.4' }) -or
-        !(Test-Path -LiteralPath (Join-Path $binaryRoot 'licenses/SoundTouch-2.3.2-LGPL.txt'))) { throw 'SoundTouch dependency or license notice missing.' }
     $unchanged = if ($CleanCheckout) {
         $fixtureHash -eq (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
     } else { $originalHash -eq (Get-FileHash -LiteralPath $legacyPath -Algorithm SHA256).Hash }
@@ -162,7 +165,7 @@ try {
     $report = [PSCustomObject]@{
         success=$true
         mode=$(if ($CleanCheckout) { 'clean-checkout-synthetic' } else { 'legacy-import' })
-        checks=@($identityCheck,$(if ($CleanCheckout) { 'isolated empty first launch and synthetic WAV scan' } else { 'headless first launch imports 34 records' }),'packaged CLI statistics','Chinese UI snapshot and clean exit','invalid preferences return failure and synchronous diagnostic','Slint, SoundTouch and ASIO license materials','source unchanged')
+        checks=@($identityCheck,$(if ($CleanCheckout) { 'isolated empty first launch and synthetic WAV scan' } else { 'headless first launch imports 34 records' }),'packaged CLI statistics','Chinese UI snapshot and clean exit','invalid preferences return failure and synchronous diagnostic',$(if ($WithoutAsio) { 'Slint and SoundTouch license materials (non-ASIO build)' } else { 'Slint, SoundTouch and ASIO license materials' }),'source unchanged')
         records=$expectedCount
         screenshot='.rust-validation/portable-smoke/chinese.png'
         original_database_unchanged=$(if ($CleanCheckout) { $null } else { $unchanged })

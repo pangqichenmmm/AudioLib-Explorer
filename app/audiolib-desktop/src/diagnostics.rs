@@ -243,6 +243,10 @@ fn snapshot(ui: &AppWindow, audio: &PlaybackStatus) -> Value {
     json!({
         "event": "StateChanged", "query_chars": ui.get_query().chars().count(),
         "result_rows": ui.get_rows().row_count(), "selected_row": ui.get_selected_row(),
+        "task_restoring": ui.get_task_restoring(),
+        "workspace_loading": ui.get_search_workspace_loading(),
+        "result_scroll_y": ui.get_task_result_scroll_y(),
+        "folder_scroll_y": ui.get_task_folder_scroll_y(),
         "folder_scoped": !ui.get_selected_folder_path().is_empty(),
         "searching": ui.get_searching(), "scanning": ui.get_scanning(),
         "closing": ui.get_closing(), "library_busy": ui.get_library_busy(), "metadata_dirty": ui.get_metadata_dirty(),

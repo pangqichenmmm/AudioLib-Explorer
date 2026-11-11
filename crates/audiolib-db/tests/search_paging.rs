@@ -70,6 +70,7 @@ fn deferred_metadata_hydration_matches_direct_sql_for_every_sort_and_visibility(
                         descending,
                         limit: 7,
                         offset: 2,
+                        ..Default::default()
                     };
                     let (join, condition) = if query.is_empty() {
                         ("", "1=1")

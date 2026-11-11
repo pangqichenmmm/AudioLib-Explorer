@@ -1094,7 +1094,7 @@ impl Security {
         } else if presented.is_none() {
             match mode {
                 AuthMode::External => ApiError::token_required(
-                    "A bearer token is required for access from outside the LAN",
+                    "A bearer token is required: this request is not from a trusted direct LAN peer",
                 ),
                 _ => ApiError::unauthorized(),
             }

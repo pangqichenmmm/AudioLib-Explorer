@@ -29,8 +29,8 @@ pub(crate) fn restore_before_show(ui: &AppWindow, layout: &WindowLayoutPreferenc
     }
 }
 
-/// Apply the saved pane widths; call after the interface scale is applied because
-/// widths are stored at interface scale 100%.
+/// Apply saved pane widths and sidebar section layout; call after the interface
+/// scale is applied because widths are stored at interface scale 100%.
 pub(crate) fn restore_panes(ui: &AppWindow, layout: &WindowLayoutPreferences) {
     let scale = interface_scale(ui);
     if let Some(width) = layout.sidebar_width {
@@ -38,6 +38,15 @@ pub(crate) fn restore_panes(ui: &AppWindow, layout: &WindowLayoutPreferences) {
     }
     if let Some(width) = layout.inspector_width {
         ui.set_inspector_preferred_width(width * scale);
+    }
+    if let Some(expanded) = layout.folders_section_expanded {
+        ui.set_folders_section_expanded(expanded);
+    }
+    if let Some(expanded) = layout.libraries_section_expanded {
+        ui.set_libraries_section_expanded(expanded);
+    }
+    if let Some(ratio) = layout.folders_section_ratio {
+        ui.set_folders_section_ratio(ratio);
     }
 }
 
@@ -111,6 +120,9 @@ pub(crate) fn capture(
     layout.sidebar_width = Some(ui.get_sidebar_preferred_width() / scale);
     layout.inspector_width = Some(ui.get_inspector_preferred_width() / scale);
     layout.inspector_visible = Some(ui.get_inspector_visible());
+    layout.folders_section_expanded = Some(ui.get_folders_section_expanded());
+    layout.libraries_section_expanded = Some(ui.get_libraries_section_expanded());
+    layout.folders_section_ratio = Some(ui.get_folders_section_ratio());
     // `filters_visible` stays as saved: the page is not restored (see restore_before_show)
     // and older builds that still read it keep their previous value.
     layout.normalized()
@@ -140,6 +152,9 @@ mod tests {
                 inspector_width: Some(340.0),
                 inspector_visible: Some(false),
                 filters_visible: Some(true),
+                folders_section_expanded: Some(false),
+                libraries_section_expanded: Some(true),
+                folders_section_ratio: Some(0.7),
                 ..Default::default()
             };
             restore_before_show(&ui, &saved);
@@ -152,6 +167,9 @@ mod tests {
             assert_eq!(captured.inspector_width, Some(340.0));
             assert_eq!(captured.inspector_visible, Some(false));
             assert_eq!(captured.filters_visible, Some(true));
+            assert_eq!(captured.folders_section_expanded, Some(false));
+            assert_eq!(captured.libraries_section_expanded, Some(true));
+            assert_eq!(captured.folders_section_ratio, Some(0.7));
         }
     }
 
@@ -182,6 +200,11 @@ mod tests {
         let sidebar = ui.get_sidebar_preferred_width();
         let inspector = ui.get_inspector_preferred_width();
         let visible = (ui.get_inspector_visible(), ui.get_filters_visible());
+        let sections = (
+            ui.get_folders_section_expanded(),
+            ui.get_libraries_section_expanded(),
+            ui.get_folders_section_ratio(),
+        );
         let empty = WindowLayoutPreferences::default();
         restore_before_show(&ui, &empty);
         restore_panes(&ui, &empty);
@@ -190,6 +213,14 @@ mod tests {
         assert_eq!(
             (ui.get_inspector_visible(), ui.get_filters_visible()),
             visible
+        );
+        assert_eq!(
+            (
+                ui.get_folders_section_expanded(),
+                ui.get_libraries_section_expanded(),
+                ui.get_folders_section_ratio(),
+            ),
+            sections
         );
     }
 

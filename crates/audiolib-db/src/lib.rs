@@ -1,6 +1,10 @@
 // crates/audiolib-db/src/lib.rs
 //! SQLite library data, lossless legacy import, and bounded background scanning.
 #[cfg(test)]
+mod album_tests;
+mod albums;
+mod dir_search;
+#[cfg(test)]
 mod folder_rollup_tests;
 #[cfg(test)]
 mod full_library_validation;
@@ -9,26 +13,39 @@ mod import_lease;
 mod list_waveforms;
 pub mod local_play_history;
 mod management;
+#[cfg(test)]
+mod metadata_plain_tests;
+pub(crate) mod metadata_storage;
 pub mod migration;
+pub mod migration9;
 mod owned_cancellation;
 mod path_identity;
 #[cfg(feature = "scanner")]
 pub mod scanner;
 mod schema;
+mod scoped_search;
 mod search_bm25;
 mod search_cache;
+mod search_cache_control;
 mod search_candidates;
 mod search_exclude;
 mod search_facets;
 mod search_include;
+mod search_page_cache;
+mod search_page_control;
 mod search_rank_parallel;
+mod search_snapshot;
 mod search_sorted;
 mod search_storage;
 mod search_text;
+mod search_tracking;
 mod search_workspace;
+mod snapshot_legacy;
+mod snapshot_schema9;
 mod space;
 pub mod sqlite_engine;
 mod sqlite_mmap;
+pub mod vendor_import;
 mod wal;
 pub use wal::CheckpointStage;
 mod waveforms_db;
@@ -36,10 +53,10 @@ mod waveforms_db;
 #[cfg(feature = "scanner")]
 use audiolib_core::AudioMetadata;
 use audiolib_core::{
-    AudioFile, BackupReport, BatchMetadataReport, BatchMetadataRequest, DataProvider, Error,
-    FileVisibility, Folder, IntegrityReport, LibraryExportFormat, LibraryInfo, LibraryStats,
-    MaintenanceAction, MaintenanceReport, MetadataPatch, RestoreReport, Result, ScanSession,
-    SearchPage, SearchRequest, SortOrder, TransferReport,
+    Album, AlbumFacet, AudioFile, BackupReport, BatchMetadataReport, BatchMetadataRequest,
+    DataProvider, Error, FileVisibility, Folder, IntegrityReport, LibraryExportFormat, LibraryInfo,
+    LibraryStats, MaintenanceAction, MaintenanceReport, MetadataPatch, RestoreReport, Result,
+    ScanSession, SearchPage, SearchRequest, SearchScope, SortOrder, TransferReport,
 };
 use jieba_rs::Jieba;
 use rusqlite::{
@@ -54,7 +71,7 @@ pub use schema::{MIN_SNAPSHOT_SCHEMA_VERSION, SCHEMA_VERSION};
 pub const MIN_SNAPSHOT_SCHEMA: i64 = schema::MIN_SNAPSHOT_SCHEMA_VERSION;
 /// Newest schema of a snapshot this client opens read-only. Older supported schemas
 /// use an owned copy when their derived search state needs upgrading; the source is preserved.
-pub const MAX_SNAPSHOT_SCHEMA: i64 = schema::SCHEMA_VERSION;
+pub const MAX_SNAPSHOT_SCHEMA: i64 = audiolib_core::compatibility::SNAPSHOT_SCHEMA_MAX as i64;
 const _: () = assert!(MIN_SNAPSHOT_SCHEMA <= MAX_SNAPSHOT_SCHEMA);
 
 /// Register the exact shared scalar functions required by library indexes/triggers.
@@ -128,6 +145,7 @@ pub fn snapshot_schema_supported(version: i64) -> bool {
 use serde::{Deserialize, Serialize};
 pub use space::ensure_free_space;
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -178,6 +196,26 @@ pub fn indexed_paths_equal(left: &str, right: &str) -> bool {
     path_identity::comparison_key(left) == path_identity::comparison_key(right)
 }
 
+/// Normalize a source directory identity without accessing any filesystem.
+/// Windows drive/UNC syntax is recognized on every host; POSIX backslashes and
+/// directory-entry case are retained. A drive root's identity is `c:`, while
+/// the POSIX root remains `/`. The returned identity is not an OS access path.
+pub fn normalize_source_path_identity(directory: &str) -> String {
+    path_identity::comparison_key(directory)
+}
+
+/// Return the direct parent identity using the stored source's path syntax.
+/// Relative filenames have the empty parent; Windows paths never depend on the
+/// reader's platform, and a POSIX literal backslash is not a path separator.
+pub fn source_parent_path_identity(file_path: &str) -> String {
+    let identity = normalize_source_path_identity(file_path);
+    match identity.rsplit_once('/') {
+        Some(("", _)) => "/".into(),
+        Some((parent, _)) => parent.into(),
+        None => String::new(),
+    }
+}
+
 /// The text the library stores in `audio_files.file_path` for `path` (as given, normally
 /// canonical): the Windows verbatim prefix is dropped (`\\?\C:\x` -> `C:\x`,
 /// `\\?\UNC\host\share` -> `\\host\share`); separators are kept as they are.
@@ -209,6 +247,9 @@ pub(crate) fn tokenize(jieba: &Jieba, value: &str) -> String {
 #[cfg(feature = "scanner")]
 const HEADER_ATTRIBUTES: &[&str] = &[
     "wav_metadata",
+    "container",
+    "source_audio_layout",
+    "aiff_compression",
     "bwf_description",
     "bwf_originator",
     "bwf_originator_reference",
@@ -233,12 +274,20 @@ const HEADER_ATTRIBUTES: &[&str] = &[
 /// One writer and independent read snapshots keep owned results independent of sessions.
 pub struct SqliteProvider {
     path: PathBuf,
+    album_namespace: RwLock<String>,
+    legacy_album_scope: RwLock<Option<String>>,
     read_only: bool,
+    server_schema9: bool,
     writer: Mutex<Connection>,
     read_pool: Mutex<Vec<Connection>>,
     revision_reader: Mutex<Option<Connection>>,
+    /// Cursors expire when the provider/library is reopened, even if data_version resets.
+    cursor_session: uuid::Uuid,
     ranking_cache: Mutex<search_cache::RankingCache>,
-    document_lengths: Mutex<Option<(u64, Arc<search_bm25::Lengths>)>>,
+    first_page_cache: Mutex<search_page_cache::PageCache<search_page_control::PresentationPage>>,
+    search_upgrade_pool: management::SearchUpgradePool,
+    document_lengths: Mutex<VecDeque<(search_cache::CacheRevision, Arc<search_bm25::Lengths>)>>,
+    search_cache_observation: Mutex<Option<search_cache_control::Observation>>,
     parallel_rank_reserved: AtomicBool,
     tokenizer: Arc<Jieba>,
     read_gate: RwLock<()>,
@@ -246,6 +295,7 @@ pub struct SqliteProvider {
     derived_tags: AtomicBool,
     /// Session state of local list Waveforms (computed file versions, decode failures).
     list_waveform_memory: list_waveforms::ListWaveformMemory,
+    dir_index: dir_search::DirIndexCache,
     // Declared last so every SQLite connection closes before the owned directory is removed.
     _owned_snapshot_directory: Option<tempfile::TempDir>,
 }
@@ -286,9 +336,11 @@ impl std::ops::DerefMut for ReadLease<'_> {
 }
 impl Drop for ReadLease<'_> {
     fn drop(&mut self) {
-        // A cancelled search must never poison a later user of this pooled reader.
+        // A cancelled search or unfinished explicit transaction must never
+        // poison the next pooled reader. Closing a dirty connection rolls its
+        // transaction back while this lease still holds the reader/admin gates.
         if let Some(conn) = self.conn.as_ref()
-            && conn.progress_handler(0, None::<fn() -> bool>).is_err()
+            && (!conn.is_autocommit() || conn.progress_handler(0, None::<fn() -> bool>).is_err())
         {
             self.conn.take();
         }
@@ -463,6 +515,7 @@ fn import_legacy_with_history(
         return Ok(report);
     }
     let provider = SqliteProvider::open(staging.path())?;
+    provider.admit_import_identity(None)?;
     provider.check_integrity()?;
     let integrity = provider.check_library()?;
     if !integrity.is_ok() {
@@ -647,24 +700,37 @@ impl SqliteProvider {
         schema::register_tokenizer(&conn, tokenizer.clone())?;
         let derived = schema::source_tags_ready(&conn)?;
         let provider = Self {
+            album_namespace: RwLock::new(albums::namespace(&conn)?),
+            legacy_album_scope: RwLock::new(albums::legacy_scope(&conn)?),
             path: path.to_path_buf(),
             read_only: false,
+            server_schema9: false,
             writer: Mutex::new(conn),
             read_pool: Mutex::new(Vec::new()),
             revision_reader: Mutex::new(None),
+            cursor_session: uuid::Uuid::new_v4(),
             ranking_cache: Mutex::new(Default::default()),
-            document_lengths: Mutex::new(None),
+            first_page_cache: Mutex::new(Default::default()),
+            search_upgrade_pool: Default::default(),
+            document_lengths: Mutex::new(Default::default()),
+            search_cache_observation: Mutex::new(None),
             parallel_rank_reserved: AtomicBool::new(false),
             tokenizer,
             read_gate: RwLock::new(()),
             derived_tags: AtomicBool::new(derived),
             list_waveform_memory: Default::default(),
+            dir_index: Default::default(),
             _owned_snapshot_directory: None,
         };
+        // Identity admission obtains the exclusive administration lease itself;
+        // never retain startup's shared lease while asking for that exclusion.
+        drop(_isolation);
         // Only a completed local/p1 provider can retire the durable import owner.
         // Keep its lock inode; contention during shared-to-exclusive cleanup
         // leaves the receipt available for the next matching local open.
         if let Some(intent) = &import_intent {
+            let namespace = intent.admission_namespace()?;
+            provider.admit_import_identity(Some(&namespace))?;
             if let Some(owner) = import_owner {
                 owner.clear_completed_intent(intent)?;
             } else if let Some(lease) = &creation_lease {
@@ -707,6 +773,43 @@ impl SqliteProvider {
     }
 
     /// File backing this provider; older read-only inputs may use an owned upgraded copy.
+    /// Cached identity of this local library; no database access on the event loop.
+    pub fn album_namespace(&self) -> String {
+        self.album_namespace.read().unwrap().clone()
+    }
+
+    /// Captured pre-entity local database identity for one-time preference migration.
+    /// Only an explicit local-client upgrade records this; new-library imports clear it.
+    pub fn legacy_album_scope(&self) -> Option<String> {
+        self.legacy_album_scope.read().unwrap().clone()
+    }
+
+    fn admit_import_identity(&self, desired_namespace: Option<&str>) -> Result<()> {
+        let desired_namespace = desired_namespace
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let _gate = self
+            .read_gate
+            .write()
+            .map_err(|_| Error::Database("Library reader gate was poisoned".into()))?;
+        self.read_pool
+            .lock()
+            .map_err(|_| Error::Database("Reader pool lock was poisoned".into()))?
+            .clear();
+        self.reset_search_caches()?;
+        let cancel = AtomicBool::new(false);
+        let namespace = migration::admit_import_identity(&self.path, &desired_namespace, &cancel)?;
+        *self
+            .album_namespace
+            .write()
+            .map_err(|_| Error::Database("Album namespace lock was poisoned".into()))? = namespace;
+        *self
+            .legacy_album_scope
+            .write()
+            .map_err(|_| Error::Database("Legacy album scope lock was poisoned".into()))? = None;
+        Ok(())
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.path
     }
@@ -775,6 +878,10 @@ impl SqliteProvider {
             return Err(Error::Database(format!(
                 "Snapshot requires schema {MIN_SNAPSHOT_SCHEMA}..={MAX_SNAPSHOT_SCHEMA}, found {version}"
             )));
+        }
+        if version == 9 {
+            snapshot_schema9::validate_read(&conn)?;
+            return Ok(false);
         }
         if version == schema::SCHEMA_VERSION && schema::current_format_ready(&conn)? {
             return Ok(false);
@@ -891,7 +998,15 @@ impl SqliteProvider {
                 "Read-only database requires schema {MIN_SNAPSHOT_SCHEMA}..={MAX_SNAPSHOT_SCHEMA}, found {version}"
             )));
         }
-        let (conn, actual_path, owned_directory) = if schema::search_state_is_current(&source)? {
+        let current = if version == 9 {
+            snapshot_schema9::validate_read(&source)?;
+            true
+        } else {
+            version == SCHEMA_VERSION
+                && schema::search_state_is_current(&source)?
+                && albums::ready(&source)?
+        };
+        let (conn, actual_path, owned_directory) = if current {
             (source, path.to_path_buf(), None)
         } else {
             schema::validate_library_identity(&source)?;
@@ -930,20 +1045,29 @@ impl SqliteProvider {
                 .map_err(db_error)?;
             (conn, copy_path, Some(directory))
         };
+        schema::register_casefold(&conn)?;
         let derived = schema::source_tags_ready(&conn)?;
         Ok(Self {
+            album_namespace: RwLock::new(albums::namespace(&conn)?),
+            legacy_album_scope: RwLock::new(albums::legacy_scope(&conn)?),
             path: actual_path,
             read_only: true,
+            server_schema9: false,
             writer: Mutex::new(conn),
             read_pool: Mutex::new(Vec::new()),
             revision_reader: Mutex::new(None),
+            cursor_session: uuid::Uuid::new_v4(),
             ranking_cache: Mutex::new(Default::default()),
-            document_lengths: Mutex::new(None),
+            first_page_cache: Mutex::new(Default::default()),
+            search_upgrade_pool: Default::default(),
+            document_lengths: Mutex::new(Default::default()),
+            search_cache_observation: Mutex::new(None),
             parallel_rank_reserved: AtomicBool::new(false),
             tokenizer: load_tokenizer(),
             read_gate: RwLock::new(()),
             derived_tags: AtomicBool::new(derived),
             list_waveform_memory: Default::default(),
+            dir_index: Default::default(),
             _owned_snapshot_directory: owned_directory,
         })
     }
@@ -986,7 +1110,9 @@ impl SqliteProvider {
         schema::ensure_ready(&conn)?;
         schema::validate_library_identity(&conn)?;
         schema::register_tokenizer(&conn, tokenizer.clone())?;
-        if version == schema::SCHEMA_VERSION && !schema::readable_format_ready(&conn)? {
+        if version == 9 {
+            snapshot_schema9::validate_read(&conn)?;
+        } else if version == schema::SCHEMA_VERSION && !schema::readable_format_ready(&conn)? {
             return Err(Error::Validation(
                 "Snapshot format is not ready for incremental Metadata".into(),
             ));
@@ -998,11 +1124,14 @@ impl SqliteProvider {
             .iter()
             .map(snapshot_modified_at)
             .collect::<Result<Vec<_>>>()?;
+        let contentless = search_storage::columns(&conn)?
+            .iter()
+            .all(|column| !search_storage::is_derived_column(column));
         let tx = conn.transaction().map_err(db_error)?;
         {
             let mut update = tx
                 .prepare(
-                    if version==schema::SCHEMA_VERSION {
+                    if contentless {
                         "UPDATE audio_files SET user_tags=?1,user_notes=?2,favorite=?3,user_color=?4,modified_at=?5 WHERE id=?6"
                     } else {"UPDATE audio_files SET user_tags=?1,user_tags_tokenized=?2,user_notes=?3,
                     user_notes_tokenized=?4,favorite=?5,user_color=?6,modified_at=?7
@@ -1010,7 +1139,7 @@ impl SqliteProvider {
                 )
                 .map_err(db_error)?;
             for (file, modified_at) in files.iter().zip(modified) {
-                let changed = if version == schema::SCHEMA_VERSION {
+                let changed = if contentless {
                     update.execute(params![
                         file.tags,
                         file.notes,
@@ -1050,7 +1179,7 @@ impl SqliteProvider {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(db_error)?;
-        if version != schema::SCHEMA_VERSION {
+        if version != schema::SCHEMA_VERSION && !(self.server_schema9 && version == 9) {
             return Err(Error::Busy(
                 "Library format changed; reopen before writing".into(),
             ));
@@ -1070,22 +1199,33 @@ impl SqliteProvider {
     }
 
     fn reader(&self) -> Result<ReadLease<'_>> {
+        self.reader_inner(true)
+    }
+
+    // Only a full-page lookup proven by its pinned observer stamp may skip the
+    // SQL ready probes. Both paths keep the same local gate and OS upgrade lease.
+    fn reader_inner(&self, check_ready: bool) -> Result<ReadLease<'_>> {
         let upgrade = if self.read_only {
             None
         } else {
-            Some(management::SearchUpgradeLease::acquire(&self.path, false)?)
+            Some(self.search_upgrade_pool.acquire_shared(&self.path)?)
         };
         let gate = self
             .read_gate
             .read()
             .map_err(|_| Error::Database("Library reader gate was poisoned".into()))?;
-        if let Some(conn) = self
+        let pooled = self
             .read_pool
             .lock()
             .map_err(|_| Error::Database("Reader pool lock was poisoned".into()))?
-            .pop()
-        {
-            schema::ensure_ready(&conn)?;
+            .pop();
+        // Refuse an inherited transaction even if a future/internal caller put
+        // one in the pool without passing through ReadLease::drop. The rejected
+        // connection closes outside the pool mutex before opening a fresh one.
+        if let Some(conn) = pooled.filter(Connection::is_autocommit) {
+            if check_ready {
+                schema::ensure_ready(&conn)?;
+            }
             return Ok(ReadLease {
                 conn: Some(conn),
                 pool: &self.read_pool,
@@ -1110,7 +1250,9 @@ impl SqliteProvider {
         conn.pragma_update(None, "mmap_size", sqlite_reader_mmap_bytes(&self.path))
             .map_err(db_error)?;
         schema::register_casefold(&conn)?;
-        schema::ensure_ready(&conn)?;
+        if check_ready {
+            schema::ensure_ready(&conn)?;
+        }
         Ok(ReadLease {
             conn: Some(conn),
             pool: &self.read_pool,
@@ -1120,13 +1262,27 @@ impl SqliteProvider {
     }
 
     fn search_reader(&self, cancel: Option<Arc<AtomicBool>>) -> Result<ReadLease<'_>> {
+        self.search_reader_inner(cancel, true)
+    }
+
+    /// Lookup-only reader. A miss must drop this lease and use the checked path;
+    /// a hit needs equal before/pin/after observer values and a ready-built entry.
+    fn search_page_reader(&self, cancel: Option<Arc<AtomicBool>>) -> Result<ReadLease<'_>> {
+        self.search_reader_inner(cancel, false)
+    }
+
+    fn search_reader_inner(
+        &self,
+        cancel: Option<Arc<AtomicBool>>,
+        check_ready: bool,
+    ) -> Result<ReadLease<'_>> {
         if cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
         {
             return Err(Error::Cancelled);
         }
-        let conn = self.reader()?;
+        let conn = self.reader_inner(check_ready)?;
         if cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -1171,6 +1327,10 @@ impl SqliteProvider {
     #[cfg(feature = "scanner")]
     pub(crate) fn start_scan(&self, root: &Path, incremental: bool) -> Result<i64> {
         let mut conn = self.writer()?;
+        // Read before the business transaction so its first statement retains
+        // the existing write-lock admission. Folder reattachment can update AF
+        // album membership, so only an unchanged tracked epoch is bookkeeping.
+        let search_epoch = search_tracking::epoch(&conn)?;
         let tx = conn.transaction().map_err(db_error)?;
         // The exclusive scan lease proves any prior Running session was abandoned.
         tx.execute_batch("UPDATE scan_sessions SET status='failed',end_time=strftime('%Y-%m-%d %H:%M:%f','now'),
@@ -1188,7 +1348,13 @@ impl SqliteProvider {
         )
         .map_err(db_error)?;
         let id = tx.last_insert_rowid();
+        let unchanged_search_epoch =
+            search_epoch.is_some() && search_epoch == search_tracking::epoch(&tx)?;
         tx.commit().map_err(db_error)?;
+        if unchanged_search_epoch && self.search_cache_bookkeeping_committed(&conn).is_err() {
+            let _ = self.reset_search_caches();
+            tracing::debug!("Scan session kept; cache bookkeeping was discarded");
+        }
         Ok(id)
     }
 
@@ -1210,9 +1376,24 @@ impl SqliteProvider {
         session_id: i64,
     ) -> Result<(u64, u64)> {
         let mut conn = self.writer()?;
-        let tx = conn.transaction().map_err(db_error)?;
+        // Capture the cache baseline only after writer admission. Promoting a
+        // read snapshot after another annotation commit would yield BUSY_SNAPSHOT.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let search_cache = self.begin_search_cache_batch(&tx)?;
         let result = self.apply_scan_items(&tx, items, Some(session_id))?;
-        tx.commit().map_err(db_error)?;
+        // Preserve the existing scanner cancellation boundary: once admitted,
+        // this batch drains atomically. Cache work has no scan-control side effect.
+        let search_cache =
+            self.prepare_search_cache_batch(&tx, search_cache, &AtomicBool::new(false))?;
+        let search_cache = self.commit_search_cache_batch(tx, search_cache)?;
+        if let Some(candidate) = search_cache
+            && self.publish_search_cache_batch(&conn, candidate).is_err()
+        {
+            let _ = self.reset_search_caches();
+            tracing::debug!("Scan batch kept; search cache publication was discarded");
+        }
         Ok(result)
     }
 
@@ -1226,6 +1407,7 @@ impl SqliteProvider {
         let mut added = 0;
         let mut updated = 0;
         let mut folders = std::collections::HashMap::new();
+        let mut file_folders = Vec::new();
         let mut find_existing = tx.prepare_cached(
             "SELECT file_path,id,metadata_json,COALESCE(file_size,0),source_mtime_ns FROM audio_files WHERE path_key=?1 ORDER BY id",
         ).map_err(db_error)?;
@@ -1235,6 +1417,9 @@ impl SqliteProvider {
             bwf_umid=?8,ixml_tape=?9,ixml_circled=?10,ixml_wild_track=?11,ixml_no_good=?12 WHERE id=?1",
         ).map_err(db_error)?;
         for item in items {
+            if schema::metadata_requires_audio_sources(&item.path, &item.metadata.attributes) {
+                schema::require_audio_sources(tx)?;
+            }
             let file_size = i64::try_from(item.size)
                 .map_err(|_| Error::Validation("Audio file exceeds SQLite size range".into()))?;
             let text = display_path(&item.path);
@@ -1245,7 +1430,13 @@ impl SqliteProvider {
                         row.get::<_, String>(0)?,
                         (
                             row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
+                            metadata_storage::decode_value(row.get_ref(2)?).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Blob,
+                                    Box::new(error),
+                                )
+                            })?,
                             row.get::<_, i64>(3)?,
                             row.get::<_, Option<i64>>(4)?,
                         ),
@@ -1266,6 +1457,21 @@ impl SqliteProvider {
                     *entry.insert(ensure_folder(tx, folder, &item.root)?)
                 }
             };
+            file_folders.push(folder_id);
+            if let Some(id) = existing {
+                let previous: Option<i64> = tx
+                    .query_row(
+                        "SELECT folder_id FROM audio_files WHERE id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)?;
+                if let Some(previous) = previous
+                    && previous != folder_id
+                {
+                    file_folders.push(previous);
+                }
+            }
             let filename = item
                 .path
                 .file_name()
@@ -1300,6 +1506,8 @@ impl SqliteProvider {
             }
             let source_tags_text =
                 schema::fold_case(&audiolib_core::source_tags(&attributes).join(", "));
+            // Library/album comes from the file itself; empty when it declares none.
+            let encoded_metadata = metadata_storage::encode(&attributes.to_string(), false)?;
             let ix_scene = attributes
                 .get("ixml_scene")
                 .and_then(|value| value.as_str());
@@ -1312,7 +1520,7 @@ impl SqliteProvider {
                     modified_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?1").map_err(db_error)?.execute(params![id,
                     filename,file_size,item.metadata.sample_rate,item.metadata.bit_depth,item.metadata.channels,
                     item.metadata.duration,item.metadata.encoding,description,folder_id,item.mtime_ns,
-                    attributes.to_string(),ix_scene,ix_take,session_id,source_tags_text]).map_err(db_error)?;
+                    encoded_metadata,ix_scene,ix_take,session_id,source_tags_text]).map_err(db_error)?;
                 updated += 1;
             } else {
                 let id = schema::allocate_audio_id(tx)?;
@@ -1323,7 +1531,7 @@ impl SqliteProvider {
                     strftime('%Y-%m-%d %H:%M:%f','now'),strftime('%Y-%m-%d %H:%M:%f','now'),?18)").map_err(db_error)?.execute(params![
                     display_path(&item.path),key,filename,file_size,item.metadata.sample_rate,item.metadata.bit_depth,item.metadata.channels,
                     item.metadata.duration,item.metadata.encoding,description,folder_id,item.mtime_ns,
-                    attributes.to_string(),ix_scene,ix_take,session_id,id,source_tags_text]).map_err(db_error)?;
+                    encoded_metadata,ix_scene,ix_take,session_id,id,source_tags_text]).map_err(db_error)?;
                 added += 1;
             }
             // Missing supported header fields clear legacy columns after successful probing.
@@ -1359,7 +1567,13 @@ impl SqliteProvider {
             header_columns
                 .execute(params_from_iter(header_values))
                 .map_err(db_error)?;
+            // Last-good sidecar events remain independent of whether this
+            // scan can still read their table. Re-evaluate embedded dedup now.
+            vendor_import::reproject_automatic_if_present(tx, id)?;
         }
+        file_folders.sort_unstable();
+        file_folders.dedup();
+        dir_search::maintain(tx, &[], &file_folders)?;
         Ok((added, updated))
     }
 
@@ -1398,61 +1612,182 @@ impl SqliteProvider {
         progress: &mut audiolib_core::ScanProgress,
         cleanup: bool,
         recursive: bool,
+        interrupt: &Arc<AtomicBool>,
     ) -> Result<()> {
         let mut conn = self.writer()?;
-        let tx = conn.transaction().map_err(db_error)?;
-        if cleanup {
-            let folder = ensure_folder(&tx, root, root)?;
-            let stored_root: String = tx
-                .query_row(
-                    "SELECT folder_path FROM folders WHERE id=?1",
-                    [folder],
-                    |row| row.get(0),
-                )
+        let result = run_interruptible(&mut conn, interrupt, |conn| {
+            // Admit the writer before capturing the cache/read snapshot. A
+            // deferred transaction could otherwise fail its first write after
+            // a concurrent annotation commit with BUSY_SNAPSHOT.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(db_error)?;
-            // Missing files retain annotations, playlists, and IDs and can reconnect later.
-            let (scope, scope_value) = if recursive {
-                (
-                    // Hierarchy membership survives native case-only aliases and
-                    // volume roots. Rows without a folder retain the old path scope.
-                    "(folder_id IN (SELECT descendant_id FROM folder_closure WHERE ancestor_id=?1) OR (folder_id IS NULL AND ((?3='/' AND substr(file_path,1,1)='/') OR audiolib_path_identity(file_path)=?3 COLLATE BINARY OR substr(audiolib_path_identity(file_path),1,length(?3)+1)=?3||'/' COLLATE BINARY)))",
-                    Value::Integer(folder),
-                )
+            let search_cache = if cleanup {
+                None
             } else {
-                ("folder_id=?1 AND ?3 IS NOT NULL", Value::Integer(folder))
+                Some(self.begin_search_cache_batch(&tx)?)
             };
-            ensure_scan_seen_table(&tx)?;
-            progress.removed = tx.execute(
+            finish_scan_transaction(&tx, root, progress, cleanup, recursive)?;
+            // Even history/statistics-only commits change the full-page
+            // revision. Recompute owned pages in this exact final image; an
+            // unchanged AF epoch cannot validate old presentation DTOs.
+            let search_cache = match search_cache {
+                Some(baseline) => {
+                    self.prepare_search_cache_batch(&tx, baseline, interrupt.as_ref())?
+                }
+                None => None,
+            };
+            self.commit_search_cache_batch(tx, search_cache)
+        });
+        if result.is_err()
+            && (interrupt.load(Ordering::Acquire) || matches!(result, Err(Error::Cancelled)))
+        {
+            // The heavy transaction rolled back. Leave a terminal session row so
+            // history does not stay "running" after quit aborted the rollup.
+            mark_scan_session_cancelled(&conn, progress)?;
+            return Err(Error::Cancelled);
+        }
+        // The interrupt hook/watcher are gone before publication. A cancellation
+        // racing after COMMIT must not turn durable scan/history work into an
+        // error; a failed optional cache publication only discards caches.
+        if let Some(candidate) = result?
+            && self.publish_search_cache_batch(&conn, candidate).is_err()
+        {
+            let _ = self.reset_search_caches();
+            tracing::debug!("Scan finalization kept; search cache publication was discarded");
+        }
+        Ok(())
+    }
+}
+
+/// Stop a statement on this connection when `interrupt` becomes set.
+/// The progress handler is removed and the watcher joined before return, so the
+/// next statement is not cancelled. A successful `work` result is preserved when
+/// the flag races in after commit.
+#[cfg(feature = "scanner")]
+fn run_interruptible<T>(
+    conn: &mut Connection,
+    interrupt: &Arc<AtomicBool>,
+    work: impl FnOnce(&mut Connection) -> Result<T>,
+) -> Result<T> {
+    if interrupt.load(Ordering::Acquire) {
+        return Err(Error::Cancelled);
+    }
+    let flag = Arc::clone(interrupt);
+    conn.progress_handler(2000, Some(move || flag.load(Ordering::Acquire)))
+        .map_err(db_error)?;
+    let handle = conn.get_interrupt_handle();
+    let flag = Arc::clone(interrupt);
+    let result = std::thread::scope(|scope| {
+        let (done, waiting) = std::sync::mpsc::sync_channel::<()>(1);
+        scope.spawn(move || {
+            loop {
+                if flag.load(Ordering::Acquire) {
+                    handle.interrupt();
+                }
+                match waiting.recv_timeout(Duration::from_millis(20)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            }
+        });
+        let result = work(conn);
+        drop(done);
+        result
+    });
+    if conn.progress_handler(0, None::<fn() -> bool>).is_err() {
+        // A handler that still returns true would cancel the next writer user.
+        let _ = conn.progress_handler(2000, Some(|| false));
+    }
+    result
+}
+
+#[cfg(feature = "scanner")]
+fn finish_scan_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    progress: &mut audiolib_core::ScanProgress,
+    cleanup: bool,
+    recursive: bool,
+) -> Result<()> {
+    if cleanup {
+        let folder = ensure_folder(tx, root, root)?;
+        let stored_root: String = tx
+            .query_row(
+                "SELECT folder_path FROM folders WHERE id=?1",
+                [folder],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        // Missing files retain annotations, playlists, and IDs and can reconnect later.
+        let (scope, scope_value) = if recursive {
+            (
+                // Hierarchy membership survives native case-only aliases and
+                // volume roots. Rows without a folder retain the old path scope.
+                "(folder_id IN (SELECT descendant_id FROM folder_closure WHERE ancestor_id=?1) OR (folder_id IS NULL AND ((?3='/' AND substr(file_path,1,1)='/') OR audiolib_path_identity(file_path)=?3 COLLATE BINARY OR substr(audiolib_path_identity(file_path),1,length(?3)+1)=?3||'/' COLLATE BINARY)))",
+                Value::Integer(folder),
+            )
+        } else {
+            ("folder_id=?1 AND ?3 IS NOT NULL", Value::Integer(folder))
+        };
+        ensure_scan_seen_table(tx)?;
+        progress.removed = tx.execute(
                 &format!(
-                    "UPDATE audio_files SET missing=1 WHERE {scope} AND missing=0 AND lower(filename) LIKE '%.wav'
+                    "UPDATE audio_files SET missing=1 WHERE {scope} AND missing=0 AND (lower(filename) LIKE '%.wav' OR lower(filename) LIKE '%.flac' OR lower(filename) LIKE '%.ogg' OR lower(filename) LIKE '%.oga' OR lower(filename) LIKE '%.mp3' OR lower(filename) LIKE '%.aif' OR lower(filename) LIKE '%.aiff' OR lower(filename) LIKE '%.bwf')
                 AND (seen_scan_id IS NULL OR seen_scan_id<>?2)
                 AND NOT EXISTS(SELECT 1 FROM temp.scan_seen s WHERE s.session_id=?2 AND s.audio_id=audio_files.id)"
                 ),
                 params![scope_value, progress.session_id, path_identity::comparison_key(&stored_root)],
             )
             .map_err(db_error)? as u64;
-        }
-        ensure_scan_seen_table(&tx)?;
-        tx.execute(
-            "DELETE FROM temp.scan_seen WHERE session_id<=?1",
-            [progress.session_id],
-        )
-        .map_err(db_error)?;
-        refresh_folder_statistics(&tx)?;
-        let status = match progress.state {
-            audiolib_core::ScanState::Running => "running",
-            audiolib_core::ScanState::Completed => "completed",
-            audiolib_core::ScanState::Cancelled => "cancelled",
-            audiolib_core::ScanState::Failed => "failed",
-        };
-        tx.execute("UPDATE scan_sessions SET end_time=strftime('%Y-%m-%d %H:%M:%f','now'),status=?2,
+    }
+    ensure_scan_seen_table(tx)?;
+    tx.execute(
+        "DELETE FROM temp.scan_seen WHERE session_id<=?1",
+        [progress.session_id],
+    )
+    .map_err(db_error)?;
+    refresh_folder_statistics(tx)?;
+    let status = match progress.state {
+        audiolib_core::ScanState::Running => "running",
+        audiolib_core::ScanState::Completed => "completed",
+        audiolib_core::ScanState::Cancelled => "cancelled",
+        audiolib_core::ScanState::Failed => "failed",
+    };
+    tx.execute("UPDATE scan_sessions SET end_time=strftime('%Y-%m-%d %H:%M:%f','now'),status=?2,
             files_scanned=?3,files_added=?4,files_updated=?5,files_skipped=?6,errors=?7,error_details=?8,
             files_removed=?9,errors_truncated=?10 WHERE id=?1",
             params![progress.session_id,status,progress.processed as i64,progress.added as i64,progress.updated as i64,progress.unchanged as i64,
                 progress.errors as i64,serde_json::to_string(&progress.error_details).map_err(|e|Error::Validation(e.to_string()))?,
                 progress.removed as i64,progress.errors_truncated as i64]).map_err(db_error)?;
-        tx.commit().map_err(db_error)
-    }
+    Ok(())
+}
+
+#[cfg(feature = "scanner")]
+fn mark_scan_session_cancelled(
+    conn: &Connection,
+    progress: &audiolib_core::ScanProgress,
+) -> Result<()> {
+    let details = serde_json::to_string(&progress.error_details)
+        .map_err(|error| Error::Validation(error.to_string()))?;
+    conn.execute(
+        "UPDATE scan_sessions SET end_time=strftime('%Y-%m-%d %H:%M:%f','now'),status='cancelled',
+            files_scanned=?2,files_added=?3,files_updated=?4,files_skipped=?5,errors=?6,error_details=?7,
+            files_removed=?8,errors_truncated=?9 WHERE id=?1 AND status='running'",
+        params![
+            progress.session_id,
+            progress.processed as i64,
+            progress.added as i64,
+            progress.updated as i64,
+            progress.unchanged as i64,
+            progress.errors as i64,
+            details,
+            progress.removed as i64,
+            progress.errors_truncated as i64
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
 }
 
 #[cfg(feature = "scanner")]
@@ -1472,6 +1807,36 @@ struct RankingSnapshot<'a> {
 }
 
 impl SqliteProvider {
+    /// Shared-entity counts for the same query and filters as the result page.
+    /// Clear both album filters for cross-navigation. Ordered by count, name, then ID.
+    pub fn album_facets(&self, request: &SearchRequest) -> Result<Vec<AlbumFacet>> {
+        self.entity_facets(request, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Cancellable shared entity counts for the same query and filters.
+    pub fn album_facets_cancellable(
+        &self,
+        request: &SearchRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AlbumFacet>> {
+        self.entity_facets(request, cancel)
+    }
+
+    /// One present file path for an album, used to read that album's embedded cover.
+    pub fn album_cover_path(&self, album: &str) -> Result<Option<std::path::PathBuf>> {
+        let reader = self.reader()?;
+        let album_key = album_expression(&reader)?;
+        let path: Option<String> = reader
+            .query_row(
+                &format!("SELECT file_path FROM audio_files af WHERE {album_key}=?1 AND missing=0 ORDER BY id LIMIT 1"),
+                [album],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(path.map(std::path::PathBuf::from))
+    }
+
     fn observe_search_revision(&self) -> Result<u64> {
         let mut observer = self.revision_reader.lock().unwrap();
         if observer.is_none() {
@@ -1486,40 +1851,14 @@ impl SqliteProvider {
                 .map_err(db_error)?;
             *observer = Some(conn);
         }
-        observer
+        let mut statement = observer
             .as_ref()
             .unwrap()
-            .query_row("PRAGMA data_version", [], |row| unsigned(row, 0))
+            .prepare_cached("PRAGMA data_version")
+            .map_err(db_error)?;
+        statement
+            .query_row([], |row| unsigned(row, 0))
             .map_err(db_error)
-    }
-
-    fn rank_document_lengths(
-        &self,
-        tx: &Connection,
-        stable_revision: Option<u64>,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<Arc<search_bm25::Lengths>>> {
-        let Some(revision) = stable_revision else {
-            return search_bm25::load_lengths(tx, cancel);
-        };
-        let mut cached = self
-            .document_lengths
-            .lock()
-            .map_err(|_| Error::Database("Document-length cache lock was poisoned".into()))?;
-        if let Some((cached_revision, lengths)) = cached.as_ref()
-            && *cached_revision == revision
-        {
-            return Ok(Some(lengths.clone()));
-        }
-        // The caller pinned this transaction between matching observer values.
-        // Decode each document length once rather than issuing a docsize lookup
-        // for every scored row. A concurrent commit only forbids publication;
-        // the owned values remain valid for this request's pinned snapshot.
-        let lengths = search_bm25::load_lengths(tx, cancel)?;
-        if self.observe_search_revision()? == revision {
-            *cached = lengths.as_ref().map(|lengths| (revision, lengths.clone()));
-        }
-        Ok(lengths)
     }
 
     fn ranked_search(
@@ -1542,9 +1881,19 @@ impl SqliteProvider {
             }
         };
         check_cancel()?;
-        let query = compile_query(&self.tokenizer, &request.query)?;
-        let cached = cache_eligible
-            .then(|| self.ranking_cache.lock().unwrap().get(revision, &query))
+        let query = compile_request_query(&self.tokenizer, request)?;
+        let cache_revision = self.cache_revision(tx, revision)?;
+        // A tracked epoch belongs to this pinned SQLite snapshot. Untracked
+        // formats retain the before/after observer proof used by older readers.
+        let rank_cache_eligible =
+            cache_eligible || matches!(cache_revision, search_cache::CacheRevision::Tracked(_));
+        let cached = rank_cache_eligible
+            .then(|| {
+                self.ranking_cache
+                    .lock()
+                    .unwrap()
+                    .get(&cache_revision, &query)
+            })
             .flatten();
         let cache_hit = cached.is_some();
         let ids = if let Some(ids) = cached {
@@ -1576,11 +1925,14 @@ impl SqliteProvider {
             let ids = Arc::new(ids);
             // Comparing the same observer before/after the pinned reader snapshot
             // prevents publishing a ranking under a revision from another commit.
-            if cache_eligible && self.observe_search_revision()? == revision {
+            if rank_cache_eligible
+                && (matches!(cache_revision, search_cache::CacheRevision::Tracked(_))
+                    || self.observe_search_revision()? == revision)
+            {
                 self.ranking_cache
                     .lock()
                     .unwrap()
-                    .insert(revision, query, ids.clone());
+                    .insert(cache_revision, query, ids.clone());
             }
             ids
         };
@@ -1605,6 +1957,7 @@ impl SqliteProvider {
                 conditions,
                 values,
             } = search_sql(
+                tx,
                 &self.tokenizer,
                 &filter_request,
                 true,
@@ -1645,6 +1998,7 @@ impl SqliteProvider {
             };
             if ids.is_empty() {
                 return Ok(Some(SearchPage {
+                    total_count_exact: true,
                     query: request.query.clone(),
                     execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
                     cache_hit,
@@ -1713,21 +2067,28 @@ impl SqliteProvider {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(SearchPage {
+            total_count_exact: true,
             returned_count: results.len(),
             results,
             total_count,
             query: request.query.clone(),
             execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
             cache_hit,
+            next_cursor: None,
         }))
     }
 
-    fn search_impl(
+    fn search_impl_uncached(
         &self,
         request: &SearchRequest,
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<SearchPage> {
         request.validate()?;
+        let normalized = normalize_search_page(request)?;
+        let request = normalized.as_ref();
+        if matches!(request.scope, SearchScope::All | SearchScope::Path) {
+            return self.search_scoped(request, cancel);
+        }
         let start = Instant::now();
         let mut conn = self.search_reader(cancel.clone())?;
         let revision_before = self.observe_search_revision()?;
@@ -1760,6 +2121,7 @@ impl SqliteProvider {
             conditions,
             mut values,
         } = search_sql(
+            &tx,
             &self.tokenizer,
             request,
             true,
@@ -1853,12 +2215,14 @@ impl SqliteProvider {
         };
         if request.offset as u64 >= total {
             return Ok(SearchPage {
+                total_count_exact: true,
                 returned_count: 0,
                 results: Vec::new(),
                 total_count: total,
                 query: request.query.clone(),
                 execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
                 cache_hit: false,
+                next_cursor: None,
             });
         }
         let sorted_page_sql =
@@ -1930,13 +2294,314 @@ impl SqliteProvider {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
         Ok(SearchPage {
+            total_count_exact: true,
             returned_count: results.len(),
             results,
             total_count: total,
             query: request.query.clone(),
             execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
             cache_hit: false,
+            next_cursor: None,
         })
+    }
+
+    /// Directory-segment search. `scope=main` never reaches this path.
+    fn search_scoped(
+        &self,
+        request: &SearchRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<SearchPage> {
+        if request.query.trim().is_empty() {
+            let mut browse = request.clone();
+            browse.scope = SearchScope::Main;
+            browse.cursor = None;
+            return self.search_impl(&browse, cancel);
+        }
+        if !self.directory_index_ready()? {
+            // s8 snapshots / libraries without the directory index must not create
+            // tables here (read-only snapshots cannot, and local s8 must stay clean).
+            // PS-15:「全部」degrades to main;「仅路径」returns no hits.
+            if request.scope == SearchScope::Path {
+                return Ok(SearchPage {
+                    total_count_exact: true,
+                    returned_count: 0,
+                    results: Vec::new(),
+                    total_count: 0,
+                    query: request.query.clone(),
+                    execution_time_ms: 0.0,
+                    cache_hit: false,
+                    next_cursor: None,
+                });
+            }
+            let mut browse = request.clone();
+            browse.scope = SearchScope::Main;
+            browse.cursor = None;
+            return self.search_impl(&browse, cancel);
+        }
+        if !path_scope_is_unfiltered(request)
+            || request
+                .cursor
+                .as_deref()
+                .is_some_and(|cursor| cursor.starts_with("v2."))
+        {
+            return scoped_search::page(self, request, cancel);
+        }
+        let start = Instant::now();
+        let before = self.observe_search_revision()?;
+        let mut conn = self.search_reader(cancel)?;
+        let tx = conn.transaction().map_err(db_error)?;
+        tx.query_row("SELECT COUNT(*) FROM library_meta", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(db_error)?;
+        let revision = self.observe_search_revision()?;
+        if before != revision {
+            return Err(Error::Validation(
+                "CURSOR_STALE: library changed while opening search".into(),
+            ));
+        }
+        let cursor = scoped_search::native_cursor(self, request, revision)?;
+        let position = cursor
+            .as_ref()
+            .map_or(request.offset as u64, |(_, position)| *position);
+        let page = dir_search::search(&dir_search::DirSearch {
+            conn: &tx,
+            cache: &self.dir_index,
+            jieba: &self.tokenizer,
+            query: &request.query,
+            scope: request.scope,
+            visibility: request.filters.visibility,
+            cursor: cursor.as_ref().map(|(inner, _)| inner.as_str()),
+            offset: request.offset,
+            limit: request.limit,
+        })?;
+        let ids = page.hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let json =
+            serde_json::to_string(&ids).map_err(|error| Error::Database(error.to_string()))?;
+        let projection = audio_projection(&tx)?;
+        let mut statement = tx
+            .prepare(&format!(
+                "SELECT {projection} FROM audio_files af WHERE af.id IN (SELECT value FROM json_each(?1))"
+            ))
+            .map_err(db_error)?;
+        let mut files = statement
+            .query_map(params![json], audio_from_row)
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?
+            .into_iter()
+            .map(|file| (file.id, file))
+            .collect::<std::collections::HashMap<_, _>>();
+        let results = ids
+            .into_iter()
+            .map(|id| {
+                files.remove(&id).ok_or_else(|| {
+                    Error::Database("Path search and Metadata snapshots disagree".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let next_position = position.saturating_add(results.len() as u64);
+        let next_cursor = page
+            .has_more
+            .then(|| {
+                page.hits.last().map(|hit| {
+                    scoped_search::encode_native_cursor(
+                        self,
+                        request,
+                        revision,
+                        next_position,
+                        dir_search::encode_cursor(
+                            hit.tier,
+                            hit.score,
+                            hit.id,
+                            dir_search::SEARCH_PATH_REV,
+                        ),
+                    )
+                })
+            })
+            .flatten()
+            .transpose()?;
+        let total_count_exact = !page.has_more
+            && (page.short_circuited || position == 0 || cursor.is_some() || !results.is_empty());
+        let total_count = if page.short_circuited {
+            0
+        } else if results.is_empty() && cursor.is_none() && position != 0 {
+            // An arbitrary deep offset gives no evidence about the skipped count.
+            0
+        } else {
+            // Count only observed hits, including the lookahead. An offset past
+            // the end must not manufacture matches; cursors count their suffix.
+            page.observed_count as u64
+        };
+        Ok(SearchPage {
+            returned_count: results.len(),
+            results,
+            total_count,
+            total_count_exact,
+            query: request.query.clone(),
+            execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            cache_hit: false,
+            next_cursor,
+        })
+    }
+
+    fn directory_index_ready(&self) -> Result<bool> {
+        let conn = self.reader()?;
+        dir_search::ready(&conn)
+    }
+
+    /// §7.1 plan for the schema 9 path index; `None` when ready or read-only. An empty
+    /// library is indexed at once without asking.
+    pub fn local_upgrade_plan_impl(
+        &self,
+    ) -> Result<Option<audiolib_core::local_upgrade::LocalUpgradePlan>> {
+        use audiolib_core::local_upgrade::LocalUpgradePlan;
+        if self.read_only {
+            return Ok(None);
+        }
+        let state = {
+            let conn = self.reader()?;
+            dir_search::upgrade_state(&conn)?
+        };
+        if state.ready {
+            return Ok(None);
+        }
+        if state.total == 0 {
+            self.rebuild_directory_search()?;
+            return Ok(None);
+        }
+        let database_bytes = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // Server copy (909,342 rows): ~70 s path build; backup at ~150 MB/s.
+        let estimated_secs = state.files / 13_000 + database_bytes / (150 << 20);
+        Ok(Some(LocalUpgradePlan {
+            resuming: state.checkpoint.is_some(),
+            completed: state.done,
+            total: state.total,
+            database_bytes,
+            required_bytes: LocalUpgradePlan::required_for(database_bytes),
+            available_bytes: space::free_space(parent),
+            estimated_secs,
+        }))
+    }
+
+    /// Run or resume the path-index upgrade (§5.2): backup once, adaptive batches of at
+    /// most ~2 s each with the checkpoint in the same transaction, cancel between batches.
+    pub fn run_local_upgrade_impl(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &mut dyn FnMut(audiolib_core::local_upgrade::LocalUpgradeProgress),
+    ) -> Result<audiolib_core::local_upgrade::LocalUpgradeOutcome> {
+        use audiolib_core::local_upgrade::{
+            LocalUpgradeOutcome, LocalUpgradePhase, LocalUpgradePlan, LocalUpgradeProgress,
+        };
+        use std::sync::atomic::Ordering;
+        if self.read_only {
+            return Err(Error::Validation("Library is read-only".into()));
+        }
+        let state = {
+            let conn = self.reader()?;
+            dir_search::upgrade_state(&conn)?
+        };
+        if state.ready {
+            return Ok(LocalUpgradeOutcome::Done { backup: None });
+        }
+        let mut backup = state.backup.clone().map(PathBuf::from);
+        if state.checkpoint.is_none() {
+            let parent = self
+                .path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            let bytes = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+            ensure_free_space(&parent, LocalUpgradePlan::required_for(bytes))?;
+            progress(LocalUpgradeProgress {
+                phase: LocalUpgradePhase::Backup,
+                completed: 0,
+                total: 1,
+            });
+            let stem = self
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "library".into());
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let destination = parent.join(format!("{stem}.pre-schema9-{stamp}.db"));
+            match self.backup_library_cancellable(&destination, cancel) {
+                Ok(_) => {}
+                Err(Error::Cancelled) => return Ok(LocalUpgradeOutcome::Cancelled),
+                Err(error) => return Err(error),
+            }
+            progress(LocalUpgradeProgress {
+                phase: LocalUpgradePhase::Backup,
+                completed: 1,
+                total: 1,
+            });
+            let text = destination.to_string_lossy().into_owned();
+            let conn = self.writer()?;
+            dir_search::upgrade_begin(&conn, Some(&text))?;
+            backup = Some(destination);
+        }
+        let mut batch: i64 = 200;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(LocalUpgradeOutcome::Cancelled);
+            }
+            let started = std::time::Instant::now();
+            let more = {
+                let conn = self.writer()?;
+                dir_search::upgrade_batch(&conn, batch)?
+            };
+            let elapsed = started.elapsed();
+            if elapsed < std::time::Duration::from_millis(500) {
+                batch = (batch * 2).min(20_000);
+            } else if elapsed > std::time::Duration::from_secs(2) {
+                batch = (batch / 2).max(20);
+            }
+            let state = {
+                let conn = self.reader()?;
+                dir_search::upgrade_state(&conn)?
+            };
+            progress(LocalUpgradeProgress {
+                phase: LocalUpgradePhase::PathBuild,
+                completed: state.done,
+                total: state.total,
+            });
+            if !more {
+                break;
+            }
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Ok(LocalUpgradeOutcome::Cancelled);
+        }
+        progress(LocalUpgradeProgress {
+            phase: LocalUpgradePhase::Optimize,
+            completed: 0,
+            total: 1,
+        });
+        {
+            let conn = self.writer()?;
+            dir_search::upgrade_finish(&conn)?;
+        }
+        progress(LocalUpgradeProgress {
+            phase: LocalUpgradePhase::Switch,
+            completed: 1,
+            total: 1,
+        });
+        Ok(LocalUpgradeOutcome::Done { backup })
+    }
+
+    /// Rebuild `audio_dir_search` and `audio_dir_runs` for the open library.
+    pub fn rebuild_directory_search(&self) -> Result<()> {
+        let conn = self.writer()?;
+        dir_search::rebuild(&conn)
     }
 
     fn search_folders_impl(
@@ -1945,6 +2610,11 @@ impl SqliteProvider {
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<Vec<Folder>> {
         request.validate()?;
+        if matches!(request.scope, SearchScope::All | SearchScope::Path)
+            && !request.query.trim().is_empty()
+        {
+            return scoped_search::folders(self, request, cancel);
+        }
         let has_query = !request.query.trim().is_empty();
         let visibility_only = request.filters
             == (audiolib_core::SearchFilters {
@@ -1961,14 +2631,6 @@ impl SqliteProvider {
                 Ok(())
             }
         };
-        let SearchSql {
-            conditions, values, ..
-        } = search_sql(
-            &self.tokenizer,
-            request,
-            false,
-            self.derived_tags.load(Ordering::Acquire),
-        )?;
         // FTS emits arbitrary row IDs. Use a narrow covering lookup rather than
         // fetching each matching file's wide Metadata row just for its folder.
         // Exclude terms read only the covered tag columns, so they keep this scan as long
@@ -1992,6 +2654,15 @@ impl SqliteProvider {
             .then(|| self.observe_search_revision())
             .transpose()?;
         let tx = conn.transaction().map_err(db_error)?;
+        let SearchSql {
+            conditions, values, ..
+        } = search_sql(
+            &tx,
+            &self.tokenizer,
+            request,
+            false,
+            self.derived_tags.load(Ordering::Acquire),
+        )?;
         let (ranked_ids, pinned_revision) = if let Some(revision_before) = revision_before {
             // The complete ranking is query-only, even when its page was scoped
             // or filtered. Reuse it only when it belongs to this pinned snapshot.
@@ -2001,11 +2672,17 @@ impl SqliteProvider {
             .optional()
             .map_err(db_error)?;
             let revision = self.observe_search_revision()?;
-            if revision_before == revision {
-                let query = compile_query(&self.tokenizer, &request.query)?;
+            let cache_revision = self.cache_revision(&tx, revision)?;
+            if revision_before == revision
+                || matches!(cache_revision, search_cache::CacheRevision::Tracked(_))
+            {
+                let query = compile_request_query(&self.tokenizer, request)?;
                 (
-                    self.ranking_cache.lock().unwrap().get(revision, &query),
-                    Some(revision),
+                    self.ranking_cache
+                        .lock()
+                        .unwrap()
+                        .get(&cache_revision, &query),
+                    Some(cache_revision),
                 )
             } else {
                 (None, None)
@@ -2020,7 +2697,7 @@ impl SqliteProvider {
         let query_ids = match (values.first(), ranked_ids.as_ref()) {
             (Some(Value::Text(query)), None) if has_query => {
                 search_candidates::query_ids(&tx, query, &check_cancel, || {
-                    let Some(revision) = pinned_revision else {
+                    let Some(revision) = pinned_revision.as_ref() else {
                         return Ok(None);
                     };
                     match self.ranking_cache.try_lock() {
@@ -2069,6 +2746,7 @@ impl SqliteProvider {
             // folder. Keep the covering-index proof aligned with that SQL scope.
             filter_request.folder_id = None;
             let filter_sql = search_sql(
+                &tx,
                 &self.tokenizer,
                 &filter_request,
                 false,
@@ -2194,6 +2872,142 @@ impl SqliteProvider {
 }
 
 impl DataProvider for SqliteProvider {
+    fn vendor_import_available(&self) -> Result<bool> {
+        Ok(!self.read_only)
+    }
+    fn vendor_import_preview(
+        &self,
+        file: &Path,
+    ) -> Result<audiolib_core::vendor_import::VendorImportPreview> {
+        self.vendor_import_preview_impl(file)
+    }
+    fn vendor_import_preview_files(
+        &self,
+        files: &[PathBuf],
+        options: &audiolib_core::vendor_import::VendorImportOptions,
+    ) -> Result<audiolib_core::vendor_import::VendorImportPreview> {
+        self.vendor_import_preview_files_impl(files, options)
+    }
+    fn vendor_import_status(
+        &self,
+        id: &str,
+    ) -> Result<audiolib_core::vendor_import::VendorImportStatus> {
+        self.vendor_import_status_impl(id)
+    }
+    fn vendor_import_mapping(
+        &self,
+        id: &str,
+        options: &audiolib_core::vendor_import::VendorImportOptions,
+    ) -> Result<audiolib_core::vendor_import::VendorImportPreview> {
+        self.vendor_import_mapping_impl(id, options)
+    }
+    fn vendor_import_rows(
+        &self,
+        id: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<audiolib_core::vendor_import::VendorRowPreview>> {
+        self.vendor_import_rows_impl(id, offset, limit)
+    }
+    fn vendor_import_history(&self) -> Result<audiolib_core::vendor_import::VendorImportHistory> {
+        self.vendor_import_history_impl()
+    }
+    fn vendor_import_candidates(
+        &self,
+        id: &str,
+        row_id: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<audiolib_core::vendor_import::VendorCandidatePage> {
+        self.vendor_import_candidates_impl(id, row_id, offset, limit)
+    }
+    fn vendor_import_templates(
+        &self,
+    ) -> Result<Vec<audiolib_core::vendor_import::VendorMappingTemplate>> {
+        self.vendor_import_templates_impl()
+    }
+    fn vendor_import_save_template(
+        &self,
+        template: &audiolib_core::vendor_import::VendorMappingTemplate,
+    ) -> Result<audiolib_core::vendor_import::VendorMappingTemplate> {
+        self.vendor_import_save_template_impl(template)
+    }
+    fn vendor_import_cancel(
+        &self,
+        id: &str,
+    ) -> Result<audiolib_core::vendor_import::VendorImportStatus> {
+        self.vendor_import_cancel_impl(id)
+    }
+    fn vendor_import_commit(
+        &self,
+        id: &str,
+        key: &str,
+    ) -> Result<audiolib_core::vendor_import::VendorImportResult> {
+        self.vendor_import_commit_impl(id, key)
+    }
+    fn vendor_import_rollback(
+        &self,
+        id: &str,
+    ) -> Result<audiolib_core::vendor_import::VendorImportResult> {
+        self.vendor_import_rollback_impl(id)
+    }
+    fn album_facets(&self, request: &SearchRequest) -> Result<Vec<AlbumFacet>> {
+        SqliteProvider::album_facets(self, request)
+    }
+    fn album_facets_cancellable(
+        &self,
+        request: &SearchRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AlbumFacet>> {
+        SqliteProvider::album_facets_cancellable(self, request, cancel)
+    }
+    fn album_member_ids(
+        &self,
+        id: i64,
+        after: Option<i64>,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<i64>> {
+        SqliteProvider::album_member_ids(self, id, after, limit, cancel)
+    }
+    fn find_album_by_semantic(
+        &self,
+        kind: audiolib_core::AlbumKind,
+        metadata_key: Option<&str>,
+        folder_path: Option<&str>,
+    ) -> Result<Option<Album>> {
+        SqliteProvider::find_album_by_semantic(self, kind, metadata_key, folder_path)
+    }
+    fn get_album(&self, id: i64) -> Result<Album> {
+        SqliteProvider::get_album(self, id)
+    }
+    fn album_members(
+        &self,
+        id: i64,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        SqliteProvider::album_members(self, id, limit, cancel)
+    }
+    fn album_members_in_folder(
+        &self,
+        id: i64,
+        folder_id: i64,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        SqliteProvider::album_members_in_folder(self, id, folder_id, limit, cancel)
+    }
+    fn album_members_in_unassigned_directory(
+        &self,
+        id: i64,
+        directory: &str,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        SqliteProvider::album_members_in_unassigned_directory(self, id, directory, limit, cancel)
+    }
+
     fn load_search_workspace(
         &self,
         target: &audiolib_core::SearchWorkspaceTarget,
@@ -2207,6 +3021,22 @@ impl DataProvider for SqliteProvider {
         workspace: &audiolib_core::SearchWorkspace,
     ) -> Result<()> {
         search_workspace::save(target, workspace)
+    }
+
+    fn path_search_ready(&self) -> Result<bool> {
+        self.directory_index_ready()
+    }
+
+    fn local_upgrade_plan(&self) -> Result<Option<audiolib_core::local_upgrade::LocalUpgradePlan>> {
+        self.local_upgrade_plan_impl()
+    }
+
+    fn run_local_upgrade(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &mut dyn FnMut(audiolib_core::local_upgrade::LocalUpgradeProgress),
+    ) -> Result<audiolib_core::local_upgrade::LocalUpgradeOutcome> {
+        self.run_local_upgrade_impl(cancel, progress)
     }
 
     fn search_revision(&self) -> Result<Option<u64>> {
@@ -2543,8 +3373,43 @@ struct SearchSql {
     values: Vec<Value>,
 }
 
+fn normalize_search_page(request: &SearchRequest) -> Result<std::borrow::Cow<'_, SearchRequest>> {
+    let Some(page) = request.page else {
+        return Ok(std::borrow::Cow::Borrowed(request));
+    };
+    if request.cursor.is_some() {
+        return Ok(std::borrow::Cow::Borrowed(request));
+    }
+    let mut copy = request.clone();
+    copy.offset = (page as usize - 1)
+        .checked_mul(request.limit)
+        .ok_or_else(|| Error::Validation("Search page is too large".into()))?;
+    copy.page = None;
+    Ok(std::borrow::Cow::Owned(copy))
+}
+
+/// Layered path search keeps the bench plan for an unfiltered relevance query.
+pub fn path_scope_is_unfiltered(request: &SearchRequest) -> bool {
+    request.folder_id.is_none()
+        && request.order_by == SortOrder::Relevance
+        && request.filters.sample_rate.is_none()
+        && request.filters.bit_depth.is_none()
+        && request.filters.channels.is_none()
+        && request.filters.duration_min.is_none()
+        && request.filters.duration_max.is_none()
+        && !request.filters.favorites_only
+        && !request.filters.tagged_only
+        && request.filters.tag_contains.is_none()
+        && request.filters.include_tags.is_empty()
+        && request.filters.exclude_tags.is_empty()
+        && request.filters.color.is_none()
+        && request.filters.album.is_none()
+        && request.filters.album_id.is_none()
+}
+
 // Results and directory facets must compile exactly the same query and filters.
 fn search_sql(
+    conn: &Connection,
     tokenizer: &Jieba,
     request: &SearchRequest,
     include_folder: bool,
@@ -2560,10 +3425,20 @@ fn search_sql(
     ];
     let mut values = Vec::<Value>::new();
     let mut from = "audio_files af".to_string();
-    if !request.query.trim().is_empty() {
+    if !request.query.trim().is_empty()
+        && matches!(request.scope, SearchScope::All | SearchScope::Path)
+    {
+        conditions.push(scoped_search::predicate(
+            conn,
+            tokenizer,
+            &request.query,
+            request.scope,
+            &mut values,
+        )?);
+    } else if !request.query.trim().is_empty() {
         from = fts_search_from(false).into();
         conditions.push("audio_search MATCH ?".into());
-        values.push(Value::Text(compile_query(tokenizer, &request.query)?));
+        values.push(Value::Text(compile_request_query(tokenizer, request)?));
     }
     if let Some(folder) = request.folder_id.filter(|_| include_folder) {
         if request.include_subfolders {
@@ -2597,6 +3472,25 @@ fn search_sql(
     }
     if filters.favorites_only {
         conditions.push("af.favorite=1".into());
+    }
+    if let Some(id) = filters.album_id {
+        conditions.push("af.album_id=?".into());
+        values.push(Value::Integer(id));
+    }
+    if let Some(album) = filters.album.as_deref() {
+        // Exact stored name; the value is bound, never interpolated.
+        let has:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('audio_files') WHERE name='album_id')",[],|row|row.get(0)).map_err(db_error)?;
+        if has && album.is_empty() {
+            conditions.push("af.album_id IN (SELECT id FROM albums WHERE kind='folder')".into());
+        } else {
+            conditions.push(if has {
+                "af.album_id IN (SELECT id FROM albums WHERE kind='metadata' AND metadata_key=?)"
+                    .into()
+            } else {
+                format!("{}=?", album_expression(conn)?)
+            });
+            values.push(Value::Text(album.to_owned()));
+        }
     }
     // Both filters are written so the planner can use idx_audio_visible_tagged_any: its
     // partial WHERE is exactly the "has any tag" term below, so the visible filename order
@@ -2672,6 +3566,7 @@ fn search_sql(
 
 // Typed, owned result columns: preserve unknown attributes and all legacy BWF/iXML fields.
 // Legacy NULL/nonbinary visibility stays unchanged in storage; only exact zero is present.
+// Column 36 stays reserved; declared album uses the Metadata already decoded for this row.
 const AUDIO_SELECT: &str = "af.id,af.file_path,af.filename,af.folder_id,COALESCE(af.file_size,0),
  COALESCE(af.sample_rate,0),COALESCE(af.bit_depth,0),COALESCE(af.channels,0),COALESCE(af.duration,0),
  COALESCE(af.user_tags,''),af.user_color,COALESCE(af.user_notes,''),af.favorite,
@@ -2679,12 +3574,21 @@ const AUDIO_SELECT: &str = "af.id,af.file_path,af.filename,af.folder_id,COALESCE
  af.bwf_originator,af.bwf_originator_reference,af.bwf_origination_date,af.bwf_origination_time,
  af.bwf_time_reference,af.bwf_version,af.bwf_umid,af.ixml_scene,af.ixml_take,af.ixml_tape,
  af.ixml_circled,af.ixml_wild_track,af.ixml_no_good,af.codec,af.created_at,af.modified_at,
- af.peak_amplitude,af.rms_level,af.spectral_centroid,af.zero_crossing_rate,(af.missing IS NOT 0)";
+ af.peak_amplitude,af.rms_level,af.spectral_centroid,af.zero_crossing_rate,(af.missing IS NOT 0),
+ NULL";
 
-fn audio_projection(_conn: &Connection) -> Result<std::borrow::Cow<'static, str>> {
-    // The same owned DTO projection reads legacy v3..v5, p0 and current p1;
-    // retired library playback fields are never selected or surfaced.
-    Ok(std::borrow::Cow::Borrowed(AUDIO_SELECT))
+fn album_expression(_conn: &Connection) -> Result<&'static str> {
+    Ok("audiolib_album_key(af.metadata_json)")
+}
+
+fn audio_projection(conn: &Connection) -> Result<std::borrow::Cow<'static, str>> {
+    let has:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('audio_files') WHERE name='album_id') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE name='albums')",[],|row|row.get(0)).map_err(db_error)?;
+    let extra = if has {
+        format!(",af.album_id,{}", albums::entity_json_expression())
+    } else {
+        ",NULL,NULL".into()
+    };
+    Ok(std::borrow::Cow::Owned(format!("{AUDIO_SELECT}{extra}")))
 }
 
 fn snapshot_modified_at(file: &AudioFile) -> Result<&str> {
@@ -2706,12 +3610,15 @@ fn snapshot_modified_at(file: &AudioFile) -> Result<&str> {
 }
 
 fn audio_from_row(row: &Row<'_>) -> rusqlite::Result<AudioFile> {
-    let raw: String = row.get(14)?;
+    let raw = metadata_storage::decode_view(row.get_ref(14)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Blob, Box::new(error))
+    })?;
     let mut attributes =
         serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!({}));
     if !attributes.is_object() {
         attributes = serde_json::json!({"legacy_attributes":attributes});
     }
+    let album = audiolib_core::album(&attributes);
     let object = attributes.as_object_mut().expect("attributes object");
     let description: String = row.get(13)?;
     if !description.is_empty() {
@@ -2755,7 +3662,7 @@ fn audio_from_row(row: &Row<'_>) -> rusqlite::Result<AudioFile> {
             object.insert(name.into(), value.into());
         }
     }
-    Ok(AudioFile {
+    Ok(AudioFile::from(audiolib_core::AudioFileData {
         id: row.get(0)?,
         file_path: row.get(1)?,
         filename: row.get(2)?,
@@ -2771,13 +3678,41 @@ fn audio_from_row(row: &Row<'_>) -> rusqlite::Result<AudioFile> {
         favorite: row.get(12)?,
         bext_description: row.get(13)?,
         attributes,
+        album,
+        album_id: row.get(37)?,
+        album_entity: row
+            .get::<_, Option<String>>(38)?
+            .map(|raw| {
+                serde_json::from_str(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        38,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
         missing: row.get(35)?,
-    })
+    }))
 }
 
 /// Plain-text queries are quoted tokens, so punctuation cannot become SQL or FTS operators.
 fn compile_query(jieba: &Jieba, query: &str) -> Result<String> {
     search_text::compile_query(jieba, query)
+}
+
+fn compile_request_query(jieba: &Jieba, request: &SearchRequest) -> Result<String> {
+    if request.scope == SearchScope::Filename {
+        search_text::compile_query_columns(
+            jieba,
+            &request.query,
+            "{filename}",
+            "{filename_tokenized}",
+        )
+        .map(|query| format!("{{filename filename_tokenized}} : ({query})"))
+    } else {
+        compile_query(jieba, &request.query)
+    }
 }
 
 #[cfg(feature = "scanner")]
@@ -2814,6 +3749,8 @@ fn ensure_folder(conn: &Connection, folder: &Path, root: &Path) -> Result<i64> {
             )
             .map_err(db_error)?;
             repair_folder_subtree(conn, id)?;
+            albums::refresh_folder_membership(conn, id)?;
+            dir_search::bump_generation(conn)?;
         } else {
             conn.execute("INSERT OR IGNORE INTO folder_closure(ancestor_id,descendant_id,depth) VALUES(?1,?1,0)",[id]).map_err(db_error)?;
         }
@@ -2836,6 +3773,7 @@ fn ensure_folder(conn: &Connection, folder: &Path, root: &Path) -> Result<i64> {
         [id],
     )
     .map_err(db_error)?;
+    dir_search::maintain(conn, &[id], &[])?;
     if let Some(parent) = parent_id {
         conn.execute(
             "INSERT OR IGNORE INTO folder_closure(ancestor_id,descendant_id,depth)
@@ -2974,7 +3912,7 @@ mod search_folder_plan_tests {
                 // both when no ranking exists and when candidate IDs overflow.
                 let SearchSql {
                     conditions, values, ..
-                } = search_sql(&provider.tokenizer, &request, false, true).unwrap();
+                } = search_sql(&conn, &provider.tokenizer, &request, false, true).unwrap();
                 let from = folder_search_from(true, visibility_only, false);
                 let plan = conn
                     .prepare(&format!(
@@ -3006,7 +3944,7 @@ mod search_folder_plan_tests {
                 from,
                 conditions,
                 values,
-            } = search_sql(&provider.tokenizer, &filtered_request(), true, true).unwrap();
+            } = search_sql(&conn, &provider.tokenizer, &filtered_request(), true, true).unwrap();
             for (columns, suffix) in [
                 ("COUNT(*)", ""),
                 (
@@ -3375,6 +4313,9 @@ mod search_cancellation_tests {
             ..Default::default()
         };
         assert!(!provider.search(&request).unwrap().cache_hit);
+        // Exercise the ranked-ID cancellation boundary even when a newer
+        // first-page layer could satisfy the same request without this SQL.
+        provider.clear_first_pages().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let hydrated = Arc::new(AtomicBool::new(false));
         let reader = provider.reader().unwrap();
@@ -3407,6 +4348,56 @@ mod search_cancellation_tests {
             Err(Error::Cancelled)
         ));
         assert!(!hydrated.load(Ordering::Acquire));
+        let reader = provider.reader().unwrap();
+        reader
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        drop(reader);
+        assert!(provider.search(&request).unwrap().cache_hit);
+    }
+
+    #[test]
+    fn cached_first_page_observes_cancellation_after_reader_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider =
+            SqliteProvider::open(&directory.path().join("cached-page-cancel.db")).unwrap();
+        provider
+            .writer()
+            .unwrap()
+            .execute(
+                "INSERT INTO audio_files(file_path,filename) VALUES('metal.wav','metal.wav')",
+                [],
+            )
+            .unwrap();
+        let request = SearchRequest {
+            query: "metal".into(),
+            ..Default::default()
+        };
+        provider.search(&request).unwrap();
+        assert!(provider.search(&request).unwrap().cache_hit);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let reader = provider.reader().unwrap();
+        reader
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "audio_files",
+                        column_name: "id",
+                        ..
+                    }
+                ) {
+                    signal.store(true, Ordering::Release);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        drop(reader);
+        assert!(matches!(
+            provider.search_cancellable(&request, cancel),
+            Err(Error::Cancelled)
+        ));
         let reader = provider.reader().unwrap();
         reader
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
@@ -3608,7 +4599,7 @@ mod search_cancellation_tests {
                 .unwrap();
         }
         drop(connection);
-        let original = provider.get_audio(1).unwrap().attributes;
+        let original = provider.get_audio(1).unwrap().into_data().attributes;
         // Copying the displayed source tag into the editable annotation must not
         // change its key. Both kinds of blank annotations must select the source.
         for tags in [
@@ -3739,5 +4730,72 @@ mod search_cancellation_tests {
         assert_eq!(provider.search(&request).unwrap().total_count, 0);
         assert!(provider.search_folders(&request).unwrap().is_empty());
         assert_eq!(provider.stats().unwrap().audio_files, 0);
+    }
+}
+
+#[cfg(all(test, feature = "scanner"))]
+mod finish_interrupt_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn interrupt_before_finish_marks_the_session_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let sounds = root.path().join("sounds");
+        std::fs::create_dir(&sounds).unwrap();
+        let provider = SqliteProvider::open(&root.path().join("library.db")).unwrap();
+        let session = provider.start_scan(&sounds, true).unwrap();
+        let mut progress = audiolib_core::ScanProgress {
+            session_id: session,
+            state: audiolib_core::ScanState::Completed,
+            ..Default::default()
+        };
+        let interrupt = Arc::new(AtomicBool::new(true));
+        let started = Instant::now();
+        let error = provider
+            .finish_scan(&sounds, &mut progress, true, true, &interrupt)
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(error, Error::Cancelled));
+        let status: String = Connection::open(provider.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT status FROM scan_sessions WHERE id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn interrupt_during_statement_returns_cancelled_and_the_connection_recovers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&interrupt);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = run_interruptible(&mut conn, &interrupt, |conn| {
+            conn.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT SUM(x) FROM n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(db_error)
+        });
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

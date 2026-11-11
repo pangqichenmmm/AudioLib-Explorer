@@ -299,7 +299,7 @@ fn scanner_incremental_rescan_keeps_annotations_and_filters_counts() {
     extra
         .execute("UPDATE audio_files SET user_rating=4 WHERE id=?1", [id])
         .unwrap();
-    extra.execute("UPDATE audio_files SET metadata_json=json_patch(metadata_json,?2),bwf_originator='legacy originator',ixml_tape='legacy tape' WHERE id=?1",
+    extra.execute("UPDATE audio_files SET metadata_json=json_patch(audiolib_metadata_json(metadata_json),?2),bwf_originator='legacy originator',ixml_tape='legacy tape' WHERE id=?1",
         params![id,r#"{"private_plugin_attribute":"preserve","ixml_scene":"scene preserved"}"#]).unwrap();
     extra.execute("INSERT INTO waveform_cache(audio_file_id,zoom_level,min_values,max_values) VALUES(?1,'overview',X'0000803F',X'00000040')", [id]).unwrap();
     drop(extra);

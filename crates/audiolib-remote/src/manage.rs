@@ -96,6 +96,19 @@ pub struct Capabilities {
     /// servers (only the §9.2 switch, status and pause/resume).
     #[serde(default)]
     pub list_waveform_jobs: Option<audiolib_core::waveform_cache::WaveformJobsCapability>,
+    /// Library schema and served snapshot formats (search metadata v2); `None` on
+    /// older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_schema: Option<audiolib_core::server_upgrade::LibrarySchemaInfo>,
+    /// Schema migration state (search metadata v2); `None` on older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_migration: Option<audiolib_core::server_upgrade::SchemaMigrationInfo>,
+    /// Vendor metadata import limits; `None` when the server does not offer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_import: Option<audiolib_core::server_upgrade::VendorImportInfo>,
+    /// Client upgrade advice (#214); absent means no prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_upgrade: Option<audiolib_core::server_upgrade::ClientUpgradeInfo>,
 }
 
 fn known() -> bool {
@@ -114,6 +127,10 @@ impl Default for Capabilities {
             list_waveforms: None,
             pregenerate_list_waveforms: None,
             list_waveform_jobs: None,
+            library_schema: None,
+            schema_migration: None,
+            vendor_import: None,
+            client_upgrade: None,
         }
     }
 }
@@ -370,6 +387,29 @@ impl RemoveReport {
     }
 }
 
+/// Compatibility catalog headers already sent on other peer reads (`GET /library`).
+struct PeerCatalogHeaders {
+    catalog: String,
+    accepted: String,
+    schema_max: String,
+    search_storage_max: String,
+    tokenization_max: String,
+}
+
+fn peer_catalog_headers() -> Result<PeerCatalogHeaders> {
+    let manifest = audiolib_core::compatibility::compatibility_manifest();
+    let catalog = serde_json::to_string(&manifest).map_err(|_| {
+        RemoteError::Protocol("Cannot serialize client compatibility catalog".into())
+    })?;
+    Ok(PeerCatalogHeaders {
+        accepted: manifest.snapshot_read_formats.join(", "),
+        schema_max: audiolib_core::compatibility::SNAPSHOT_SCHEMA_MAX.to_string(),
+        search_storage_max: audiolib_core::compatibility::SEARCH_STORAGE_MAX.to_string(),
+        tokenization_max: audiolib_core::compatibility::TOKENIZATION_MAX.to_string(),
+        catalog,
+    })
+}
+
 /// A missing endpoint on an older server becomes [`RemoteError::Unsupported`].
 fn endpoint_missing(error: RemoteError, context: &str) -> RemoteError {
     match error {
@@ -413,13 +453,43 @@ impl RemoteClient {
             .transpose()?;
         let result = match method {
             // Reads may be resent once on a stale keep-alive connection; writes never are.
-            "GET" => crate::abort::call_fresh(|| {
-                let request = self.agent.get(&url);
-                match &authorization {
-                    Some(value) => request.header("Authorization", value),
-                    None => request,
-                }
-            }),
+            // `GET /capabilities` is the exception: an unmarked peer is served the
+            // schema-8 compatibility snapshot and a client-upgrade hint.
+            "GET" => {
+                let peer_catalog = (path == "/capabilities")
+                    .then(peer_catalog_headers)
+                    .transpose()?;
+                crate::abort::call_fresh(|| {
+                    let mut request = self.agent.get(&url);
+                    if let Some(peer) = &peer_catalog {
+                        request = request
+                            .header(
+                                audiolib_core::compatibility::CLIENT_COMPATIBILITY_HEADER,
+                                &peer.catalog,
+                            )
+                            .header(
+                                audiolib_core::compatibility::ACCEPT_FORMATS_HEADER,
+                                &peer.accepted,
+                            )
+                            .header(
+                                audiolib_core::compatibility::SNAPSHOT_SCHEMA_MAX_HEADER,
+                                &peer.schema_max,
+                            )
+                            .header(
+                                audiolib_core::compatibility::SEARCH_STORAGE_MAX_HEADER,
+                                &peer.search_storage_max,
+                            )
+                            .header(
+                                audiolib_core::compatibility::TOKENIZATION_MAX_HEADER,
+                                &peer.tokenization_max,
+                            );
+                    }
+                    match &authorization {
+                        Some(value) => request.header("Authorization", value),
+                        None => request,
+                    }
+                })
+            }
             "DELETE" => {
                 let mut request = agent
                     .unwrap_or(&self.writes)
@@ -798,6 +868,61 @@ mod tests {
             RemoteClient::new(&secured.url, "").unwrap().capabilities(),
             Err(RemoteError::TokenRequired(_))
         ));
+    }
+
+    #[test]
+    fn capabilities_get_sends_the_client_compatibility_catalog() {
+        use audiolib_core::compatibility::{
+            ACCEPT_FORMATS_HEADER, CLIENT_COMPATIBILITY_HEADER, PLAN_B_V9_FORMAT,
+            SEARCH_STORAGE_MAX, SEARCH_STORAGE_MAX_HEADER, SNAPSHOT_SCHEMA_MAX,
+            SNAPSHOT_SCHEMA_MAX_HEADER, TOKENIZATION_MAX, TOKENIZATION_MAX_HEADER,
+            compatibility_manifest,
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let log = seen.clone();
+        let server = TestServer::start(move |request| {
+            if request.method == "GET" && request.path == "/api/v1/capabilities" {
+                *log.lock().unwrap() = Some(request.headers.clone());
+                return TestResponse::json(200, r#"{"manage_mode":"all","can_manage":true}"#);
+            }
+            TestResponse::json(
+                404,
+                r#"{"error_code":"NOT_FOUND","message":"No such endpoint"}"#,
+            )
+        });
+        let caps = RemoteClient::new(&server.url, "tok")
+            .unwrap()
+            .capabilities()
+            .unwrap();
+        assert!(caps.supported);
+        let headers = seen.lock().unwrap().clone().expect("capabilities request");
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        let catalog: audiolib_core::compatibility::CompatibilityManifest =
+            serde_json::from_str(header(CLIENT_COMPATIBILITY_HEADER).expect("catalog")).unwrap();
+        assert_eq!(catalog, compatibility_manifest());
+        assert!(
+            header(ACCEPT_FORMATS_HEADER)
+                .unwrap()
+                .split(',')
+                .any(|id| id.trim() == PLAN_B_V9_FORMAT)
+        );
+        assert_eq!(
+            header(SNAPSHOT_SCHEMA_MAX_HEADER).unwrap(),
+            SNAPSHOT_SCHEMA_MAX.to_string()
+        );
+        assert_eq!(
+            header(SEARCH_STORAGE_MAX_HEADER).unwrap(),
+            SEARCH_STORAGE_MAX.to_string()
+        );
+        assert_eq!(
+            header(TOKENIZATION_MAX_HEADER).unwrap(),
+            TOKENIZATION_MAX.to_string()
+        );
     }
 
     #[test]

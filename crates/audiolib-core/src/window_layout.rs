@@ -19,6 +19,8 @@ pub const WINDOW_MAX_COORDINATE: i64 = 100_000;
 pub const SIDEBAR_WIDTH_RANGE: (f32, f32) = (120.0, 800.0);
 /// Details panel width range in unscaled logical pixels (interface scale 100%).
 pub const INSPECTOR_WIDTH_RANGE: (f32, f32) = (160.0, 1200.0);
+/// Folder list share of the combined expanded sidebar list height.
+pub const FOLDERS_SECTION_RATIO_RANGE: (f32, f32) = (0.1, 0.9);
 
 /// Desktop window and pane layout restored on the next launch.
 ///
@@ -44,6 +46,15 @@ pub struct WindowLayoutPreferences {
     pub inspector_visible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filters_visible: Option<bool>,
+    /// Whether the folder tree section is expanded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folders_section_expanded: Option<bool>,
+    /// Whether the library/album section is expanded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub libraries_section_expanded: Option<bool>,
+    /// Folder list share while both sections are expanded, independent of UI scale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folders_section_ratio: Option<f32>,
 }
 
 impl<'de> Deserialize<'de> for WindowLayoutPreferences {
@@ -84,6 +95,9 @@ impl WindowLayoutPreferences {
             inspector_width: number("inspector_width").map(|value| value as f32),
             inspector_visible: flag("inspector_visible"),
             filters_visible: flag("filters_visible"),
+            folders_section_expanded: flag("folders_section_expanded"),
+            libraries_section_expanded: flag("libraries_section_expanded"),
+            folders_section_ratio: number("folders_section_ratio").map(|value| value as f32),
         }
         .normalized()
     }
@@ -118,6 +132,9 @@ impl WindowLayoutPreferences {
             inspector_width: pane(self.inspector_width, INSPECTOR_WIDTH_RANGE),
             inspector_visible: self.inspector_visible,
             filters_visible: self.filters_visible,
+            folders_section_expanded: self.folders_section_expanded,
+            libraries_section_expanded: self.libraries_section_expanded,
+            folders_section_ratio: pane(self.folders_section_ratio, FOLDERS_SECTION_RATIO_RANGE),
         }
     }
 }
@@ -242,6 +259,9 @@ mod tests {
             inspector_width: Some(360.0),
             inspector_visible: Some(false),
             filters_visible: Some(true),
+            folders_section_expanded: Some(false),
+            libraries_section_expanded: Some(true),
+            folders_section_ratio: Some(0.7),
         };
         let text = serde_json::to_string(&layout).unwrap();
         let parsed: WindowLayoutPreferences = serde_json::from_str(&text).unwrap();
@@ -282,7 +302,46 @@ mod tests {
                 inspector_width: None,
                 inspector_visible: None,
                 filters_visible: Some(true),
+                ..Default::default()
             }
+        );
+    }
+
+    #[test]
+    fn sidebar_sections_default_independently_and_clamp_the_saved_split() {
+        let older = WindowLayoutPreferences::from_value(&json!({"sidebar_width": 260}));
+        assert_eq!(older.folders_section_expanded, None);
+        assert_eq!(older.libraries_section_expanded, None);
+        assert_eq!(older.folders_section_ratio, None);
+
+        let parsed = WindowLayoutPreferences::from_value(&json!({
+            "sidebar_width": 260,
+            "folders_section_expanded": false,
+            "libraries_section_expanded": "yes",
+            "folders_section_ratio": -1
+        }));
+        assert_eq!(parsed.sidebar_width, Some(260.0));
+        assert_eq!(parsed.folders_section_expanded, Some(false));
+        assert_eq!(parsed.libraries_section_expanded, None);
+        assert_eq!(
+            parsed.folders_section_ratio,
+            Some(FOLDERS_SECTION_RATIO_RANGE.0)
+        );
+
+        for ratio in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let normalized = WindowLayoutPreferences {
+                folders_section_ratio: Some(ratio),
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(normalized.folders_section_ratio, None);
+        }
+        let too_large = WindowLayoutPreferences::from_value(&json!({
+            "folders_section_ratio": 10
+        }));
+        assert_eq!(
+            too_large.folders_section_ratio,
+            Some(FOLDERS_SECTION_RATIO_RANGE.1)
         );
     }
 

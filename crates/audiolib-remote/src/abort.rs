@@ -228,7 +228,7 @@ fn warm(url: &str) {
         return;
     };
     if WARMING
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < MAX_WARMING).then_some(n + 1)
         })
         .is_err()
@@ -320,6 +320,10 @@ impl Timeouts {
 
     pub(crate) fn post(&self, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
         self.apply(shared_agent().post(url))
+    }
+
+    pub(crate) fn put(&self, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+        self.apply(shared_agent().put(url))
     }
 
     pub(crate) fn patch(&self, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
@@ -517,6 +521,63 @@ impl ScopedTransport {
             _ => error.into(),
         }
     }
+
+    /// Keep one deadline across interrupted/polled reads; injectable operations let
+    /// tests exercise cancellation and deadline exhaustion without signals or sleeps.
+    fn await_input_with(
+        &mut self,
+        timeout: NextTimeout,
+        mut read: impl FnMut(&mut Self) -> io::Result<usize>,
+        mut now: impl FnMut() -> std::time::Instant,
+    ) -> Result<bool, ureq::Error> {
+        self.follow_scope()?;
+        let mut wanted = timeout.not_zero().map(|timeout| *timeout);
+        if let Some(stall) = self.read_stall
+            && timeout.reason != ureq::Timeout::RecvResponse
+        {
+            wanted = Some(wanted.map_or(stall, |wanted| wanted.min(stall)));
+        }
+        // Windows shutdown can leave a pending blocking recv asleep until the peer
+        // writes/closes. Poll scoped reads so cancellation also bounds the worker's
+        // lifetime when the peer retains its socket; retain the original deadline.
+        let deadline = wanted.map(|wait| now() + wait);
+        let scoped = self.registration.is_some();
+        let amount = loop {
+            if self.aborted() {
+                return Err(cancelled().into());
+            }
+            let remaining = deadline.map(|deadline| deadline.saturating_duration_since(now()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return Err(ureq::Error::Timeout(timeout.reason));
+            }
+            let read_wait = if scoped {
+                Some(remaining.map_or(crate::client::WAIT_TICK, |remaining| {
+                    remaining.min(crate::client::WAIT_TICK)
+                }))
+            } else {
+                remaining
+            };
+            if read_wait != self.read_timeout {
+                self.stream.set_read_timeout(read_wait)?;
+                self.read_timeout = read_wait;
+            }
+            match read(self) {
+                Ok(amount) => break amount,
+                // A signal can interrupt recv before either cancellation or the
+                // timeout. Retry through the same abort/deadline checks above.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if scoped
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) => {}
+                Err(error) => return Err(self.failure(error, timeout)),
+            }
+        };
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
 }
 
 impl Transport for ScopedTransport {
@@ -538,52 +599,11 @@ impl Transport for ScopedTransport {
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        self.follow_scope()?;
-        let mut wanted = timeout.not_zero().map(|timeout| *timeout);
-        if let Some(stall) = self.read_stall
-            && timeout.reason != ureq::Timeout::RecvResponse
-        {
-            wanted = Some(wanted.map_or(stall, |wanted| wanted.min(stall)));
-        }
-        // Windows shutdown can leave a pending blocking recv asleep until the peer
-        // writes/closes. Poll scoped reads so cancellation also bounds the worker's
-        // lifetime when the peer retains its socket; retain the original deadline.
-        let deadline = wanted.map(|wait| std::time::Instant::now() + wait);
-        let scoped = self.registration.is_some();
-        let amount = loop {
-            if self.aborted() {
-                return Err(cancelled().into());
-            }
-            let remaining = deadline
-                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
-            if remaining.is_some_and(|remaining| remaining.is_zero()) {
-                return Err(ureq::Error::Timeout(timeout.reason));
-            }
-            let read_wait = if scoped {
-                Some(remaining.map_or(crate::client::WAIT_TICK, |remaining| {
-                    remaining.min(crate::client::WAIT_TICK)
-                }))
-            } else {
-                remaining
-            };
-            if read_wait != self.read_timeout {
-                self.stream.set_read_timeout(read_wait)?;
-                self.read_timeout = read_wait;
-            }
-            let input = self.buffers.input_append_buf();
-            match (&*self.stream).read(input) {
-                Ok(amount) => break amount,
-                Err(error)
-                    if scoped
-                        && matches!(
-                            error.kind(),
-                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                        ) => {}
-                Err(error) => return Err(self.failure(error, timeout)),
-            }
-        };
-        self.buffers.input_appended(amount);
-        Ok(amount > 0)
+        self.await_input_with(
+            timeout,
+            |transport| (&*transport.stream).read(transport.buffers.input_append_buf()),
+            std::time::Instant::now,
+        )
     }
 
     fn is_open(&mut self) -> bool {
@@ -601,8 +621,110 @@ impl Transport for ScopedTransport {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::net::TcpListener;
     use std::time::Instant;
+
+    fn transport_for_read_test() -> (ScopedTransport, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream =
+            TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(5))
+                .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        (
+            ScopedTransport {
+                stream: Arc::new(stream),
+                buffers: LazyBuffers::new(16, 16),
+                read_timeout: None,
+                write_timeout: None,
+                registration: None,
+                read_stall: None,
+            },
+            peer,
+        )
+    }
+
+    fn response_timeout(wait: Duration) -> NextTimeout {
+        NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::Exact(wait),
+            reason: ureq::Timeout::RecvResponse,
+        }
+    }
+
+    #[test]
+    fn interrupted_read_retries_and_appends_the_received_bytes() {
+        let (mut transport, _peer) = transport_for_read_test();
+        let mut reads = 0;
+        let now = Instant::now();
+        let received = transport
+            .await_input_with(
+                response_timeout(Duration::from_secs(1)),
+                |transport| {
+                    reads += 1;
+                    if reads == 1 {
+                        return Err(io::ErrorKind::Interrupted.into());
+                    }
+                    transport.buffers.input_append_buf()[..2].copy_from_slice(b"ok");
+                    Ok(2)
+                },
+                || now,
+            )
+            .unwrap();
+        assert!(received);
+        assert_eq!(reads, 2);
+        assert_eq!(transport.buffers.input(), b"ok");
+    }
+
+    #[test]
+    fn interrupted_read_rechecks_cancellation_before_another_read() {
+        let (mut transport, _peer) = transport_for_read_test();
+        let abort = Abort::default();
+        let _scope = abort.enter(None);
+        let mut reads = 0;
+        let now = Instant::now();
+        let result = transport.await_input_with(
+            response_timeout(Duration::from_secs(1)),
+            |_| {
+                reads += 1;
+                abort.abort();
+                Err(io::ErrorKind::Interrupted.into())
+            },
+            || now,
+        );
+        assert!(
+            matches!(result, Err(ureq::Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted)
+        );
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn interrupted_reads_keep_the_original_deadline() {
+        let (mut transport, _peer) = transport_for_read_test();
+        let now = Cell::new(Instant::now());
+        let mut waits = Vec::new();
+        let result = transport.await_input_with(
+            response_timeout(Duration::from_secs(3)),
+            |transport| {
+                assert!(waits.len() < 3, "interrupted reads extended the deadline");
+                waits.push(transport.read_timeout.unwrap());
+                now.set(now.get() + Duration::from_secs(1));
+                Err(io::ErrorKind::Interrupted.into())
+            },
+            || now.get(),
+        );
+        assert!(matches!(
+            result,
+            Err(ureq::Error::Timeout(ureq::Timeout::RecvResponse))
+        ));
+        assert_eq!(
+            waits,
+            [
+                Duration::from_secs(3),
+                Duration::from_secs(2),
+                Duration::from_secs(1)
+            ]
+        );
+    }
 
     /// A server that accepts, reads the request head and never answers; sends the instant
     /// it saw the client close the connection.
@@ -622,6 +744,7 @@ pub(crate) mod tests {
             // The request head, then wait for EOF (or a reset) from the client.
             loop {
                 match socket.read(&mut buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }

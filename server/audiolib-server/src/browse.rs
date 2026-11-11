@@ -40,6 +40,8 @@ pub struct FsListing {
     pub truncated: bool,
     /// `.wav` files directly in this directory (not in sub-directories).
     pub wav_files: u64,
+    /// Supported WAV, FLAC and Ogg source files directly in this directory.
+    pub audio_files: u64,
     /// All other files directly in this directory.
     pub other_files: u64,
     /// The listing stopped after [`MAX_SCANNED_ENTRIES`] entries: the file counts and
@@ -110,7 +112,8 @@ pub fn list_directory(raw: &str, hidden: bool) -> Result<FsListing, ApiError> {
     let reader = fs::read_dir(&path).map_err(|error| io_error(&shown, error))?;
     let mut entries = Vec::new();
     let mut truncated = false;
-    let (mut wav_files, mut other_files, mut scanned) = (0_u64, 0_u64, 0_usize);
+    let (mut wav_files, mut audio_files, mut other_files, mut scanned) =
+        (0_u64, 0_u64, 0_u64, 0_usize);
     let mut counts_truncated = false;
     for entry in reader {
         let Ok(entry) = entry else { continue };
@@ -143,9 +146,13 @@ pub fn list_directory(raw: &str, hidden: bool) -> Result<FsListing, ApiError> {
                 is_symlink,
             });
         } else if kind.is_file() {
+            let audio = audiolib_core::is_supported_audio_extension(Path::new(&name));
             let wav = Path::new(&name)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
+            if audio {
+                audio_files += 1;
+            }
             if wav {
                 wav_files += 1;
             } else {
@@ -166,6 +173,7 @@ pub fn list_directory(raw: &str, hidden: bool) -> Result<FsListing, ApiError> {
         entries,
         truncated,
         wav_files,
+        audio_files,
         other_files,
         counts_truncated,
     })

@@ -8,19 +8,30 @@ use std::sync::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+pub mod albums;
+mod audio_file;
+mod audio_range;
+mod audio_source;
 pub mod compatibility;
 pub mod config;
 pub mod library;
 pub mod list_waveform;
 pub mod list_waveform_i8;
+pub mod local_upgrade;
 mod metadata;
 pub mod profiles;
 pub mod search_workspace;
+pub mod server_upgrade;
 pub mod server_url;
 pub mod tag_filter;
+pub mod vendor_import;
 pub mod waveform_cache;
 pub mod waveform_rate;
 pub mod window_layout;
+pub use albums::{Album, AlbumFacet, AlbumKind, MAX_ALBUM_MEMBERS};
+pub use audio_file::AudioFile;
+pub use audio_range::AudioFrameRange;
+pub use audio_source::{SUPPORTED_AUDIO_EXTENSIONS, SourceAudioFormat, source_audio_format};
 pub use library::*;
 pub use list_waveform::{
     LIST_WAVEFORM_COLUMNS, LIST_WAVEFORM_ENCODING_VERSION, ListWaveform, ListWaveformBatch,
@@ -32,7 +43,8 @@ pub use list_waveform_i8::{
     i8_base64_len, quantize_i16_to_i8,
 };
 pub use metadata::{
-    SOURCE_TAG_KEYS, display_tags, source_description, source_metadata_search_text, source_tags,
+    SOURCE_TAG_KEYS, album, display_tags, source_description, source_metadata_search_text,
+    source_tags,
 };
 pub use search_workspace::{
     SavedSearchTask, SearchAudioRef, SearchFolderRef, SearchSession, SearchTask,
@@ -90,6 +102,13 @@ pub enum Error {
     Cancelled,
     #[error("Busy: {0}")]
     Busy(String),
+    /// A migration refused the operation without applying it. Retain the request
+    /// and retry after this delay while displaying the migration state.
+    #[error("Server library migration in progress")]
+    Migration {
+        refusal: server_upgrade::MigrationRefusal,
+        retry_after: u64,
+    },
     #[error("Not found: {0}")]
     NotFound(String),
     /// The database or snapshot was written by a newer AudioLib Explorer: its schema
@@ -177,8 +196,10 @@ pub struct AudioMetadata {
     pub attributes: serde_json::Value,
 }
 
+/// Owned audio-record fields used to construct or consume an [`AudioFile`].
+/// The wire representation and field defaults remain identical to `AudioFile`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct AudioFile {
+pub struct AudioFileData {
     pub id: i64,
     pub file_path: String,
     pub filename: String,
@@ -194,6 +215,15 @@ pub struct AudioFile {
     pub favorite: bool,
     pub bext_description: String,
     pub attributes: serde_json::Value,
+    /// Library/album declared by the file itself; empty when it declares none.
+    #[serde(default)]
+    pub album: String,
+    /// Shared album membership; absent only on older, unconverted snapshots.
+    #[serde(default)]
+    pub album_id: Option<i64>,
+    /// Captured identity for event-loop actions without another database read.
+    #[serde(default)]
+    pub album_entity: Option<Album>,
     #[serde(default)]
     pub missing: bool,
 }
@@ -233,6 +263,43 @@ pub struct SearchFilters {
     pub exclude_tags: Vec<String>,
     /// Exact library color, ignoring hex letter case.
     pub color: Option<String>,
+    /// Exact library/album name declared by the files; absent keeps every album visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Exact shared entity filter. Mutually exclusive with the declared-name filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<i64>,
+}
+
+/// Where a query is allowed to match. Omitted JSON stays `main` (current s8 order).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    /// Filename and Metadata fields only, in the existing relevance order.
+    #[default]
+    Main,
+    /// Main-field matches first, then mixed, then path-only matches.
+    All,
+    /// Every term must match directory names or their ancestors, without main fields.
+    Path,
+    /// Filename columns only; independent of the backwards-compatible main scope.
+    Filename,
+}
+
+impl SearchScope {
+    /// Wire value for settings and (when not `main`) the HTTP `scope` parameter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::All => "all",
+            Self::Path => "path",
+            Self::Filename => "filename",
+        }
+    }
+}
+
+fn scope_is_main(scope: &SearchScope) -> bool {
+    *scope == SearchScope::Main
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +327,15 @@ pub struct SearchRequest {
     pub offset: usize,
     pub order_by: SortOrder,
     pub descending: bool,
+    /// `main` (default), `all`, `path`, or `filename`. Omitted requests keep s8 ordering.
+    #[serde(default, skip_serializing_if = "scope_is_main")]
+    pub scope: SearchScope,
+    /// Opaque keyset cursor. When set with `scope` `all` or `path`, it replaces offset/page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// 1-based page. Ignored when `cursor` is set; otherwise it replaces `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 impl Default for SearchRequest {
     fn default() -> Self {
@@ -272,6 +348,9 @@ impl Default for SearchRequest {
             offset: 0,
             order_by: SortOrder::Relevance,
             descending: false,
+            scope: SearchScope::Main,
+            cursor: None,
+            page: None,
         }
     }
 }
@@ -303,6 +382,14 @@ impl SearchRequest {
 
     /// Validate bounded search input before compiling a parameterized FTS5 query.
     pub fn validate(&self) -> Result<()> {
+        if self.filters.album.is_some() && self.filters.album_id.is_some() {
+            return Err(Error::Validation(
+                "Album name and identity filters are mutually exclusive".into(),
+            ));
+        }
+        if self.filters.album_id.is_some_and(|id| id <= 0) {
+            return Err(Error::Validation("Album identity must be positive".into()));
+        }
         if self.query.chars().count() > 500 || self.query.contains(';') || self.query.contains('\0')
         {
             return Err(Error::Validation(
@@ -316,6 +403,28 @@ impl SearchRequest {
         }
         if self.limit == 0 || self.limit > 10_000 {
             return Err(Error::Validation("Search limit must be 1..=10000".into()));
+        }
+        if self.page == Some(0) {
+            return Err(Error::Validation("Search page must be 1 or greater".into()));
+        }
+        if let Some(page) = self.page
+            && page > 1
+            && (page as usize - 1).checked_mul(self.limit).is_none()
+        {
+            return Err(Error::Validation("Search page is too large".into()));
+        }
+        if self.cursor.as_ref().is_some_and(|cursor| {
+            cursor.is_empty() || cursor.len() > 512 || cursor.chars().any(|c| c.is_control())
+        }) {
+            return Err(Error::Validation(
+                "Search cursor is empty, too long, or contains a control character".into(),
+            ));
+        }
+        if matches!(self.scope, SearchScope::Main | SearchScope::Filename) && self.cursor.is_some()
+        {
+            return Err(Error::Validation(
+                "Search cursor requires scope all or path".into(),
+            ));
         }
         for duration in [self.filters.duration_min, self.filters.duration_max]
             .into_iter()
@@ -366,18 +475,97 @@ impl SearchRequest {
             }
             .validate()?;
         }
+        // Album names originate in bounded WAV Metadata. Keep exact names usable even
+        // when they exceed the free-text query's 500-character limit.
+        if self
+            .filters
+            .album
+            .as_ref()
+            .is_some_and(|album| album.len() > 32 * 1024 * 1024 || album.contains('\0'))
+        {
+            return Err(Error::Validation(
+                "Album filter exceeds the Metadata size limit or contains NUL".into(),
+            ));
+        }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchPage {
     pub results: Vec<AudioFile>,
+    /// Exact match count for main/filename search, including empty-query browsing
+    /// and `all` falling back to main when the directory index is unavailable.
+    /// Materialized directory searches (`all`/`path`) with filters, alternate
+    /// sorting or a materialized cursor also retain exact global counts. The
+    /// native unfiltered relevance route counts only observed hits: without a
+    /// cursor this includes the traversed prefix, skipped hits and lookahead;
+    /// with a cursor it includes only the observed suffix after that cursor,
+    /// ignoring the request offset. An exhausted nonzero offset without a cursor
+    /// returns zero with `total_count_exact = false`. An offset never invents
+    /// matches. Use `next_cursor` for native directory continuation.
     pub total_count: u64,
+    /// False means `total_count` is a lower bound, never an exact last-page bound.
+    /// Native directory search marks a terminal cursor page exact for its
+    /// observed suffix; that cursor-local count is not a global match total.
+    /// Older replies omit this field and retain their exact-count semantics.
+    #[serde(default = "search_count_exact_default")]
+    pub total_count_exact: bool,
     pub query: String,
     pub execution_time_ms: f64,
     pub cache_hit: bool,
     pub returned_count: usize,
+    /// Keyset cursor for the next page. Absent on the last page and on `scope=main`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn search_count_exact_default() -> bool {
+    true
+}
+
+impl Default for SearchPage {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+            total_count: 0,
+            total_count_exact: true,
+            query: String::new(),
+            execution_time_ms: 0.0,
+            cache_hit: false,
+            returned_count: 0,
+            next_cursor: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_page_count_tests {
+    use super::*;
+
+    #[test]
+    fn old_replies_default_to_exact_counts_and_lower_bounds_round_trip() {
+        let mut legacy = serde_json::to_value(SearchPage::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("total_count_exact");
+        let old: SearchPage = serde_json::from_value(legacy).unwrap();
+        assert!(old.total_count_exact);
+        let lower = SearchPage {
+            results: vec![AudioFile::from(AudioFileData {
+                id: 1,
+                ..Default::default()
+            })],
+            returned_count: 1,
+            total_count: 2,
+            total_count_exact: false,
+            next_cursor: Some("opaque-next-position".into()),
+            ..Default::default()
+        };
+        let decoded: SearchPage =
+            serde_json::from_slice(&serde_json::to_vec(&lower).unwrap()).unwrap();
+        assert!(!decoded.total_count_exact);
+        assert_eq!(decoded.total_count, 2);
+        assert_eq!(decoded.next_cursor, lower.next_cursor);
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -439,6 +627,10 @@ pub struct ScanProgress {
     pub added: u64,
     pub updated: u64,
     pub unchanged: u64,
+    /// Same-directory vendor tables are scanned after audio headers, including
+    /// incremental scans where only the table has changed. Older servers omit it.
+    #[serde(default)]
+    pub vendor_metadata: vendor_import::VendorScanSummary,
     #[serde(default)]
     pub removed: u64,
     pub errors: u64,
@@ -485,6 +677,116 @@ pub trait DataProvider: Send + Sync {
     fn search_revision(&self) -> Result<Option<u64>> {
         Ok(None)
     }
+    /// Whether directory-segment path search (`scope=all|path`) is usable on this
+    /// provider. Default false; GUI hides「仅路径」and degrades「全部」to main.
+    fn path_search_ready(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Background readiness probe for a path query against an older snapshot.
+    /// A migration refusal retains its retry delay. `false` means the remote index
+    /// is ready but the local snapshot must be refreshed before results are read.
+    fn probe_path_search(&self, _cancel: Arc<AtomicBool>) -> Result<bool> {
+        self.path_search_ready()
+    }
+    /// §7.1 plan for building the schema 9 path index of a local library; `None` when
+    /// nothing is needed (ready, read-only, or a provider without one).
+    fn local_upgrade_plan(&self) -> Result<Option<local_upgrade::LocalUpgradePlan>> {
+        Ok(None)
+    }
+    /// Run or resume that upgrade (§5.2); cancel is checked between batches.
+    fn run_local_upgrade(
+        &self,
+        _cancel: &std::sync::atomic::AtomicBool,
+        _progress: &mut dyn FnMut(local_upgrade::LocalUpgradeProgress),
+    ) -> Result<local_upgrade::LocalUpgradeOutcome> {
+        Err(Error::Validation(
+            "This provider has no local upgrade".into(),
+        ))
+    }
+    /// Whether this provider implements vendor import and permits library management.
+    fn vendor_import_available(&self) -> Result<bool> {
+        Ok(false)
+    }
+    /// Vendor table preview (read-only); remote mode also requires manage permission.
+    fn vendor_import_preview(
+        &self,
+        _file: &std::path::Path,
+    ) -> Result<vendor_import::VendorImportPreview> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Preview multiple tables without modifying the library; options control mapping and matching.
+    fn vendor_import_preview_files(
+        &self,
+        _files: &[std::path::PathBuf],
+        _options: &vendor_import::VendorImportOptions,
+    ) -> Result<vendor_import::VendorImportPreview> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Read a durable preview or its current commit/rollback progress.
+    fn vendor_import_status(&self, _import_id: &str) -> Result<vendor_import::VendorImportStatus> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Recompute matching with explicit mappings or ambiguity confirmations; no library write.
+    fn vendor_import_mapping(
+        &self,
+        _import_id: &str,
+        _options: &vendor_import::VendorImportOptions,
+    ) -> Result<vendor_import::VendorImportPreview> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Page bounded preview rows, including unresolved match candidates.
+    fn vendor_import_rows(
+        &self,
+        _import_id: &str,
+        _offset: u64,
+        _limit: u64,
+    ) -> Result<Vec<vendor_import::VendorRowPreview>> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Page all candidates for an ambiguous preview row without materializing them all.
+    fn vendor_import_candidates(
+        &self,
+        _import_id: &str,
+        _row_id: &str,
+        _offset: u64,
+        _limit: u64,
+    ) -> Result<vendor_import::VendorCandidatePage> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// List import batches for this library only.
+    fn vendor_import_history(&self) -> Result<vendor_import::VendorImportHistory> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Read reusable mappings scoped to this provider's owned library state.
+    fn vendor_import_templates(&self) -> Result<Vec<vendor_import::VendorMappingTemplate>> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Persist an explicitly chosen mapping template without writing audio metadata.
+    fn vendor_import_save_template(
+        &self,
+        _template: &vendor_import::VendorMappingTemplate,
+    ) -> Result<vendor_import::VendorMappingTemplate> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Cancel at a durable batch boundary; completed batches remain resumable or rollbackable.
+    fn vendor_import_cancel(&self, _import_id: &str) -> Result<vendor_import::VendorImportStatus> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    /// Commit a previewed batch; the same key replays the same result.
+    fn vendor_import_commit(
+        &self,
+        _import_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<vendor_import::VendorImportResult> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
+    fn vendor_import_rollback(
+        &self,
+        _import_id: &str,
+    ) -> Result<vendor_import::VendorImportResult> {
+        Err(Error::Validation("Vendor import is not available".into()))
+    }
     fn search(&self, request: &SearchRequest) -> Result<SearchPage>;
     /// Search that can be superseded by a newer GUI request. Providers may additionally
     /// interrupt in-flight work; the default checks cancellation before and after I/O.
@@ -521,6 +823,94 @@ pub trait DataProvider: Send + Sync {
         result
     }
     fn get_audio(&self, id: i64) -> Result<AudioFile>;
+    /// Search-scoped album counts; clear both album filters for cross-navigation.
+    fn album_facets(&self, _request: &SearchRequest) -> Result<Vec<AlbumFacet>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Cancellable shared album aggregation.
+    fn album_facets_cancellable(
+        &self,
+        request: &SearchRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AlbumFacet>> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        self.album_facets(request)
+    }
+    /// Resolve an owned album by its identity within this provider.
+    fn get_album(&self, _id: i64) -> Result<Album> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Indexed semantic lookup when rebinding a personal filter to another library.
+    fn find_album_by_semantic(
+        &self,
+        _kind: AlbumKind,
+        _metadata_key: Option<&str>,
+        _folder_path: Option<&str>,
+    ) -> Result<Option<Album>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Present members of the entire album, ordered by audio ID, bounded to 64.
+    fn album_members(
+        &self,
+        _id: i64,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
+    /// Present members in exactly one indexed parent directory, ordered by audio ID.
+    /// The positive album ID and limit `1..=64` are validated; folder IDs retain
+    /// the full signed range accepted by `get_folder`. This never includes child
+    /// directories or falls back to members elsewhere in the shared album.
+    fn album_members_in_folder(
+        &self,
+        _id: i64,
+        _folder_id: i64,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        Err(Error::Validation(
+            "This provider cannot resolve album members within a directory".into(),
+        ))
+    }
+    /// Present unassigned members whose source path has exactly this parent directory.
+    /// Only records without a folder ID are eligible. Directory identities use source
+    /// path syntax, accept an empty parent for a relative filename, and are bounded
+    /// to 4096 UTF-8 bytes. Results are ordered by audio ID and limited to `1..=64`.
+    fn album_members_in_unassigned_directory(
+        &self,
+        _id: i64,
+        _directory: &str,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<AudioFile>> {
+        Err(Error::Validation(
+            "This provider cannot resolve unassigned album members within a directory".into(),
+        ))
+    }
+    /// Paginate all member identities, including missing records, for local preferences.
+    /// IDs are strictly ascending and the page limit is 1..=4096.
+    fn album_member_ids(
+        &self,
+        _id: i64,
+        _after_audio_id: Option<i64>,
+        _limit: usize,
+        _cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<i64>> {
+        Err(Error::Validation(
+            "This provider has no shared album entities".into(),
+        ))
+    }
     fn folders(&self, parent_id: Option<i64>) -> Result<Vec<Folder>>;
     /// Retrieve one owned folder by its stable identity; absence is `NotFound`.
     /// Providers may implement a direct indexed lookup instead of the tree fallback.
@@ -587,6 +977,13 @@ pub trait DataProvider: Send + Sync {
         format: LibraryExportFormat,
     ) -> Result<TransferReport>;
     fn import_annotations(&self, source: &Path) -> Result<TransferReport>;
+
+    /// How the connected server relates to this client version (newer server, older
+    /// server, schema migration, unknown snapshot formats). `None` (the default) for
+    /// local providers and servers that were not asked. Blocking: call off the UI thread.
+    fn server_upgrade_status(&self) -> Result<Option<server_upgrade::ServerUpgradeStatus>> {
+        Ok(None)
+    }
 
     /// Where this provider's list thumbnail Waveforms come from (doc/api/README.md
     /// §9.1–§9.3). `Unavailable` (the default) hides the list Waveform column.
@@ -717,6 +1114,27 @@ pub fn validate_wav_path(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathB
     Ok(canonical)
 }
 
+/// File types that can be scanned and decoded by the shipped source-audio pipeline.
+pub fn is_supported_audio_extension(path: &Path) -> bool {
+    source_audio_format(path).is_some()
+}
+
+/// Resolve an existing supported audio target before enforcing its configured root.
+/// Use the returned real path for all subsequent I/O, never the unchecked original link.
+pub fn validate_audio_path(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    if !canonical.is_file() || !is_supported_audio_extension(&canonical) {
+        return Err(Error::Validation(
+            "Target must be an existing supported audio file".into(),
+        ));
+    }
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| Error::Validation("Audio parent folder is required".into()))?;
+    validate_scan_root(parent, allowed_roots)?;
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +1220,17 @@ mod tests {
     }
 
     #[test]
+    fn album_filters_reject_nul_and_unbounded_input_without_truncating_declared_names() {
+        let mut request = SearchRequest::default();
+        request.filters.album = Some("名".repeat(1000));
+        assert!(request.validate().is_ok());
+        request.filters.album = Some("name\0suffix".into());
+        assert!(request.validate().is_err());
+        request.filters.album = Some("x".repeat(32 * 1024 * 1024 + 1));
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
     fn a_lone_letter_waits_without_restricting_other_searches() {
         for query in [
             "e",
@@ -860,13 +1289,13 @@ mod tests {
 
     #[test]
     fn audio_dto_ignores_retired_and_unknown_legacy_json_fields() {
-        let file = AudioFile {
+        let file = AudioFile::from(AudioFileData {
             id: 7,
             filename: "owned.wav".into(),
             notes: "retain this annotation".into(),
             attributes: serde_json::json!({"unknown_extension":{"preserved":true}}),
             ..Default::default()
-        };
+        });
         let clean = serde_json::to_value(&file).unwrap();
         let mut legacy = clean.clone();
         legacy["play_count"] = serde_json::json!(17);

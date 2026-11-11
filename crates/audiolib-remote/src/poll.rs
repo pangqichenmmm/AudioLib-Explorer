@@ -461,9 +461,10 @@ mod tests {
                 assert_eq!(check, RevisionCheck::UpToDate { revision: 7 });
                 assert!(check.reachable());
             } else {
-                assert!(
-                    matches!(&check, RevisionCheck::Failed(message) if version == 6 || message.contains(&format!("schema {version}")))
-                );
+                assert!(matches!(&check, RevisionCheck::Failed(message)
+                        if version == 6
+                            || message.contains(&format!("schema {version}"))
+                            || message.contains("format")));
                 assert!(!check.reachable() && !check.update_available());
             }
         }

@@ -1,0 +1,195 @@
+{
+  "bundle_name": "AudioLib Explorer.app",
+  "bundle_identifier": "io.github.freedragonlancer.audiolib-explorer",
+  "minimum_macos": "11.0",
+  "files": [
+    {
+      "source": "MACOS_README.md",
+      "destination": "MACOS_README.md"
+    },
+    {
+      "source": "README.md",
+      "destination": "README.md"
+    },
+    {
+      "source": "README.zh-CN.md",
+      "destination": "README.zh-CN.md"
+    },
+    {
+      "source": "LICENSE",
+      "destination": "LICENSE"
+    },
+    {
+      "source": "THIRD_PARTY.md",
+      "destination": "THIRD_PARTY.md"
+    },
+    {
+      "source": "doc/INDEX.md",
+      "destination": "doc/INDEX.md"
+    },
+    {
+      "source": "doc/Rust_App_Icon.md",
+      "destination": "doc/Rust_App_Icon.md"
+    },
+    {
+      "source": "doc/Rust_Auto_Update.md",
+      "destination": "doc/Rust_Auto_Update.md"
+    },
+    {
+      "source": "doc/Rust_Architecture.md",
+      "destination": "doc/Rust_Architecture.md"
+    },
+    {
+      "source": "doc/Rust_Debug_Reports.md",
+      "destination": "doc/Rust_Debug_Reports.md"
+    },
+    {
+      "source": "doc/Rust_GUI_Search_Performance.md",
+      "destination": "doc/Rust_GUI_Search_Performance.md"
+    },
+    {
+      "source": "doc/Rust_Known_Issues.md",
+      "destination": "doc/Rust_Known_Issues.md"
+    },
+    {
+      "source": "doc/Rust_Library_Management.md",
+      "destination": "doc/Rust_Library_Management.md"
+    },
+    {
+      "source": "doc/Rust_Release_Notes.md",
+      "destination": "doc/Rust_Release_Notes.md"
+    },
+    {
+      "source": "doc/Rust_Remote_Mode.md",
+      "destination": "doc/Rust_Remote_Mode.md"
+    },
+    {
+      "source": "doc/Rust_Review_Fixes.md",
+      "destination": "doc/Rust_Review_Fixes.md"
+    },
+    {
+      "source": "doc/Rust_Scan_Search_Performance.md",
+      "destination": "doc/Rust_Scan_Search_Performance.md"
+    },
+    {
+      "source": "doc/Rust_Spectral_Audition.md",
+      "destination": "doc/Rust_Spectral_Audition.md"
+    },
+    {
+      "source": "doc/Rust_Validation.md",
+      "destination": "doc/Rust_Validation.md"
+    },
+    {
+      "source": "doc/Rust_Upgrade_Recovery.md",
+      "destination": "doc/Rust_Upgrade_Recovery.md"
+    },
+    {
+      "source": "doc/Rust_Versioning.md",
+      "destination": "doc/Rust_Versioning.md"
+    },
+    {
+      "source": "doc/Rust_Wav_Metadata.md",
+      "destination": "doc/Rust_Wav_Metadata.md"
+    },
+    {
+      "source": "doc/api/README.md",
+      "destination": "doc/api/README.md"
+    },
+    {
+      "source": "doc/api/Library_Migration_Compatibility.md",
+      "destination": "doc/api/Library_Migration_Compatibility.md"
+    },
+    {
+      "source": "doc/api/Search_Storage_B.md",
+      "destination": "doc/api/Search_Storage_B.md"
+    },
+    {
+      "source": "doc/api/Search_Storage_B_Validation.md",
+      "destination": "doc/api/Search_Storage_B_Validation.md"
+    },
+    {
+      "source": "doc/api/Search_Storage_B_Integrated_Validation.md",
+      "destination": "doc/api/Search_Storage_B_Integrated_Validation.md"
+    },
+    {
+      "source": "doc/api/Implementation_B_Status.md",
+      "destination": "doc/api/Implementation_B_Status.md"
+    },
+    {
+      "source": "doc/api/Search_Storage_B_CR.md",
+      "destination": "doc/api/Search_Storage_B_CR.md"
+    },
+    {
+      "source": "doc/api/Schema_V6_Iteration.md",
+      "destination": "doc/api/Schema_V6_Iteration.md"
+    },
+    {
+      "source": "doc/api/Schema_V6_Column_Audit.md",
+      "destination": "doc/api/Schema_V6_Column_Audit.md"
+    },
+    {
+      "source": "doc/Technical_Architecture.md",
+      "destination": "doc/Technical_Architecture.md"
+    },
+    {
+      "source": "doc/Security_Guidelines.md",
+      "destination": "doc/Security_Guidelines.md"
+    },
+    {
+      "source": "doc/Testing_Strategy.md",
+      "destination": "doc/Testing_Strategy.md"
+    },
+    {
+      "source": "doc/AudioLib_Explorer_PRD.md",
+      "destination": "doc/AudioLib_Explorer_PRD.md"
+    },
+    {
+      "source": "doc/AudioLib_Explorer Requirement.md",
+      "destination": "doc/AudioLib_Explorer Requirement.md"
+    },
+    {
+      "source": "doc/API_Design.md",
+      "destination": "doc/API_Design.md"
+    },
+    {
+      "source": "doc/Database_Schema_Changes.md",
+      "destination": "doc/Database_Schema_Changes.md"
+    },
+    {
+      "source": "doc/UI_Color_Scheme_Guide.md",
+      "destination": "doc/UI_Color_Scheme_Guide.md"
+    },
+    {
+      "source": "doc/archive/Code_Optimization_Proposal.md",
+      "destination": "doc/archive/Code_Optimization_Proposal.md"
+    },
+    {
+      "source": "doc/archive/Cross_Index_Implementation.md",
+      "destination": "doc/archive/Cross_Index_Implementation.md"
+    },
+    {
+      "source": "doc/archive/Phase1_Implementation_Guide.md",
+      "destination": "doc/archive/Phase1_Implementation_Guide.md"
+    },
+    {
+      "source": "doc/archive/Phase2_Planning_Overview.md",
+      "destination": "doc/archive/Phase2_Planning_Overview.md"
+    },
+    {
+      "source": "doc/archive/UI_Redesign_Proposal.md",
+      "destination": "doc/archive/UI_Redesign_Proposal.md"
+    },
+    {
+      "source": "resources/audio_terms.txt",
+      "destination": "resources/audio_terms.txt"
+    },
+    {
+      "source": "resources/icons/AudioLibExplorer.icns",
+      "destination": "AudioLibExplorer.icns"
+    },
+    {
+      "source": "config/rust_settings.example.json",
+      "destination": "config/rust_settings.example.json"
+    }
+  ]
+}

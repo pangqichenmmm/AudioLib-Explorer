@@ -23,6 +23,12 @@ page. It never modifies audio files.
 - `/audio/{id}/preview` for low-bandwidth playback: in-process PCM decimation for WAV
   (`codec=pcm`) and an optional ffmpeg FLAC transcode (`codec=flac`).
 - `/audio/{id}/waveform` with an on-disk LRU cache.
+- `/albums/{id}/artwork` returns a shared album's embedded JPEG or PNG (optional
+  `?side=`), bound to library identity and album namespace with the
+  `album_entity_artwork` capability. The compatible `/audio/{id}/artwork` retains
+  its per-audio meaning. Image bytes stay outside SQLite; a cache lives in
+  `<library directory>/artwork`. Upgrade schema-8 clients and servers together and
+  retain the rollback database. See [shared albums and storage](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md).
 - Metadata writes, play counts, remote scans (start/pause/resume/cancel), record and folder
   removal (`manage_mode` can restrict them).
 - Token authentication with three modes (`off`, `external`, `all`), tokens generated on the
@@ -31,9 +37,26 @@ page. It never modifies audio files.
 
 ## Download a prebuilt server
 
-[GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) provide Windows x64 ZIP and Linux x64 GNU tar.gz archives with SHA256 files. Verify the checksum, extract, then use the executable at the archive root with your own configuration (`--config <path>`). Public configuration examples are under `server/audiolib-server/`; the Linux archive is built on Ubuntu 22.04. Keep your existing library, roots, configuration and credentials when upgrading. See the [deployment guide](deploy/README.md) for installation and rollback. Other platforms can build from source below.
+[GitHub Releases](https://github.com/Freedragonlancer/AudioLib-Explorer/releases) provide macOS arm64 and, from 0.8.4, Linux x64 GNU server archives with SHA256 files. Version 0.8.4 also includes Docker amd64/arm64 offline images. Verify the checksum before extracting a native package or loading an image. Native archives keep the executable at their root and public configuration examples under `server/audiolib-server/`; Linux packages use Debian 12 as their GNU libc build baseline. Keep existing libraries, roots, configuration and credentials when upgrading. See [Linux/Docker delivery](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Linux_Docker_Release.md) and the [deployment guide](deploy/README.md). From 0.8.5 (first included version) a prebuilt Windows x64 server ZIP is provided (`AudioLibServer-<tag>-win-x64.zip`); earlier versions and source builds remain available. Standalone Linux arm64 servers build from source.
 
 ## Quick start: build from source
+
+The next large release uses native server package layout 2: `audiolib-server` and
+`audiolib-migrate` are siblings (`.exe` on Windows); Docker images retain both under
+`/opt/audiolibserver`. The migration tool has JSON `status`, `start` and `rollback`
+commands with an explicit `--db` path, rather than a `--version` command. Production
+packages exclude test hooks. Their inventory and acceptance reports bind both hashes.
+
+This layout requires a **manual server bootstrap** from pre-0.9 installations. The
+frozen old updater genuinely rejects the new migration binary; package metadata states
+`automatic_upgrade_compatible=false`, `manual_bootstrap_required=true`, layout revision 2
+and minimum published updater version `0.9.0`. The candidate program version is frozen
+at 0.9.0 but remains unpublished. Preserve the library, configuration and rollback backups, install
+the complete native payload while the old server is gracefully stopped, and follow the
+client/server migration runbook before explicitly migrating the library. Offline recovery
+uses the packaged tool, for example `audiolib-migrate status --db /path/to/library.db`;
+`start` or `rollback` targets that same explicitly selected library. Docker upgrades replace
+the image and retain its data mounts. This adds no archive or release asset.
 
 The repository root `rust-toolchain.toml` and `.cargo/config.toml` default to a **Windows**
 target, so always pass an explicit `--target` for your platform. The server builds
@@ -42,8 +65,8 @@ target, so always pass an explicit `--target` for your platform. The server buil
 **macOS (Apple silicon)** — `server/rust-toolchain.toml` pins 1.97.1 for builds inside `server/`:
 
 ```sh
-cargo build -p audiolib-server --release --target aarch64-apple-darwin
-# binary: target/aarch64-apple-darwin/release/audiolib-server
+cargo build -p audiolib-server -p audiolib-db --bin audiolib-server --bin audiolib-migrate --release --locked --no-default-features --target aarch64-apple-darwin
+# binaries: target/aarch64-apple-darwin/release/{audiolib-server,audiolib-migrate}
 ```
 
 **Linux (Debian/Ubuntu)**:
@@ -52,10 +75,10 @@ cargo build -p audiolib-server --release --target aarch64-apple-darwin
 sudo apt-get install -y build-essential pkg-config clang libclang-dev
 export RUSTUP_TOOLCHAIN=1.97.1          # override the repository's Windows toolchain file
 rustup toolchain install 1.97.1
-cargo build -p audiolib-server --release --locked --target x86_64-unknown-linux-gnu
+cargo build -p audiolib-server -p audiolib-db --bin audiolib-server --bin audiolib-migrate --release --locked --no-default-features --target x86_64-unknown-linux-gnu
 #   or --target aarch64-unknown-linux-gnu on ARM64
 cargo test  -p audiolib-server --locked --target x86_64-unknown-linux-gnu   # optional
-# binary: target/<target>/release/audiolib-server
+# binaries: target/<target>/release/{audiolib-server,audiolib-migrate}
 ```
 
 Verified: the Linux build and the server test suite pass in an aarch64 container
@@ -207,6 +230,7 @@ rollback, backup and health check).
 
 `/health`, `/library`, `/library/snapshot`, `/roots`, `POST /roots/{name}/check`,
 `/audio/{id}`, `/audio/{id}/waveform`, `/audio/{id}/preview`, `/audio/{id}/stream`,
+`/audio/{id}/artwork`,
 metadata writes (`PATCH /audio/{id}/metadata`, `POST /audio/metadata/batch`,
 deprecated no-op `POST /audio/{id}/plays`), remote scans (`POST /scans`, `GET /scans/current`,
 `GET /scans/{id}`, `POST /scans/{id}/pause|resume|cancel`), history

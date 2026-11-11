@@ -6,15 +6,45 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Catalog version identifies capability semantics independently of application SemVer.
-pub const CATALOG_REVISION: u32 = 1;
+pub const CATALOG_REVISION: u32 = 2;
 /// Plan B's completed business schema.
-pub const TARGET_SCHEMA: u32 = 6;
+pub const TARGET_SCHEMA: u32 = 8;
+/// Explicit server migration target; ordinary local writers retain [`TARGET_SCHEMA`].
+pub const SERVER_TARGET_SCHEMA: u32 = 9;
 /// Completed tokenizer encoding; 4 in an old live upgrade is a temporary marker.
 pub const TOKENIZATION_REVISION: u32 = 3;
 /// Format identifiers are exact sets, not a promise that all lower integers work.
-pub const PLAN_B_FORMAT: &str = "ale-s6-cld1-t3-m2-p1";
-/// Earlier unpublished Plan B retained the last playback timestamp; read-only source.
-pub const PLAN_B_INITIAL_FORMAT: &str = "ale-s6-cld1-t3-m2-p0";
+pub const PLAN_B_FORMAT: &str = "ale-s8-cld1-t3-m2-p1-a1";
+/// Schema 9 directory-segment path index. `sd1` is that index's revision;
+/// the retired per-file path suffix `sp1` is not a format id.
+pub const PLAN_B_V9_FORMAT: &str = "ale-s9-cld1-t3-m2-p1-a1-sd1";
+/// Schema 8 with explicitly required MP3, AIFF and BWF-alias source support.
+pub const PLAN_B_AUDIO_FORMAT: &str = "ale-s8-cld1-t3-m2-p1-a1-af1";
+/// Schema 9 with the same required source-audio capability.
+pub const PLAN_B_V9_AUDIO_FORMAT: &str = "ale-s9-cld1-t3-m2-p1-a1-sd1-af1";
+/// Durable source support, activated atomically with the first affected audio write.
+pub const AUDIO_SOURCES_FEATURE: &str = "audio_sources";
+/// Revision understood by this build; source support is separate from decoding success.
+pub const AUDIO_SOURCES_REVISION: u32 = 1;
+/// Experimental schema-8 snapshots with compressed Metadata remain read-only inputs.
+pub const PLAN_B_V8_COMPRESSED_FORMAT: &str = "ale-s8-cld1-t3-m2-p1-a1-z1";
+/// Schema-7 Plan B used per-record album names and uncompressed Metadata.
+pub const PLAN_B_V7_FORMAT: &str = "ale-s7-cld1-t3-m2-p1";
+/// Earlier schema-7 Plan B retained the last playback timestamp; read-only source.
+pub const PLAN_B_V7_INITIAL_FORMAT: &str = "ale-s7-cld1-t3-m2-p0";
+/// Compatibility alias for the first schema-7 format, never a schema-8 target.
+pub const PLAN_B_INITIAL_FORMAT: &str = PLAN_B_V7_INITIAL_FORMAT;
+/// Schema-6 libraries stay readable; the album column only affects writable opens.
+pub const PLAN_B_V6_FORMAT: &str = "ale-s6-cld1-t3-m2-p1";
+pub const PLAN_B_V6_INITIAL_FORMAT: &str = "ale-s6-cld1-t3-m2-p0";
+/// Persistent shared-album representation required by the schema-8 format.
+pub const ALBUM_ENTITIES_FEATURE: &str = "album_entities";
+/// Revision of the persistent shared-album representation.
+pub const ALBUM_ENTITIES_REVISION: u32 = 1;
+/// Persistent Metadata codec understood only for experimental compressed snapshots.
+pub const METADATA_STORAGE_FEATURE: &str = "metadata_storage";
+/// Revision of the persistent lossless Metadata encoding.
+pub const METADATA_STORAGE_REVISION: u32 = 1;
 /// Snapshot protocol is separate from both schema and application versions.
 pub const API_PROTOCOL: &str = "api/v1";
 /// Minimum engine with corrected contentless-delete aggregate statistics.
@@ -89,6 +119,7 @@ impl LibraryFormat {
                 ("tokenization", TOKENIZATION_REVISION),
                 ("search_storage", 1),
                 ("play_history_retired", 2),
+                (ALBUM_ENTITIES_FEATURE, ALBUM_ENTITIES_REVISION),
             ]
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
@@ -98,8 +129,55 @@ impl LibraryFormat {
         }
     }
 
+    // Fixed historical feature maps must not inherit features added to target().
+    fn prior_plan_b(schema_version: u32, play_history_retired: u32) -> Self {
+        Self {
+            schema_version,
+            storage: SearchStorage::ContentlessDelete,
+            features: [
+                ("stable_audio_ids", 1),
+                ("foreign_key_indexes", 1),
+                ("search_indexes", 1),
+                ("tokenization", 3),
+                ("search_storage", 1),
+                ("play_history_retired", play_history_retired),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+            source_search_revision: Some(2),
+            source_tags_revision: Some(2),
+        }
+    }
+
+    // Preserve the original experimental descriptor independently of later targets.
+    fn prior_compressed_plan_b() -> Self {
+        let mut format = Self::prior_plan_b(8, 2);
+        format.features.insert(ALBUM_ENTITIES_FEATURE.into(), 1);
+        format.features.insert(METADATA_STORAGE_FEATURE.into(), 1);
+        format
+    }
+
     /// Exact completed snapshot format; incomplete/unknown combinations have no ID.
     pub fn snapshot_format_id(&self) -> Option<String> {
+        if let Some(revision) = self.features.get(AUDIO_SOURCES_FEATURE) {
+            if *revision != AUDIO_SOURCES_REVISION {
+                return None;
+            }
+            let mut base = self.clone();
+            base.features.remove(AUDIO_SOURCES_FEATURE);
+            return match base.snapshot_format_id()?.as_str() {
+                PLAN_B_FORMAT => Some(PLAN_B_AUDIO_FORMAT.into()),
+                PLAN_B_V9_FORMAT => Some(PLAN_B_V9_AUDIO_FORMAT.into()),
+                _ => None,
+            };
+        }
+        let mut directory_only = Self::server_schema9();
+        directory_only.features.remove("vorbis_tags");
+        directory_only.features.remove("vendor_metadata");
+        if self == &Self::server_schema9() || self == &directory_only {
+            return Some(PLAN_B_V9_FORMAT.into());
+        }
         if unknown_requirement(self).is_some()
             || self.features.get("tokenization") != Some(&TOKENIZATION_REVISION)
             || self.source_search_revision != Some(2)
@@ -110,21 +188,66 @@ impl LibraryFormat {
         match (&self.storage, self.schema_version) {
             (SearchStorage::ExternalContent, schema @ 3..=5)
                 if !self.features.contains_key("search_storage")
-                    && !self.features.contains_key("play_history_retired") =>
+                    && !self.features.contains_key("play_history_retired")
+                    && !self.features.contains_key(ALBUM_ENTITIES_FEATURE)
+                    && !self.features.contains_key(METADATA_STORAGE_FEATURE) =>
             {
                 Some(format!("ale-s{schema}-ext-t3-m2"))
             }
             (SearchStorage::ContentlessDelete, TARGET_SCHEMA) => {
                 if self == &Self::target() {
                     Some(PLAN_B_FORMAT.into())
+                } else if self == &Self::prior_compressed_plan_b() {
+                    Some(PLAN_B_V8_COMPRESSED_FORMAT.into())
                 } else {
-                    let mut initial = Self::target();
-                    initial.features.insert("play_history_retired".into(), 1);
-                    (self == &initial).then(|| PLAN_B_INITIAL_FORMAT.into())
+                    None
+                }
+            }
+            // Old snapshots remain readable with their exact, original feature maps.
+            (SearchStorage::ContentlessDelete, schema @ 6..=7) => {
+                if self == &Self::prior_plan_b(schema, 2) {
+                    Some(if schema == 6 {
+                        PLAN_B_V6_FORMAT.into()
+                    } else {
+                        PLAN_B_V7_FORMAT.into()
+                    })
+                } else if self == &Self::prior_plan_b(schema, 1) {
+                    Some(if schema == 6 {
+                        PLAN_B_V6_INITIAL_FORMAT.into()
+                    } else {
+                        PLAN_B_V7_INITIAL_FORMAT.into()
+                    })
+                } else {
+                    None
                 }
             }
             _ => None,
         }
+    }
+
+    /// Explicit server migration target. Ordinary local writers still target schema 8.
+    pub fn server_schema9() -> Self {
+        let mut format = Self::target();
+        format.schema_version = SERVER_TARGET_SCHEMA;
+        format.source_search_revision = Some(3);
+        format.features.insert("search_path".into(), 1);
+        format.features.insert("vorbis_tags".into(), 1);
+        format.features.insert("vendor_metadata".into(), 1);
+        format
+    }
+
+    /// Require extended source-audio support without changing the base storage schema.
+    /// New empty libraries deliberately keep [`Self::target`] unchanged.
+    pub fn with_audio_sources(mut self) -> Self {
+        self.features
+            .insert(AUDIO_SOURCES_FEATURE.into(), AUDIO_SOURCES_REVISION);
+        self
+    }
+
+    /// The exact schema-8 formats accepted by ordinary local writers.
+    /// Schema 9 remains exclusive to the dedicated server writer.
+    pub fn is_local_writable(&self) -> bool {
+        self == &Self::target() || self == &Self::target().with_audio_sources()
     }
 }
 
@@ -238,7 +361,13 @@ fn decision(
 fn unknown_requirement(format: &LibraryFormat) -> Option<&str> {
     for (key, revision) in &format.features {
         let maximum = match key.as_str() {
-            "stable_audio_ids" | "foreign_key_indexes" | "search_indexes" | "search_storage" => 1,
+            "stable_audio_ids"
+            | "foreign_key_indexes"
+            | "search_indexes"
+            | "search_storage"
+            | ALBUM_ENTITIES_FEATURE
+            | METADATA_STORAGE_FEATURE => 1,
+            AUDIO_SOURCES_FEATURE => AUDIO_SOURCES_REVISION,
             "play_history_retired" => 2,
             "tokenization" => TOKENIZATION_REVISION,
             _ => return Some(key),
@@ -270,6 +399,31 @@ pub fn assess_library(
     }
     // Future formats cannot be diagnosed as corrupt merely because this tool
     // does not know their new columns, protocols or feature semantics.
+    if format.schema_version == 9 {
+        // Schema 9 is an explicit server format. Reading a completed snapshot
+        // does not grant the ordinary local writer a route to that format.
+        if !matches!(
+            format.snapshot_format_id().as_deref(),
+            Some(PLAN_B_V9_FORMAT | PLAN_B_V9_AUDIO_FORMAT)
+        ) || evidence.pending.is_some()
+            || access == LibraryAccess::Write
+        {
+            return decision(None, Blocked, vec![Reason::ToolUpgradeRequired]);
+        }
+        if evidence.business_integrity == Some(false) {
+            return decision(
+                Some(RebuildRequired),
+                Blocked,
+                vec![Reason::BusinessDataUnrecoverable],
+            );
+        }
+        return if evidence.search_ready {
+            decision(Some(Compatible), Ready, vec![])
+        } else {
+            // No schema-8 recipe may repair or reinterpret schema-9 data.
+            decision(None, Blocked, vec![Reason::InvalidFormat])
+        };
+    }
     if format.schema_version > TARGET_SCHEMA {
         return decision(None, Blocked, vec![Reason::ToolUpgradeRequired]);
     }
@@ -280,7 +434,9 @@ pub fn assess_library(
                 && (1..=5).contains(&format.schema_version)
                 && format.features.get("tokenization") == Some(&4))
                 || (pending.protocol == "search_storage"
-                    && pending.target == TARGET_SCHEMA
+                    // Retain every known storage-protocol target, including jobs
+                    // started before the schema-7 album accelerator.
+                    && (6..=TARGET_SCHEMA).contains(&pending.target)
                     && (3..=TARGET_SCHEMA).contains(&format.schema_version)));
         // Tokenization=4 is permitted only within the existing rev-3 protocol.
         let mut completed_format = format.clone();
@@ -320,7 +476,7 @@ pub fn assess_library(
         return decision(None, Blocked, vec![Reason::InvalidFormat]);
     }
     if evidence.search_ready && format.snapshot_format_id().is_some() {
-        if access == LibraryAccess::Read || format == &LibraryFormat::target() {
+        if access == LibraryAccess::Read || format.is_local_writable() {
             return decision(Some(Compatible), Ready, vec![]);
         }
         return decision(Some(Migratable), Ready, vec![Reason::StorageUpgrade]);
@@ -409,10 +565,30 @@ pub const PROTOCOL: ProtocolRange = ProtocolRange { min: 1, max: 1 };
 /// Known-bad application versions. Intentionally empty; add an exact version only for a
 /// published release that corrupts peers.
 pub const BLOCKED_VERSIONS: &[&str] = &[];
+/// Optional `GET /audio/{id}/artwork` cover endpoint. A peer that omits it only
+/// disables that request; a missing optional feature never refuses sync.
+pub const ALBUM_ARTWORK_FEATURE: &str = "album_artwork";
+/// Revision of [`ALBUM_ARTWORK_FEATURE`] implemented by this build.
+pub const ALBUM_ARTWORK_REVISION: u32 = 1;
+/// Optional album-entity artwork endpoint; absent peers retain per-audio artwork.
+pub const ALBUM_ENTITY_ARTWORK_FEATURE: &str = "album_entity_artwork";
+/// Revision of [`ALBUM_ENTITY_ARTWORK_FEATURE`] implemented by this build.
+pub const ALBUM_ENTITY_ARTWORK_REVISION: u32 = 1;
+/// Optional indexed-folder or NULL-source-parent artwork context; no DB-format change.
+pub const ALBUM_FOLDER_ARTWORK_FEATURE: &str = "album_folder_artwork";
+/// Revision of [`ALBUM_FOLDER_ARTWORK_FEATURE`] implemented by this build.
+pub const ALBUM_FOLDER_ARTWORK_REVISION: u32 = 1;
 /// Optional features and revisions this build implements on both client and server.
 pub const FEATURES: &[(&str, u32)] = &[
+    (ALBUM_ARTWORK_FEATURE, ALBUM_ARTWORK_REVISION),
+    (ALBUM_ENTITY_ARTWORK_FEATURE, ALBUM_ENTITY_ARTWORK_REVISION),
+    (ALBUM_FOLDER_ARTWORK_FEATURE, ALBUM_FOLDER_ARTWORK_REVISION),
+    (ALBUM_ENTITIES_FEATURE, ALBUM_ENTITIES_REVISION),
     ("list_waveform_jobs", 1),
     ("list_waveforms", 1),
+    ("search_path", 1),
+    ("vendor_metadata", 1),
+    ("vorbis_tags", 1),
     ("waveform_bundle_strong_etag", 1),
 ];
 /// Accepted-range shape kept for peers that still do range checks.
@@ -423,8 +599,8 @@ pub const PEER_APPLICATION_RANGES: &[&str] = &[">=0.6.0"];
 pub const SNAPSHOT_SCHEMA_MAX_HEADER: &str = "x-audiolib-snapshot-schema-max";
 pub const SEARCH_STORAGE_MAX_HEADER: &str = "x-audiolib-search-storage-max";
 pub const TOKENIZATION_MAX_HEADER: &str = "x-audiolib-tokenization-max";
-/// Highest schema the client reads.
-pub const SNAPSHOT_SCHEMA_MAX: u32 = TARGET_SCHEMA;
+/// Highest schema the client will accept on a snapshot download (s9 readable; writes stay at TARGET_SCHEMA).
+pub const SNAPSHOT_SCHEMA_MAX: u32 = 9;
 /// Highest search storage revision the client reads (matches `LibraryFormat::target()`).
 pub const SEARCH_STORAGE_MAX: u32 = 1;
 /// Highest tokenization revision the client reads.
@@ -542,11 +718,18 @@ pub fn compatibility_manifest() -> CompatibilityManifest {
             "ale-s3-ext-t3-m2".into(),
             "ale-s4-ext-t3-m2".into(),
             "ale-s5-ext-t3-m2".into(),
-            PLAN_B_INITIAL_FORMAT.into(),
+            PLAN_B_V6_INITIAL_FORMAT.into(),
+            PLAN_B_V6_FORMAT.into(),
+            PLAN_B_V7_INITIAL_FORMAT.into(),
+            PLAN_B_V7_FORMAT.into(),
+            PLAN_B_V8_COMPRESSED_FORMAT.into(),
             PLAN_B_FORMAT.into(),
+            PLAN_B_V9_FORMAT.into(),
+            PLAN_B_AUDIO_FORMAT.into(),
+            PLAN_B_V9_AUDIO_FORMAT.into(),
         ],
-        database_write_formats: vec![PLAN_B_FORMAT.into()],
-        migration_source_schemas: vec![3, 4, 5, TARGET_SCHEMA],
+        database_write_formats: vec![PLAN_B_FORMAT.into(), PLAN_B_AUDIO_FORMAT.into()],
+        migration_source_schemas: (3..=TARGET_SCHEMA).collect(),
         migration_target_format: PLAN_B_FORMAT.into(),
         migration_protocols: [("search_text".into(), 1), ("search_storage".into(), 1)]
             .into_iter()
@@ -589,6 +772,37 @@ pub fn peer_versions_compatible(
 mod tests {
     use super::*;
 
+    #[test]
+    fn completed_schema9_is_readable_but_never_a_local_write_or_repair_target() {
+        let mut proof = evidence();
+        let full = LibraryFormat::server_schema9();
+        let mut directory_only = full.clone();
+        directory_only.features.remove("vorbis_tags");
+        directory_only.features.remove("vendor_metadata");
+        for format in [full.clone(), directory_only] {
+            assert!(assess_library(&format, &proof, LibraryAccess::Read).direct_use);
+            let writable = assess_library(&format, &proof, LibraryAccess::Write);
+            assert!(!writable.direct_use);
+            assert_eq!(writable.execution_state, ExecutionState::Blocked);
+        }
+        proof.search_ready = false;
+        let incomplete = assess_library(&full, &proof, LibraryAccess::Read);
+        assert_eq!(incomplete.execution_state, ExecutionState::Blocked);
+        assert_ne!(
+            incomplete.disposition,
+            Some(MigrationDisposition::Migratable)
+        );
+        proof.search_ready = true;
+        for feature in ["search_path", "vendor_metadata", "vorbis_tags"] {
+            let mut future = full.clone();
+            future.features.insert(feature.into(), 2);
+            assert!(!assess_library(&future, &proof, LibraryAccess::Read).direct_use);
+        }
+        let mut partial = full;
+        partial.features.remove("vendor_metadata");
+        assert!(!assess_library(&partial, &proof, LibraryAccess::Read).direct_use);
+    }
+
     fn evidence() -> MigrationEvidence {
         MigrationEvidence {
             identified_library: true,
@@ -601,8 +815,7 @@ mod tests {
 
     #[test]
     fn read_compatibility_does_not_grant_legacy_write_compatibility() {
-        let mut format = LibraryFormat::target();
-        format.schema_version = 5;
+        let mut format = LibraryFormat::prior_plan_b(5, 2);
         format.storage = SearchStorage::ExternalContent;
         format.features.remove("search_storage");
         format.features.remove("play_history_retired");
@@ -617,9 +830,8 @@ mod tests {
     }
 
     #[test]
-    fn prior_schema6_requires_timestamp_retirement_for_writes() {
-        let mut initial = LibraryFormat::target();
-        initial.features.insert("play_history_retired".into(), 1);
+    fn prior_schema7_requires_timestamp_retirement_for_writes() {
+        let mut initial = LibraryFormat::prior_plan_b(7, 1);
         assert_eq!(
             initial.snapshot_format_id().as_deref(),
             Some(PLAN_B_INITIAL_FORMAT)
@@ -643,8 +855,243 @@ mod tests {
     }
 
     #[test]
+    fn schema6_and_7_keep_their_original_feature_maps_and_format_ids() {
+        let manifest = compatibility_manifest();
+        for (schema, retirement, expected) in [
+            (6, 1, PLAN_B_V6_INITIAL_FORMAT),
+            (6, 2, PLAN_B_V6_FORMAT),
+            (7, 1, PLAN_B_V7_INITIAL_FORMAT),
+            (7, 2, PLAN_B_V7_FORMAT),
+        ] {
+            // This is a historical wire fixture, intentionally independent of target().
+            let format: LibraryFormat = serde_json::from_value(serde_json::json!({
+                "schema_version": schema,
+                "storage": "contentless_delete",
+                "features": {
+                    "stable_audio_ids": 1,
+                    "foreign_key_indexes": 1,
+                    "search_indexes": 1,
+                    "tokenization": 3,
+                    "search_storage": 1,
+                    "play_history_retired": retirement,
+                },
+                "source_search_revision": 2,
+                "source_tags_revision": 2,
+            }))
+            .unwrap();
+            assert_eq!(format.snapshot_format_id().as_deref(), Some(expected));
+            assert!(
+                manifest
+                    .snapshot_read_formats
+                    .iter()
+                    .any(|id| id == expected)
+            );
+            assert!(assess_library(&format, &evidence(), LibraryAccess::Read).direct_use);
+            assert_eq!(
+                assess_library(&format, &evidence(), LibraryAccess::Write).reasons,
+                vec![CompatibilityReason::StorageUpgrade]
+            );
+            for feature in [ALBUM_ENTITIES_FEATURE, METADATA_STORAGE_FEATURE] {
+                let mut mixed = format.clone();
+                mixed.features.insert(feature.into(), 1);
+                assert_eq!(mixed.snapshot_format_id(), None);
+            }
+        }
+        assert_eq!(PLAN_B_INITIAL_FORMAT, PLAN_B_V7_INITIAL_FORMAT);
+    }
+
+    #[test]
+    fn schema8_plain_target_requires_albums_and_keeps_metadata_as_text() {
+        let target = LibraryFormat::target();
+        assert_eq!(target.schema_version, 8);
+        assert_eq!(target.snapshot_format_id().as_deref(), Some(PLAN_B_FORMAT));
+        assert!(!target.features.contains_key(METADATA_STORAGE_FEATURE));
+        assert_eq!(target.features.get(ALBUM_ENTITIES_FEATURE), Some(&1));
+        for revision in [None, Some(0), Some(2)] {
+            let mut incomplete = target.clone();
+            if let Some(revision) = revision {
+                incomplete
+                    .features
+                    .insert(ALBUM_ENTITIES_FEATURE.into(), revision);
+            } else {
+                incomplete.features.remove(ALBUM_ENTITIES_FEATURE);
+            }
+            assert_eq!(incomplete.snapshot_format_id(), None);
+            assert!(!assess_library(&incomplete, &evidence(), LibraryAccess::Read).direct_use);
+        }
+        let mut p0 = target;
+        p0.features.insert("play_history_retired".into(), 1);
+        assert_eq!(p0.snapshot_format_id(), None);
+    }
+
+    #[test]
+    fn experimental_compressed_schema8_is_an_exact_read_only_source() {
+        // Captured wire requirements must not inherit the current target's map.
+        let legacy: LibraryFormat = serde_json::from_value(serde_json::json!({
+            "schema_version": 8,
+            "storage": "contentless_delete",
+            "features": {
+                "stable_audio_ids": 1, "foreign_key_indexes": 1, "search_indexes": 1,
+                "tokenization": 3, "search_storage": 1, "play_history_retired": 2,
+                "album_entities": 1, "metadata_storage": 1,
+            },
+            "source_search_revision": 2, "source_tags_revision": 2,
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.snapshot_format_id().as_deref(),
+            Some(PLAN_B_V8_COMPRESSED_FORMAT)
+        );
+        let descriptor = SnapshotFormat {
+            id: PLAN_B_V8_COMPRESSED_FORMAT.into(),
+            format: legacy.clone(),
+        };
+        let manifest = compatibility_manifest();
+        assert!(descriptor.is_readable_by(&manifest));
+        assert!(assess_library(&legacy, &evidence(), LibraryAccess::Read).direct_use);
+        let write = assess_library(&legacy, &evidence(), LibraryAccess::Write);
+        assert!(!write.direct_use);
+        assert_eq!(write.disposition, Some(MigrationDisposition::Migratable));
+        assert_eq!(write.reasons, vec![CompatibilityReason::StorageUpgrade]);
+        assert!(!manifest.database_write_formats.contains(&descriptor.id));
+        for revision in [0, 2] {
+            let mut invalid = legacy.clone();
+            invalid
+                .features
+                .insert(METADATA_STORAGE_FEATURE.into(), revision);
+            assert_eq!(invalid.snapshot_format_id(), None);
+            assert!(!assess_library(&invalid, &evidence(), LibraryAccess::Read).direct_use);
+        }
+    }
+
+    #[test]
+    fn external_formats_do_not_admit_schema8_storage_features() {
+        for schema in 3..=5 {
+            let mut format = LibraryFormat::prior_plan_b(schema, 2);
+            format.storage = SearchStorage::ExternalContent;
+            format.features.remove("search_storage");
+            format.features.remove("play_history_retired");
+            assert_eq!(
+                format.snapshot_format_id(),
+                Some(format!("ale-s{schema}-ext-t3-m2"))
+            );
+            for feature in [ALBUM_ENTITIES_FEATURE, METADATA_STORAGE_FEATURE] {
+                let mut mixed = format.clone();
+                mixed.features.insert(feature.into(), 1);
+                assert_eq!(mixed.snapshot_format_id(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn known_storage_jobs_remain_resumable_across_schema_targets() {
+        let format = LibraryFormat::prior_plan_b(6, 2);
+        let mut proof = evidence();
+        for target in [6, 7, 8] {
+            proof.pending = Some(PendingMigration {
+                protocol: "search_storage".into(),
+                revision: 1,
+                target,
+            });
+            assert_eq!(
+                assess_library(&format, &proof, LibraryAccess::Write).reasons,
+                vec![CompatibilityReason::ResumeRequired]
+            );
+        }
+        proof.pending.as_mut().unwrap().target = 9;
+        assert_eq!(
+            assess_library(&format, &proof, LibraryAccess::Write).reasons,
+            vec![CompatibilityReason::ToolUpgradeRequired]
+        );
+    }
+
+    #[test]
+    fn manifest_advertises_schema8_and_retains_earlier_read_formats() {
+        let manifest = compatibility_manifest();
+        assert_eq!(PLAN_B_V9_FORMAT, "ale-s9-cld1-t3-m2-p1-a1-sd1");
+        assert!(PLAN_B_V9_FORMAT.ends_with("-sd1"));
+        assert!(!PLAN_B_V9_FORMAT.contains("sp1"));
+        assert_eq!(
+            manifest.database_write_formats,
+            vec![PLAN_B_FORMAT, PLAN_B_AUDIO_FORMAT]
+        );
+        assert_eq!(manifest.migration_target_format, PLAN_B_FORMAT);
+        assert_eq!(manifest.migration_source_schemas, vec![3, 4, 5, 6, 7, 8]);
+        assert_eq!(SNAPSHOT_SCHEMA_MAX, 9);
+        assert_eq!(
+            manifest.snapshot_read_formats,
+            vec![
+                "ale-s3-ext-t3-m2",
+                "ale-s4-ext-t3-m2",
+                "ale-s5-ext-t3-m2",
+                PLAN_B_V6_INITIAL_FORMAT,
+                PLAN_B_V6_FORMAT,
+                PLAN_B_V7_INITIAL_FORMAT,
+                PLAN_B_V7_FORMAT,
+                PLAN_B_V8_COMPRESSED_FORMAT,
+                PLAN_B_FORMAT,
+                PLAN_B_V9_FORMAT,
+                PLAN_B_AUDIO_FORMAT,
+                PLAN_B_V9_AUDIO_FORMAT,
+            ]
+        );
+        assert_eq!(manifest.features.get("search_path"), Some(&1));
+        for feature in [ALBUM_ENTITIES_FEATURE, ALBUM_ENTITY_ARTWORK_FEATURE] {
+            assert_eq!(manifest.features.get(feature), Some(&1));
+        }
+        assert!(!manifest.features.contains_key(METADATA_STORAGE_FEATURE));
+    }
+
+    #[test]
+    fn extended_sources_require_exact_formats_without_changing_new_library_defaults() {
+        let base = LibraryFormat::target();
+        assert!(!base.features.contains_key(AUDIO_SOURCES_FEATURE));
+        let extended = base.clone().with_audio_sources();
+        assert_eq!(
+            extended.snapshot_format_id().as_deref(),
+            Some(PLAN_B_AUDIO_FORMAT)
+        );
+        assert!(assess_library(&extended, &evidence(), LibraryAccess::Write).direct_use);
+        let server = LibraryFormat::server_schema9().with_audio_sources();
+        assert_eq!(
+            server.snapshot_format_id().as_deref(),
+            Some(PLAN_B_V9_AUDIO_FORMAT)
+        );
+        assert!(assess_library(&server, &evidence(), LibraryAccess::Read).direct_use);
+        assert!(!assess_library(&server, &evidence(), LibraryAccess::Write).direct_use);
+        let mut old = compatibility_manifest();
+        old.snapshot_read_formats
+            .retain(|id| id != PLAN_B_AUDIO_FORMAT && id != PLAN_B_V9_AUDIO_FORMAT);
+        for (id, format) in [
+            (PLAN_B_AUDIO_FORMAT, extended.clone()),
+            (PLAN_B_V9_AUDIO_FORMAT, server),
+        ] {
+            let snapshot = SnapshotFormat {
+                id: id.into(),
+                format,
+            };
+            assert!(snapshot.is_readable_by(&compatibility_manifest()));
+            assert!(!snapshot.is_readable_by(&old));
+        }
+        let mut future = extended;
+        future.features.insert(AUDIO_SOURCES_FEATURE.into(), 2);
+        assert_eq!(future.snapshot_format_id(), None);
+        assert!(!assess_library(&future, &evidence(), LibraryAccess::Write).direct_use);
+        future.features.insert(AUDIO_SOURCES_FEATURE.into(), 1);
+        future
+            .features
+            .insert("unknown_extension_requirement".into(), 1);
+        assert_eq!(future.snapshot_format_id(), None);
+    }
+
+    #[test]
     fn unknown_future_and_incomplete_evidence_never_imply_rebuild() {
-        for (key, value) in [("tokenization", 4), ("unknown_future_feature", 1)] {
+        for (key, value) in [
+            ("tokenization", 4),
+            ("unknown_future_feature", 1),
+            (ALBUM_ENTITIES_FEATURE, 2),
+            (METADATA_STORAGE_FEATURE, 2),
+        ] {
             let mut format = LibraryFormat::target();
             format.features.insert(key.into(), value);
             let result = assess_library(&format, &evidence(), LibraryAccess::Write);
@@ -670,8 +1117,7 @@ mod tests {
 
     #[test]
     fn legacy_in_progress_tokenization_four_is_not_a_completed_new_codec() {
-        let mut format = LibraryFormat::target();
-        format.schema_version = 5;
+        let mut format = LibraryFormat::prior_plan_b(5, 2);
         format.storage = SearchStorage::ExternalContent;
         format.features.remove("search_storage");
         format.features.remove("play_history_retired");
@@ -905,6 +1351,46 @@ mod tests {
     }
 
     #[test]
+    fn album_artwork_is_an_optional_feature_at_revision_1() {
+        let manifest = compatibility_manifest();
+        assert!(
+            manifest
+                .features
+                .get(ALBUM_ARTWORK_FEATURE)
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(!manifest.features.contains_key("artwork"));
+    }
+
+    #[test]
+    fn folder_artwork_is_optional_api_capability_without_a_database_requirement() {
+        let local = compatibility_manifest();
+        assert_eq!(local.features.get(ALBUM_FOLDER_ARTWORK_FEATURE), Some(&1));
+        assert!(
+            !LibraryFormat::target()
+                .features
+                .contains_key(ALBUM_FOLDER_ARTWORK_FEATURE)
+        );
+        assert_eq!(
+            LibraryFormat::target().snapshot_format_id().as_deref(),
+            Some(PLAN_B_FORMAT)
+        );
+        let mut invalid_database_marker = LibraryFormat::target();
+        invalid_database_marker
+            .features
+            .insert(ALBUM_FOLDER_ARTWORK_FEATURE.into(), 1);
+        assert!(invalid_database_marker.snapshot_format_id().is_none());
+        let mut peer = local.clone();
+        peer.features.remove(ALBUM_FOLDER_ARTWORK_FEATURE);
+        assert_eq!(
+            check_peer(&local, &peer.application_version, Some(&peer)),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn matrix_12_feature_revisions_are_per_feature() {
         let local = compatibility_manifest();
         let mut peer = marked("0.8.0");
@@ -953,8 +1439,16 @@ mod tests {
         let actual = serde_json::json!({
             "target_id": target.snapshot_format_id(),
             "target": target,
+            "extended_target_id": PLAN_B_AUDIO_FORMAT,
+            "extended_target": LibraryFormat::target().with_audio_sources(),
+            "extended_server_id": PLAN_B_V9_AUDIO_FORMAT,
+            "extended_server": LibraryFormat::server_schema9().with_audio_sources(),
             "plan_b_format": PLAN_B_FORMAT,
             "plan_b_initial_format": PLAN_B_INITIAL_FORMAT,
+            "plan_b_v7_format": PLAN_B_V7_FORMAT,
+            "plan_b_v7_initial_format": PLAN_B_V7_INITIAL_FORMAT,
+            "plan_b_v8_compressed_format": PLAN_B_V8_COMPRESSED_FORMAT,
+            "legacy_compressed": LibraryFormat::prior_compressed_plan_b(),
             "target_schema": TARGET_SCHEMA,
             "tokenization_revision": TOKENIZATION_REVISION,
             "snapshot_read_formats": compatibility_manifest().snapshot_read_formats,

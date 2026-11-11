@@ -70,6 +70,9 @@ pub(super) fn validate(
         return Err(rejected("invalid or regressed copy phase"));
     }
     for (name, _) in &blueprint.tables {
+        if !super::inspect::table_exists(input, name)? {
+            continue;
+        }
         let checkpoint = entries
             .remove(name)
             .ok_or_else(|| rejected(format!("missing table {name:?}")))?;

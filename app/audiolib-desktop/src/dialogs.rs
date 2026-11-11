@@ -1,5 +1,5 @@
 // app/audiolib-desktop/src/dialogs.rs
-//! Native file selection runs on a worker; no subprocess or extra runtime is required.
+//! Native file selection runs on a worker using Windows dialogs or macOS osascript.
 use std::path::PathBuf;
 
 /// Select one filesystem folder with the Windows common dialog on a worker thread.
@@ -169,20 +169,38 @@ pub fn choose_folder(chinese: bool, owner: usize) -> Result<Option<PathBuf>, Str
     }
 }
 
-/// Folder selection is available only on the Windows desktop target.
-#[cfg(not(windows))]
+/// Select one folder through the macOS system scripting helper on a worker.
+#[cfg(target_os = "macos")]
+pub fn choose_folder(chinese: bool, _owner: usize) -> Result<Option<PathBuf>, String> {
+    macos_choose(
+        "folder",
+        if chinese {
+            "选择音效文件夹"
+        } else {
+            "Choose a sound folder"
+        },
+        "",
+        "",
+    )
+}
+
+/// Native selection is unavailable on other desktop targets.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn choose_folder(_chinese: bool, _owner: usize) -> Result<Option<PathBuf>, String> {
-    Err("Native folder selection requires Windows".into())
+    Err("Native folder selection requires Windows or macOS".into())
 }
 
 #[derive(Clone, Copy)]
 pub enum FileKind {
     Database,
     NewLibrary,
-    Wav,
+    Audio,
+    Image,
     JsonLines,
     Csv,
     Annotations,
+    /// §4 vendor metadata table (CSV / XLS / XLSX, detected by header).
+    VendorTable,
 }
 
 #[cfg(windows)]
@@ -233,9 +251,20 @@ pub fn choose(
             "Library SQLite database (*.db)\0*.db\0All files\0*.*\0\0",
             "db",
         ),
-        (FileKind::Wav, _) => ("WAV / BWF\0*.wav\0\0", "wav"),
+        (FileKind::Audio, _) => (
+            "WAV / BWF / FLAC / Ogg / MP3 / AIFF\0*.wav;*.bwf;*.flac;*.ogg;*.oga;*.mp3;*.aif;*.aiff\0\0",
+            "wav",
+        ),
+        (FileKind::Image, _) => ("PNG / JPEG\0*.png;*.jpg;*.jpeg\0\0", "png"),
         (FileKind::JsonLines, _) => ("JSON Lines (*.jsonl)\0*.jsonl\0\0", "jsonl"),
         (FileKind::Csv, _) => ("CSV (*.csv)\0*.csv\0\0", "csv"),
+        (FileKind::VendorTable, true) => {
+            ("厂商资料表\0*.csv;*.xls;*.xlsx\0所有文件\0*.*\0\0", "csv")
+        }
+        (FileKind::VendorTable, false) => (
+            "Vendor tables\0*.csv;*.xls;*.xlsx\0All files\0*.*\0\0",
+            "csv",
+        ),
         (FileKind::Annotations, true) => ("音效库标注\0*.jsonl;*.csv\0所有文件\0*.*\0\0", "jsonl"),
         (FileKind::Annotations, false) => (
             "Library annotations\0*.jsonl;*.csv\0All files\0*.*\0\0",
@@ -251,8 +280,12 @@ pub fn choose(
         (FileKind::Database, true, false) => "Back up sound library",
         (FileKind::Database, false, true) => "选择音效库数据库",
         (FileKind::Database, false, false) => "Choose sound library database",
-        (FileKind::Wav, _, true) => "选择 WAV，修复文件引用",
-        (FileKind::Wav, _, false) => "Choose WAV to repair file reference",
+        (FileKind::Audio, _, true) => "选择音频文件，修复文件引用",
+        (FileKind::Audio, _, false) => "Choose audio to repair file reference",
+        (FileKind::Image, _, true) => "选择专辑封面",
+        (FileKind::Image, _, false) => "Choose album artwork",
+        (FileKind::VendorTable, _, true) => "选择厂商资料表（CSV / XLS / XLSX）",
+        (FileKind::VendorTable, _, false) => "Choose a vendor table (CSV / XLS / XLSX)",
         (_, true, true) => "导出音效库标注",
         (_, true, false) => "Export library annotations",
         (_, false, true) => "导入音效库标注",
@@ -271,7 +304,7 @@ pub fn choose(
             FileKind::JsonLines | FileKind::Annotations => {
                 format!("AudioLib-annotations-{date}.jsonl")
             }
-            FileKind::Wav => String::new(),
+            FileKind::Audio | FileKind::Image | FileKind::VendorTable => String::new(),
         };
         for (target, value) in file.iter_mut().zip(name.encode_utf16()) {
             *target = value;
@@ -319,14 +352,125 @@ pub fn choose(
     Ok(Some(PathBuf::from(String::from_utf16_lossy(&file[..end]))))
 }
 
-#[cfg(not(windows))]
+/// Select or name a file through the macOS system scripting helper on a worker.
+#[cfg(target_os = "macos")]
+pub fn choose(
+    save: bool,
+    kind: FileKind,
+    chinese: bool,
+    _owner: usize,
+) -> Result<Option<PathBuf>, String> {
+    let title = match (kind, save, chinese) {
+        (FileKind::NewLibrary, _, true) => "新建音效库",
+        (FileKind::NewLibrary, _, false) => "Create sound library",
+        (FileKind::Database, true, true) => "备份音效库",
+        (FileKind::Database, true, false) => "Back up sound library",
+        (FileKind::Database, false, true) => "选择音效库数据库",
+        (FileKind::Database, false, false) => "Choose sound library database",
+        (FileKind::Audio, _, true) => "选择音频文件，修复文件引用",
+        (FileKind::Audio, _, false) => "Choose audio to repair file reference",
+        (FileKind::Image, _, true) => "选择专辑封面",
+        (FileKind::Image, _, false) => "Choose album artwork",
+        (FileKind::VendorTable, _, true) => "选择厂商资料表（CSV / XLS / XLSX）",
+        (FileKind::VendorTable, _, false) => "Choose a vendor table (CSV / XLS / XLSX)",
+        (_, true, true) => "导出音效库标注",
+        (_, true, false) => "Export library annotations",
+        (_, false, true) => "导入音效库标注",
+        (_, false, false) => "Import library annotations",
+    };
+    let types = match kind {
+        FileKind::Database | FileKind::NewLibrary => "db\nsqlite\nsqlite3",
+        FileKind::Audio => "wav\nbwf\nflac\nogg\noga\nmp3\naif\naiff",
+        FileKind::Image => "png\njpg\njpeg",
+        FileKind::JsonLines => "jsonl",
+        FileKind::Csv => "csv",
+        FileKind::Annotations => "jsonl\ncsv",
+        FileKind::VendorTable => "csv\nxls\nxlsx",
+    };
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    let name = if save {
+        match kind {
+            FileKind::Database => format!("AudioLib-backup-{date}.db"),
+            FileKind::NewLibrary => "AudioLib-library.db".into(),
+            FileKind::Csv => format!("AudioLib-annotations-{date}.csv"),
+            FileKind::JsonLines | FileKind::Annotations => {
+                format!("AudioLib-annotations-{date}.jsonl")
+            }
+            FileKind::Audio | FileKind::Image | FileKind::VendorTable => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    macos_choose(if save { "save" } else { "open" }, title, &name, types)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_choose(
+    mode: &str,
+    prompt: &str,
+    default_name: &str,
+    types: &str,
+) -> Result<Option<PathBuf>, String> {
+    // Script text is constant. Paths and prompts never become AppleScript source
+    // or shell commands, and no AppKit objects are created on this worker thread.
+    const SCRIPT: &str = r#"on run argv
+    try
+        set selectionMode to item 1 of argv
+        set dialogPrompt to item 2 of argv
+        if selectionMode is "folder" then
+            set chosenPath to choose folder with prompt dialogPrompt
+        else if selectionMode is "save" then
+            set chosenPath to choose file name with prompt dialogPrompt default name (item 3 of argv)
+        else
+            set allowedTypes to paragraphs of (item 4 of argv)
+            set chosenPath to choose file with prompt dialogPrompt of type allowedTypes
+        end if
+        return POSIX path of chosenPath
+    on error errorMessage number errorNumber
+        if errorNumber is -128 then return ""
+        error errorMessage number errorNumber
+    end try
+end run"#;
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .args([mode, prompt, default_name, types])
+        .output()
+        .map_err(|error| format!("macOS file dialog could not start: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "macOS file dialog failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ));
+    }
+    macos_dialog_path(&output.stdout)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_dialog_path(output: &[u8]) -> Result<Option<PathBuf>, String> {
+    let path = std::str::from_utf8(output)
+        .map_err(|_| "macOS file dialog returned an invalid UTF-8 path".to_owned())?;
+    // osascript adds exactly one line terminator. A filename may itself end in
+    // spaces or a newline, so trimming whitespace would change the selected file.
+    let path = path.strip_suffix('\n').unwrap_or(path);
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if !path.starts_with('/') || path.contains('\0') {
+        return Err("macOS file dialog returned an invalid absolute path".into());
+    }
+    Ok(Some(PathBuf::from(path)))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn choose(
     _save: bool,
     _kind: FileKind,
     _chinese: bool,
     _owner: usize,
 ) -> Result<Option<PathBuf>, String> {
-    Err("Native file selection requires Windows".into())
+    Err("Native file selection requires Windows or macOS".into())
 }
 
 /// Capture the main window's HWND on the UI thread before starting a dialog worker.
@@ -355,5 +499,39 @@ pub fn owner_handle(window: &slint::Window) -> usize {
     {
         let _ = window;
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::macos_dialog_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn macos_dialog_preserves_unicode_and_filename_whitespace() {
+        for selected in ["/Users/test/音效 library ", "/Users/test/newline\n"] {
+            let stdout = format!("{selected}\n");
+            assert_eq!(
+                macos_dialog_path(stdout.as_bytes()).unwrap(),
+                Some(PathBuf::from(selected))
+            );
+        }
+    }
+
+    #[test]
+    fn macos_dialog_cancellation_does_not_produce_a_path() {
+        assert_eq!(macos_dialog_path(b"\n").unwrap(), None);
+        assert_eq!(macos_dialog_path(b"").unwrap(), None);
+    }
+
+    #[test]
+    fn macos_dialog_rejects_invalid_or_non_absolute_output() {
+        for invalid in [
+            b"relative.wav\n".as_slice(),
+            b"/file\0.wav\n",
+            b"/file\xff\n",
+        ] {
+            assert!(macos_dialog_path(invalid).is_err());
+        }
     }
 }

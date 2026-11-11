@@ -59,6 +59,10 @@ pub(crate) fn write_wav(
     } else {
         chunk(b"data", samples, &mut body);
     }
+    if rf64 {
+        let riff_size = body.len() as u64 + 4;
+        body[8..16].copy_from_slice(&riff_size.to_le_bytes());
+    }
     let mut output = Vec::new();
     output.extend_from_slice(if rf64 { b"RF64" } else { b"RIFF" });
     output.extend_from_slice(
@@ -635,6 +639,9 @@ fn single_open_summary_matches_probe_then_waveform_with_trailing_chunks() {
         if &wav[..4] == b"RIFF" {
             let size = (wav.len() - 8) as u32;
             wav[4..8].copy_from_slice(&size.to_le_bytes());
+        } else {
+            let size = (wav.len() - 8) as u64;
+            wav[20..28].copy_from_slice(&size.to_le_bytes());
         }
         fs::write(path, wav).unwrap();
     }

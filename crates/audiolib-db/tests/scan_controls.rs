@@ -5,7 +5,7 @@ use audiolib_db::{ScanCancellation, ScanOptions, ScanService, SqliteProvider};
 use std::{
     fs,
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn wait_paused(receiver: &mpsc::Receiver<ScanProgress>, after: u64) -> ScanProgress {
@@ -187,4 +187,146 @@ fn prepaused_scan_can_be_cancelled_without_resume_or_missing_reconciliation() {
     worker.join().unwrap();
     assert_eq!(result.state, ScanState::Cancelled);
     assert_eq!(result.removed, 0);
+}
+
+fn tiny_wav() -> Vec<u8> {
+    [
+        b"RIFF".as_slice(),
+        &38u32.to_le_bytes(),
+        b"WAVEfmt ",
+        &16u32.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &48000u32.to_le_bytes(),
+        &96000u32.to_le_bytes(),
+        &2u16.to_le_bytes(),
+        &16u16.to_le_bytes(),
+        b"data",
+        &2u32.to_le_bytes(),
+        &[0, 0],
+    ]
+    .concat()
+}
+
+fn one_sound_library() -> (tempfile::TempDir, std::path::PathBuf, Arc<SqliteProvider>) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("audio");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("one.wav"), tiny_wav()).unwrap();
+    let provider = Arc::new(SqliteProvider::open(&temp.path().join("library.db")).unwrap());
+    (temp, root, provider)
+}
+
+fn folder_total(provider: &SqliteProvider) -> u64 {
+    provider
+        .folders(None)
+        .unwrap()
+        .iter()
+        .map(|folder| folder.file_count)
+        .sum()
+}
+
+fn wait_for_cancelled_rollup(provider: &SqliteProvider) -> audiolib_core::ScanSession {
+    let started = Instant::now();
+    loop {
+        let history = provider.scan_history(1, 0).unwrap();
+        if let Some(session) = history.first()
+            && session.state == ScanState::Cancelled
+        {
+            return session.clone();
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            panic!("finish interrupt did not cancel the in-flight rollup: {history:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Close sets a finish interrupt before Metadata drain. When that drain fails, the
+/// interrupt is cleared and the same scan must still publish folder statistics.
+#[test]
+fn retracted_finish_interrupt_still_rolls_up_folder_statistics() {
+    let (_temp, root, provider) = one_sound_library();
+    let control = ScanCancellation::default();
+    // Set before enumeration ends, the same way a close request does.
+    control.interrupt_finish();
+    let worker_control = control.clone();
+    let worker_provider = provider.clone();
+    let worker_root = root.clone();
+    let (done, completion) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done.send(ScanService::new(worker_provider).scan(
+            &worker_root,
+            &ScanOptions {
+                incremental: false,
+                ..Default::default()
+            },
+            &worker_control,
+            |_| {},
+        ))
+        .unwrap();
+    });
+    let cancelled = wait_for_cancelled_rollup(&provider);
+    assert_eq!(
+        folder_total(&provider),
+        0,
+        "an interrupted rollup must not publish folder statistics"
+    );
+    assert_eq!(provider.stats().unwrap().audio_files, 1);
+    // Failed close retracts the finish interrupt and leaves the scan running.
+    control.clear_finish_interrupt();
+    let progress = completion
+        .recv_timeout(Duration::from_secs(10))
+        .expect("retracted finish interrupt must not stick")
+        .expect("rollup after a retracted finish interrupt");
+    worker.join().unwrap();
+    assert!(!control.is_interrupted());
+    assert!(!control.is_cancelled());
+    assert_eq!(progress.session_id, cancelled.id);
+    assert_eq!(progress.state, ScanState::Completed);
+    assert_eq!(folder_total(&provider), 1);
+    assert_eq!(
+        provider.scan_history(1, 0).unwrap()[0].state,
+        ScanState::Completed
+    );
+}
+
+/// Quit upgrades the finish interrupt to a full interrupt. That must stay cancelled
+/// and must not rerun the folder-statistics statement.
+#[test]
+fn committed_finish_interrupt_does_not_retry_rollup() {
+    let (_temp, root, provider) = one_sound_library();
+    let control = ScanCancellation::default();
+    control.interrupt_finish();
+    let worker_control = control.clone();
+    let worker_provider = provider.clone();
+    let worker_root = root.clone();
+    let (done, completion) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done.send(ScanService::new(worker_provider).scan(
+            &worker_root,
+            &ScanOptions {
+                incremental: false,
+                ..Default::default()
+            },
+            &worker_control,
+            |_| {},
+        ))
+        .unwrap();
+    });
+    let cancelled = wait_for_cancelled_rollup(&provider);
+    let started = Instant::now();
+    control.interrupt();
+    let error = completion
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a committed finish interrupt must stop the scan")
+        .expect_err("quit must not complete the interrupted rollup");
+    worker.join().unwrap();
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(control.is_cancelled() && control.is_interrupted());
+    assert_eq!(folder_total(&provider), 0);
+    let session = &provider.scan_history(1, 0).unwrap()[0];
+    assert_eq!(session.id, cancelled.id);
+    assert_eq!(session.state, ScanState::Cancelled);
 }

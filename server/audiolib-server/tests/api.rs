@@ -155,7 +155,7 @@ async fn health_is_public_and_reports_crate_version() {
         commit == "unknown" || (commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit())),
         "{body}"
     );
-    assert_eq!(body["compatibility_catalog_revision"], 1);
+    assert_eq!(body["compatibility_catalog_revision"], 2);
     assert_eq!(body.as_object().unwrap().len(), 7, "{body}");
 }
 
@@ -4952,4 +4952,108 @@ async fn admin_runtime_reports_in_memory_state_and_is_lan_only() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn search_scope_path_uses_directory_segments_and_keeps_main_order() {
+    let f = fixture();
+    let main = audiolib_core::SearchRequest {
+        query: "flyby".into(),
+        limit: 10,
+        ..Default::default()
+    };
+    let body = serde_json::to_string(&main).unwrap();
+    let response = send_json(
+        &f.state,
+        Method::POST,
+        "/api/v1/search",
+        Some(&body),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: serde_json::Value = json(response).await;
+    let main_ids: Vec<i64> = page["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(main_ids.len(), 2, "{page}");
+    assert!(page.get("next_cursor").is_none());
+
+    let mut path = main.clone();
+    // A schema-8 library without the published directory index reports readiness
+    // explicitly instead of silently returning an empty path page.
+    path.query = "Aircraft".into();
+    path.scope = audiolib_core::SearchScope::Path;
+    let response = send_json(
+        &f.state,
+        Method::POST,
+        "/api/v1/search",
+        Some(&serde_json::to_string(&path).unwrap()),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "30");
+    assert_eq!(
+        json::<serde_json::Value>(response).await["error_code"],
+        "migration_in_progress"
+    );
+
+    let migrated = audiolib_db::migration9::execute(
+        &f.db,
+        audiolib_db::migration9::Action::Start,
+        &Default::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert_eq!(migrated.state, audiolib_db::migration9::State::Done);
+    let response = send_json(
+        &f.state,
+        Method::POST,
+        "/api/v1/search",
+        Some(&serde_json::to_string(&path).unwrap()),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: serde_json::Value = json(response).await;
+    // Aircraft still covers 2 of 3 files, so the existing broad-directory rule
+    // discards that set. Publication must not change path-search semantics.
+    assert_eq!(page["results"].as_array().unwrap().len(), 0, "{page}");
+    let after = send_json(
+        &f.state,
+        Method::POST,
+        "/api/v1/search",
+        Some(&body),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(after.status(), StatusCode::OK);
+    let after: serde_json::Value = json(after).await;
+    assert_eq!(
+        after["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        main_ids
+    );
+
+    let mut root = path.clone();
+    // The scan root's own name is not indexed.
+    root.query = "sounds".into();
+    let response = send_json(
+        &f.state,
+        Method::POST,
+        "/api/v1/search",
+        Some(&serde_json::to_string(&root).unwrap()),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: serde_json::Value = json(response).await;
+    assert_eq!(page["results"].as_array().unwrap().len(), 0, "{page}");
 }

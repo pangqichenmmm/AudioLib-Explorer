@@ -6,8 +6,7 @@
 //!
 //! * Transcoding off (the default, and what LAN profiles use): always the original
 //!   `/audio/{id}/stream`; `/preview` is never requested.
-//! * Non-WAV files are already compressed: always `/stream` (the library holds WAV only
-//!   today).
+//! * Non-WAV containers use their original `/stream` bytes and a bundled decoder.
 //! * Transcoding on, WAV: `/audio/{id}/preview?codec=pcm&sr=48000&bits=16` (`sr=44100` for
 //!   the 44.1 kHz family, never above the source rate) and `ch=2` for more than two
 //!   channels. `sr` and `bits` are always sent: `codec=pcm` alone keeps the original 96k/24.
@@ -106,6 +105,16 @@ impl AudioRoute {
     /// Bytes per second of audio the player reads for `file` on this route (a FLAC
     /// preview is decoded to PCM of the same layout as `codec=pcm`).
     pub fn output_bytes_per_second(&self, file: &AudioFile) -> u64 {
+        if matches!(self, Self::Stream)
+            && matches!(
+                file.attributes["container"].as_str(),
+                Some("MP3" | "FLAC" | "Ogg")
+            )
+            && file.duration.is_finite()
+            && file.duration > 0.0
+        {
+            return (file.file_size as f64 / file.duration).ceil() as u64;
+        }
         let (rate, bits, channels) = match self {
             Self::Stream => (file.sample_rate, file.bit_depth, file.channels),
             Self::Pcm(params) | Self::Flac(params) => (
@@ -120,8 +129,13 @@ impl AudioRoute {
     }
 }
 
-/// Whether the record is a WAV (by file name; the library holds WAV only today).
+/// Whether the actual known source container is WAV; old records fall back to name.
 pub fn is_wav(file: &AudioFile) -> bool {
+    match file.attributes["container"].as_str() {
+        Some("RIFF" | "RF64" | "BW64") => return true,
+        Some("MP3" | "AIFF" | "AIFC" | "FLAC" | "Ogg") => return false,
+        _ => {}
+    }
     let name = if file.filename.is_empty() {
         file.file_path.as_str()
     } else {
@@ -204,7 +218,7 @@ mod tests {
     use super::*;
 
     fn wav(sample_rate: u32, bit_depth: u16, channels: u16) -> AudioFile {
-        AudioFile {
+        AudioFile::from(audiolib_core::AudioFileData {
             id: 1,
             filename: "x.wav".into(),
             file_path: "/S/x.wav".into(),
@@ -212,7 +226,7 @@ mod tests {
             bit_depth,
             channels,
             ..Default::default()
-        }
+        })
     }
 
     fn pcm(rate: u32, channels: Option<u16>) -> AudioRoute {
@@ -371,5 +385,23 @@ mod tests {
         assert_eq!(AudioRoute::Stream.preview_query(), None);
         assert_eq!(AudioRoute::Stream.tag(), "stream");
         assert_eq!(flac(48_000, None).tag(), "flac-48000-16-src");
+    }
+
+    #[test]
+    fn inspected_non_wave_containers_use_original_bytes_even_with_a_wave_name() {
+        for container in ["MP3", "AIFF", "AIFC", "FLAC", "Ogg"] {
+            let mut file = wav(48_000, 16, 2);
+            file.attributes = serde_json::json!({"container":container});
+            assert!(!is_wav(&file));
+            assert_eq!(
+                choose_route(&file, Some(100_000.0), on()),
+                AudioRoute::Stream
+            );
+        }
+        let mut mp3 = wav(48_000, 0, 2);
+        mp3.attributes = serde_json::json!({"container":"MP3"});
+        mp3.duration = 2.0;
+        mp3.file_size = 32_000;
+        assert_eq!(AudioRoute::Stream.output_bytes_per_second(&mp3), 16_000);
     }
 }

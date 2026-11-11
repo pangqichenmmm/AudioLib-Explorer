@@ -498,6 +498,8 @@ fn pending_publication(controller: &Controller, ui: &AppWindow) -> u64 {
         expected_folders: None,
         model_published: false,
         retained_status: None,
+        result_window: false,
+        viewport_anchor: None,
     });
     ui.set_status("Page pending".into());
     ui.set_searching(true);
@@ -570,6 +572,11 @@ fn child_facet_publication() {
     let stage = Rc::new(Cell::new(0));
     let next = stage.clone();
     let previous = Rc::new(RefCell::new(ui.get_folders()));
+    let previous_tree = Rc::new(RefCell::new(
+        controller.tree.lock().unwrap().visible.clone(),
+    ));
+    let range_generation = Rc::new(Cell::new(0));
+    let range_folders = Rc::new(RefCell::new(None::<Arc<Vec<Folder>>>));
     let failure = Rc::new(RefCell::new(None::<String>));
     let errors = failure.clone();
     let started = Instant::now();
@@ -620,12 +627,77 @@ fn child_facet_publication() {
                     );
                     ui.set_status("Preserve subsequent error".into());
                     *previous.borrow_mut() = ui.get_folders();
+                    *previous_tree.borrow_mut() = c.tree.lock().unwrap().visible.clone();
                     c.reload_tree();
                     next.set(2);
                 }
-                2 if ui.get_folders() != *previous.borrow() => {
+                2 if !Arc::ptr_eq(&c.tree.lock().unwrap().visible, &previous_tree.borrow()) => {
+                    // The worker has published, but identical rows deliberately
+                    // retain their pointer targets for directory double-clicks.
+                    assert_eq!(ui.get_folders(), *previous.borrow());
                     assert_eq!(ui.get_status(), "Preserve subsequent error");
+                    // A user can request more rows after the page publishes but
+                    // before its already-computed directory model reaches the UI.
+                    let generation = pending_publication(&c, &ui);
+                    c.search_page_published(&ui, generation, true);
+                    let expected = folders("scrolling window", 4);
+                    c.search_folders_computed(&ui, generation, Ok(expected.clone()));
+                    {
+                        let mut publication = c.search_publication.lock().unwrap();
+                        let state = publication.as_mut().unwrap();
+                        assert!(!state.model_published);
+                        assert!(Arc::ptr_eq(
+                            state.expected_folders.as_ref().unwrap(),
+                            &expected
+                        ));
+                        state.page = SearchPagePhase::Pending;
+                        state.result_window = true;
+                    }
+                    range_generation.set(generation);
+                    *range_folders.borrow_mut() = Some(expected);
+                    *previous.borrow_mut() = ui.get_folders();
+                    ui.set_status("Window fetch pending".into());
                     next.set(3);
+                }
+                3 if ui.get_folders() != *previous.borrow() => {
+                    // The old tree post ran while the adjoining range was
+                    // pending. It cannot mark the complete search Ready yet.
+                    assert_eq!(
+                        ui.get_folders().row_data(0).unwrap().path,
+                        "scrolling window"
+                    );
+                    assert_eq!(ui.get_folders().row_data(0).unwrap().count, "4");
+                    assert_eq!(ui.get_status(), "Window fetch pending");
+                    {
+                        let publication = c.search_publication.lock().unwrap();
+                        let state = publication.as_ref().unwrap();
+                        assert_eq!(state.generation, range_generation.get());
+                        assert!(state.page == SearchPagePhase::Pending);
+                        assert!(!state.model_published);
+                        assert!(state.pending_folders.is_none());
+                    }
+                    // Completing the range must catch up that tree publication
+                    // without recomputing or supplying the facets a second time.
+                    c.search_page_published(&ui, range_generation.get(), true);
+                    next.set(4);
+                }
+                4 if ui.get_status().starts_with("Ready") => {
+                    assert!(!ui.get_searching());
+                    assert_eq!(
+                        c.search_generation.load(Ordering::Acquire),
+                        range_generation.get()
+                    );
+                    {
+                        let publication = c.search_publication.lock().unwrap();
+                        let state = publication.as_ref().unwrap();
+                        assert!(state.model_published);
+                        assert!(Arc::ptr_eq(
+                            state.expected_folders.as_ref().unwrap(),
+                            range_folders.borrow().as_ref().unwrap(),
+                        ));
+                    }
+                    ui.set_status("Preserve subsequent error".into());
+                    next.set(5);
                     slint::quit_event_loop().unwrap();
                 }
                 _ => {}
@@ -648,7 +720,7 @@ fn child_facet_publication() {
     controller.shutdown();
     ui.hide().unwrap();
     assert!(failure.borrow().is_none(), "{:?}", failure.borrow());
-    assert_eq!(stage.get(), 3);
+    assert_eq!(stage.get(), 5);
 }
 
 /// Fresh process/provider per sample; measures publication on Slint's testing backend,

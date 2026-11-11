@@ -173,13 +173,13 @@ fn workspace_round_trips_signed_audio_and_folder_identities_from_an_existing_lib
     }];
     current.view.selected_audio = Some(SearchAudioRef {
         id: selected.id,
-        file_path: selected.file_path,
+        file_path: selected.into_data().file_path,
     });
     current.view.checked_audio = [zero, minimum]
         .into_iter()
         .map(|file| SearchAudioRef {
             id: file.id,
-            file_path: file.file_path,
+            file_path: file.into_data().file_path,
         })
         .collect();
     current.view.selection_anchor = current.view.checked_audio.first().cloned();
@@ -214,6 +214,142 @@ fn damaged_foreign_and_newer_files_are_preserved_on_load_and_save() {
 }
 
 #[test]
+fn version_one_workspaces_keep_all_tasks_and_favorites_until_an_ordered_v2_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = provider(directory.path());
+    let target = SearchWorkspaceTarget::new(directory.path().join("userdata"), "server-legacy");
+    let mut expected = SearchWorkspace::for_scope(&target.library_scope);
+    expected.session.tasks = vec![task("one", "wood"), task("two", "metal")];
+    expected.session.active_task_id = Some("two".into());
+    expected.session.tasks[0].definition.filters.album = Some("Legacy Library".into());
+    expected.session.tasks[0]
+        .view
+        .raw_inputs
+        .insert("duration_min".into(), "unfinished draft".into());
+    expected.session.tasks[0].view.list_scroll_y = -75.0;
+    expected.favorites.push(SavedSearchTask {
+        id: "saved".into(),
+        title: "Original wood".into(),
+        definition: expected.session.tasks[0].definition.clone(),
+        ..Default::default()
+    });
+    provider.save_search_workspace(&target, &expected).unwrap();
+    let path = workspace_path(&target);
+    let mut legacy = serde_json::to_value(&expected).unwrap();
+    legacy["format_version"] = 1.into();
+    for task in legacy["session"]["tasks"].as_array_mut().unwrap() {
+        task["definition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("album_binding");
+    }
+    for favorite in legacy["favorites"].as_array_mut().unwrap() {
+        favorite["definition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("album_binding");
+    }
+    let original = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&path, &original).unwrap();
+    let admitted = provider.load_search_workspace(&target).unwrap();
+    assert_eq!(admitted, expected);
+    assert_eq!(admitted.format_version, 2);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        original,
+        "loading v1 must not rewrite the user's file"
+    );
+    provider.save_search_workspace(&target, &admitted).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["format_version"],
+        2
+    );
+    assert_eq!(provider.load_search_workspace(&target).unwrap(), expected);
+}
+
+#[test]
+fn new_album_conditions_use_v2_and_the_captured_v1_reader_refuses_them() {
+    // v0.8.0 deserialized unknown fields permissively, then validated this exact
+    // independent version gate before exposing any stored search conditions.
+    #[derive(serde::Deserialize)]
+    struct PublishedV1Gate {
+        format_version: u32,
+    }
+    impl PublishedV1Gate {
+        fn accepts(&self) -> bool {
+            self.format_version == 1
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let provider = provider(directory.path());
+    let target = SearchWorkspaceTarget::new(directory.path().join("userdata"), "server-current");
+    let mut current = SearchWorkspace::for_scope(&target.library_scope);
+    let mut filtered = task("one", "");
+    filtered.definition.filters.album_id = Some(17);
+    filtered.definition.album_binding = Some(audiolib_core::search_workspace::AlbumFilterBinding {
+        namespace: "owned-namespace".into(),
+        kind: audiolib_core::AlbumKind::Metadata,
+        metadata_key: Some("Only this library".into()),
+        folder_path: None,
+        unavailable: false,
+    });
+    current.session.tasks.push(filtered);
+    provider.save_search_workspace(&target, &current).unwrap();
+    let path = workspace_path(&target);
+    let bytes = fs::read(&path).unwrap();
+    let published: PublishedV1Gate = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        !published.accepts(),
+        "the old reader must refuse before ignoring album_id"
+    );
+    assert_eq!(provider.load_search_workspace(&target).unwrap(), current);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn unknown_workspace_conditions_cannot_be_lost_during_v1_upgrade_or_v2_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = provider(directory.path());
+    let target = SearchWorkspaceTarget::new(directory.path().join("userdata"), "server-unknown");
+    let mut current = SearchWorkspace::for_scope(&target.library_scope);
+    current.session.tasks.push(task("one", "wood"));
+    provider.save_search_workspace(&target, &current).unwrap();
+    let path = workspace_path(&target);
+    for version in [1, 2] {
+        let mut unknown = serde_json::to_value(&current).unwrap();
+        unknown["format_version"] = version.into();
+        unknown["session"]["tasks"][0]["definition"]["filters"]["future_album_condition"] =
+            serde_json::json!({"restrict_to":"preserve this"});
+        let bytes = serde_json::to_vec(&unknown).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(provider.load_search_workspace(&target).is_err());
+        assert!(provider.save_search_workspace(&target, &current).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn thirty_open_tasks_reopen_with_order_and_last_active_task_intact() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = provider(directory.path());
+    let target = SearchWorkspaceTarget::new(directory.path().join("userdata"), "server-A");
+    let mut workspace = SearchWorkspace::for_scope(&target.library_scope);
+    workspace.session.tasks = (0..30)
+        .map(|index| task(&index.to_string(), &format!("sound {index}")))
+        .collect();
+    workspace.session.active_task_id = Some("29".into());
+    workspace.session.tasks[29].view.list_scroll_y = -150.0;
+    workspace.session.tasks[29]
+        .view
+        .raw_inputs
+        .insert("duration_min".into(), "unfinished".into());
+    first.save_search_workspace(&target, &workspace).unwrap();
+    drop(first);
+    let reopened = provider(directory.path());
+    assert_eq!(reopened.load_search_workspace(&target).unwrap(), workspace);
+}
+
+#[test]
 fn too_many_open_tasks_do_not_replace_the_last_session() {
     let directory = tempfile::tempdir().unwrap();
     let provider = provider(directory.path());
@@ -222,7 +358,7 @@ fn too_many_open_tasks_do_not_replace_the_last_session() {
     workspace.session.tasks.push(task("one", "wood"));
     provider.save_search_workspace(&target, &workspace).unwrap();
     let before = fs::read(workspace_path(&target)).unwrap();
-    workspace.session.tasks = (0..7)
+    workspace.session.tasks = (0..=audiolib_core::search_workspace::MAX_SEARCH_TASKS)
         .map(|index| task(&index.to_string(), "wood"))
         .collect();
     assert!(provider.save_search_workspace(&target, &workspace).is_err());

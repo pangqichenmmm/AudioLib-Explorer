@@ -171,6 +171,22 @@ pub fn content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Prefer the inspected container for original bytes, retaining the extension
+/// fallback for historical records without source-container Metadata.
+pub fn content_type_for_record(
+    path: &std::path::Path,
+    record: &audiolib_core::AudioFile,
+) -> &'static str {
+    match record.attributes["container"].as_str() {
+        Some("RIFF" | "RF64" | "BW64") => "audio/wav",
+        Some("AIFF" | "AIFC") => "audio/aiff",
+        Some("MP3") => "audio/mpeg",
+        Some("FLAC") => "audio/flac",
+        Some("Ogg") => "audio/ogg",
+        _ => content_type(path),
+    }
+}
+
 /// Longest ASCII fallback file name in a download `Content-Disposition`.
 const MAX_FALLBACK_NAME: usize = 150;
 /// Longest suffix (dot included) kept as an extension in the ASCII fallback name.

@@ -351,6 +351,77 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     (directory, path)
 }
 
+fn af1_projection_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (directory, path) = fixture();
+    let conn = Connection::open(&path).unwrap();
+    schema::register_tokenizer(&conn, load_tokenizer()).unwrap();
+    conn.execute_batch("UPDATE audio_files SET filename='owned.mp3',file_path='owned.mp3',path_key='owned.mp3' WHERE id=1;
+        INSERT INTO library_meta(key,value) VALUES('extension_metadata','preserved');").unwrap();
+    (directory, path)
+}
+
+#[test]
+fn af1_publication_does_not_replace_an_unknown_source_format_marker() {
+    let (_directory, path) = af1_projection_fixture();
+    Connection::open(&path).unwrap().execute(
+        "INSERT INTO library_meta(key,value) VALUES('snapshot_format','unknown-private-format')", [],
+    ).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let destination = path.parent().unwrap().join("imported.db");
+    let error = crate::import_legacy(&path, &destination).unwrap_err();
+    assert!(
+        matches!(&error, Error::Validation(message) if message.contains("Unknown source snapshot_format")),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(!destination.exists());
+}
+
+#[test]
+fn af1_expected_projection_still_rejects_format_and_extension_metadata_tampering() {
+    for damage in [
+        "UPDATE library_meta SET value='forged-future-format' WHERE key='snapshot_format'",
+        "UPDATE library_meta SET value='tampered' WHERE key='extension_metadata'",
+    ] {
+        let (_directory, path) = af1_projection_fixture();
+        let cancel = AtomicBool::new(false);
+        let reviewed = plan(&path, &cancel).unwrap();
+        let interrupted = apply(&reviewed, &cancel, &mut |event| {
+            if event.phase == MigrationPhase::Validating {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(interrupted, Err(Error::Cancelled)),
+            "{interrupted:?}"
+        );
+        let job = discover(&path).unwrap().unwrap();
+        Connection::open(job.directory.join("candidate.db"))
+            .unwrap()
+            .execute_batch(damage)
+            .unwrap();
+        let error = resume(&job.directory, &cancel, &mut |_| Ok(())).unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation(message) if message.contains("business projection")),
+            "{damage}: {error:?}"
+        );
+        rollback(&job.directory, &cancel, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            inspect(
+                &path,
+                audiolib_core::compatibility::LibraryAccess::Read,
+                true,
+                &cancel
+            )
+            .unwrap()
+            .business,
+            reviewed.source.business
+        );
+    }
+}
+
 fn identifier_case_fixture(mixed: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("library.db");
@@ -1236,6 +1307,7 @@ fn added_default_and_nullable_fields_use_the_generic_copy_executor() {
         backup_sha256: None,
         target_business: None,
         target_schema_sha256: None,
+        import_identity: None,
     };
     let mut source = job::open_read(&path).unwrap();
     crate::management::snapshot_to_file_cancellable(
@@ -1437,7 +1509,7 @@ fn current_provider_creation_metadata_snapshot_patch_and_play_noop_share_the_tar
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("current.db");
     let provider = crate::SqliteProvider::open(&path).unwrap();
-    assert_eq!(provider.library_info().unwrap().schema_version, 6);
+    assert_eq!(provider.library_info().unwrap().schema_version, 8);
     provider.writer().unwrap().execute(
         "INSERT INTO audio_files(id,file_path,filename,user_notes) VALUES(1,'one.wav','metal.wav','old annotation')",[],
     ).unwrap();
@@ -1499,7 +1571,7 @@ fn current_provider_auto_migrates_old_library_but_honors_explicit_rollback() {
     drop(legacy);
     let provider = crate::SqliteProvider::open_existing(&path).unwrap();
 
-    assert_eq!(provider.library_info().unwrap().schema_version, 6);
+    assert_eq!(provider.library_info().unwrap().schema_version, 8);
     drop(provider);
     let job = discover(&path).unwrap().unwrap();
     assert_eq!(job.phase, MigrationPhase::Complete);
@@ -1525,7 +1597,7 @@ fn current_import_restore_maintenance_and_removal_preserve_unretired_business() 
     crate::import_legacy(&source, &destination).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
     let provider = crate::SqliteProvider::open_existing(&destination).unwrap();
-    assert_eq!(provider.library_info().unwrap().schema_version, 6);
+    assert_eq!(provider.library_info().unwrap().schema_version, 8);
 
     assert_eq!(provider.get_audio(1).unwrap().notes, "user annotation");
     assert!(provider.check_library().unwrap().is_ok());

@@ -37,12 +37,16 @@ Mac 报告的 909,342 条库首次打开 954 秒（分词 411 秒、FTS5 542 秒
 ## UI-001：失焦后重新聚焦，界面内容丢失
 
 - 登记日期：2026-10-12。
-- 状态：0.4.4 已修复重绘逻辑，复用 buffer 回归通过；完整前台失焦/聚焦验收仍待可用的交互捕获环境。
+- 状态：0.4.4 已修复重绘逻辑，复用 buffer 回归通过；2026-11-02 已在 0.8.7 Windows ASIO 候选及最终 main `b5a98ff98fed` 实际 payload 上分别完成 Default / Studio 的前台、遮挡及最小化恢复验收，保留各自工具和二进制身份。
 - 用户报告：软件失去焦点后，再次聚焦时 UI 大面积消失或变黑，仅部分按钮和局部控件仍然可见。报告截图处于音效库管理的服务器设置界面，原因为待查，尚不能认定数据或窗口状态丢失。
 - 复现线索：打开音效库管理 → 切到其他窗口 → 返回 AudioLib Explorer。出现频率、最小化/遮挡是否必要、缩放与显示器组合尚待确认。
-- 修复：Slint 1.17.1 软件 renderer 可能按 buffer age 复用已被 Windows 清空的表面，而 Windows 不保证发送 Occluded 通知。Windows 原生 RedrawRequested 标记完整逻辑窗口，恢复事件请求重绘；保留原组件、草稿与选择，无定时重绘。
-- 验证：确定性回归先验证 request_redraw 单独使用不能恢复清空的复用 buffer，再验证完整损伤恢复整帧、表单和选择保持、空闲不重绘。新 ASIO release 的自有窗口 DC 抓帧在 192 DPI、1094×630 client 下完成失焦/遮挡/最小化各三次操作，像素保持。
-- 实机限制：当次 Windows 会话锁定，input desktop 不可访问；自有窗口表面检查不代表前台焦点和真实暴露转换已验收。工具明确记录 `foreground_exposure_verified=false`，未使用会触发重绘的 PrintWindow 来替代验收。解锁后运行 `tools/validate-window-repaint.ps1 -BinaryDirectory local_release` 补充实际前台转换。
+- 修复：Slint 1.17.1 软件 renderer 可能按 buffer age 复用已被 Windows 清空的表面，而 Windows 不保证发送 Occluded 通知。Windows 原生 RedrawRequested 标记完整逻辑窗口，恢复事件请求重绘；保留原组件、草稿与选择，无定时重绘。2026-11-01 收窄：窗口子类在 `WM_PAINT` 时检查更新区域，只有 Windows 真正失效像素（更新区域非空）或聚焦、遮挡恢复、尺寸变化之后的那一帧才标记完整窗口；Slint 自己请求的动画帧（`RDW_INTERNALPAINT`，更新区域为空）保持局部重绘，播放时不再每帧整窗重绘。无 HWND 或无法挂接的窗口仍按完整窗口处理。后续两主题原生复验见下文。
+- 历史验证：确定性回归先验证 request_redraw 单独使用不能恢复清空的复用 buffer，再验证完整损伤恢复整帧、表单和选择保持、空闲不重绘。当时 ASIO release 的自有窗口 DC 抓帧在 192 DPI、1094×630 client 下完成失焦/遮挡/最小化各三次操作，像素保持。
+- 历史实机限制：当次 Windows 会话锁定，input desktop 不可访问；自有窗口表面检查不代表前台焦点和真实暴露转换已验收。工具明确记录 `foreground_exposure_verified=false`，未使用会触发重绘的 PrintWindow 来替代验收；这些旧结果不改记为通过。
+- 2026-11-02 工具修正与复核：早期工具误用 `MainWindowHandle` 可能选中同 PID 的 winit utility 窗口，导致空白基线；失败清理误关该窗口还会破坏事件循环唤醒投递。改为唯一可见应用窗口的 PID、标题及类名复核。另在 HWND 创建时固定遮挡窗的原生 topmost/toolwindow 样式，避免托管 `TopMost` 状态与实际遮挡不一致；最小化使用自有备用焦点窗口及短暂自有队列绑定，并在 finally 解绑定。通过物理覆盖范围、四角/中心命中、真实前台/最小化状态确认操作发生，原内容与像素差异阈值未放宽，无应用 Rust 改动或重建。
+- 候选实测：同一 beta 应用提交 `86acdac21468` 的 EXE SHA256 `4bd1265d2c31c5e6856c60732e495ca74ffa3b25f33f05a10f49d7508fec3061`；192 DPI（200%），Default client 2214×1370、Studio 2214×1409。各自失焦/聚焦、保持前台的遮挡恢复、最小化/还原各三轮，共十八轮均通过，逐轮采样 `changed_fraction=0`，`foreground_exposure_verified=true`、`normal_shutdown=true`。原报告为 `.rust-validation/window-repaint/default-8ab756a0305f4807afedce875d918e33/report.json` 与 `.rust-validation/window-repaint/studio-ad83e26572f74a069fb6c0eef99b9e08/report.json`，保留候选身份，不用它代替最终 payload。
+- 最终 main 复验：`b5a98ff98fed501aafff0f6a4ef5015c8b4d435d` 实际 EXE SHA256 `859541a34d4eb05a04ddcda4f92d88596253235bc8ad1ed66a723999489faf81`；首次 Default refocus 未使遮挡窗取得前台，失败与 facts 保留，不能将具体 Windows 策略或超时原因写为已证实结论。随后仅在工具中复核当前应用窗口并通过两个自有队列短暂绑定进行焦点交接、finally 解绑定；独立工具提交 `2d25272cf0a37678e5b2a178c1079e8ca859e1c1`、SHA256 `d0344e7a28f91d6b0044d3dac0e5e2043ff6a7eecb2bbe07e39cc933751cbc79`。原层级、前台、遮挡与像素门禁未降低，应用 Rust 未改、payload 未重建。
+- 最终结果：相同 192 DPI（200%）、Default 2214×1370 / Studio 2214×1409 client，各九轮真实转换通过，采样差异均为 0，前台曝光和正常关闭均为 true。私有证据 `.rust-validation/release-087/final-windows-client/default-accepted.json`、`studio-accepted.json` 同时记录工具与应用身份。仅覆盖该 Windows/DPI/payload 组合，不扩大为所有 DPI、声学输出延迟或新增 ASIO 硬件验收；未来原生运行仍按 `<theme>-<nonce>` 建目录，以 `report_path` 为准。完整阶段和发布状态见 [0.8.7 跟踪](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/beta/doc/Rust_Release_0.8.7.md)。
 - 验收：主窗口和音效库管理在反复失焦/聚焦、遮挡恢复、最小化/还原后都能完整显示；覆盖实际 DPI 缩放，且草稿和选择不丢失。
 
 原始现象截图包含私人库信息，保留在本机忽略的审计目录，不随源码或发布包分发。

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "macos-client",
+  "host": "macos",
+  "require_tag": true,
+  "environment_tools": ["rustc", "cargo"],
+  "variables": {"SigningIdentity": "-", "OutputDirectory": "${RunDirectory}/artifacts"},
+  "stages": [
+    {"id": "preflight", "script": "tools/check-release.ps1", "parameters": {"Tag": "${Tag}"}},
+    {"id": "license-preflight", "reuse": "never", "script": "tools/check-release-licenses.ps1", "parameters": {"Profile": "MacosClient"}},
+    {"id": "build", "needs": ["preflight", "license-preflight"], "script": "tools/build-macos-client-pipeline.ps1", "parameters": {"ExpectedCommit": "${Commit}", "ReportPath": "${RunDirectory}/build.json"}, "outputs": ["${RunDirectory}/build.json", "${TargetDirectory}/aarch64-apple-darwin/release/AudioLibExplorer", "${TargetDirectory}/aarch64-apple-darwin/release/AudioLibCli"]},
+    {"id": "package-accept", "needs": ["build"], "script": "tools/package-macos-client.ps1", "parameters": {"Tag": "${Tag}", "ExpectedCommit": "${Commit}", "BuildReport": "${RunDirectory}/build.json", "ValidateRuntime": true, "SigningIdentity": "${SigningIdentity}", "OutputDirectory": "${OutputDirectory}"}, "outputs": ["${OutputDirectory}"]}
+  ]
+}

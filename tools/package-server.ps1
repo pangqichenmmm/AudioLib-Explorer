@@ -6,7 +6,7 @@
 param(
     [Parameter(Mandatory)][string]$Tag,
     [Parameter(Mandatory)]
-    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')]
+    [ValidateSet('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin')]
     [string]$Target,
     # A directory containing the target binary, or the binary itself.
     [string]$BinaryPath,
@@ -17,19 +17,26 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw 'Server packaging requires PowerShell 7.3 or newer.' }
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'dependency-licenses.ps1')
+. (Join-Path $PSScriptRoot 'server-package-layout.ps1')
 $pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
 $tagMatch = [regex]::Match($Tag, '^v(\d+\.\d+\.\d+)(?:-(?:rc|beta)\.(?:0|[1-9]\d*))?$')
 if (!$tagMatch.Success) { throw 'Tag must be vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N / -beta.N.' }
 $version = $tagMatch.Groups[1].Value
 if ($Asio -and ($Target -cne 'x86_64-pc-windows-msvc' -or !$IsWindows)) { throw '-Asio requires the native Windows server target.' }
+$taskProcessArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
 switch ($Target) {
     'x86_64-pc-windows-msvc' {
         if (!$IsWindows) { throw 'The Windows server must be packaged on Windows.' }
         $platformName = 'win-x64'; $binaryName = 'audiolib-server.exe'; $archiveExtension = 'zip'
     }
     'x86_64-unknown-linux-gnu' {
-        if (!$IsLinux) { throw 'The Linux server must be packaged on Linux.' }
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::X64) { throw 'The Linux x64 server must be packaged on Linux x64.' }
         $platformName = 'linux-x64'; $binaryName = 'audiolib-server'; $archiveExtension = 'tar.gz'
+    }
+    'aarch64-unknown-linux-gnu' {
+        if (!$IsLinux -or $taskProcessArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) { throw 'The Linux arm64 server must be packaged on Linux arm64.' }
+        $platformName = 'linux-arm64'; $binaryName = 'audiolib-server'; $archiveExtension = 'tar.gz'
     }
     'aarch64-apple-darwin' {
         if (!$IsMacOS) { throw 'The macOS server must be packaged on macOS.' }
@@ -110,7 +117,7 @@ if ($Asio) {
 Assert-Unlinked $taskRoot
 $manifestPath = Join-Path $PSScriptRoot 'server-files.json'
 Assert-Unlinked $manifestPath
-$publicFiles = @((Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
+$publicFiles = @(Get-ServerPublicDocuments)
 if (!$publicFiles.Count -or @($publicFiles | Where-Object { $_ -isnot [string] }).Count) { throw 'Server file allowlist must be a nonempty string array.' }
 $publicSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($relative in $publicFiles) {
@@ -119,7 +126,11 @@ foreach ($relative in $publicFiles) {
     Assert-Within (Join-Path $taskRoot $relative) $taskRoot
     Assert-Unlinked (Join-Path $taskRoot $relative)
 }
-if (!$BinaryPath) { $BinaryPath = Join-Path $taskRoot "target/$Target/release" }
+if (!$BinaryPath) {
+    # Match Cargo and package-portable.ps1: honor CARGO_TARGET_DIR when it is set.
+    $targetRoot = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $taskRoot) } else { Join-Path $taskRoot 'target' }
+    $BinaryPath = Join-Path $targetRoot "$Target/release"
+}
 $binarySource = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($BinaryPath)) { $BinaryPath } else { Join-Path $taskRoot $BinaryPath }))
 Assert-Unlinked $binarySource
 if (Test-Path -LiteralPath $binarySource -PathType Container) { $binarySource = Join-Path $binarySource $binaryName }
@@ -128,36 +139,23 @@ if (!(Test-Path -LiteralPath $binarySource -PathType Leaf) -or [IO.Path]::GetFil
 $versionText = (& $binarySource --version 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $versionText -cne "audiolib-server $version") { throw 'Server executable version does not match the release tag.' }
 $binaryHash = (Get-FileHash -LiteralPath $binarySource -Algorithm SHA256).Hash
+$migratorName=Get-ServerMigratorName $binaryName
+$migratorSource=Join-Path (Split-Path -Parent $binarySource) $migratorName
+Assert-Unlinked $migratorSource
+if(!(Test-Path -LiteralPath $migratorSource -PathType Leaf)){throw 'Production migration tool missing beside native server; rebuild both selected release binaries.'}
+$migratorHash=(Get-FileHash -LiteralPath $migratorSource -Algorithm SHA256).Hash
 
-# Capture raw dependency metadata in memory only: it contains local manifest paths.
-# Resolve normal/build dependency edges from the server, excluding dev-only edges.
+# Resolve selected normal/build package dependencies, excluding dev-only edges.
+$licenseFeatures=if($Asio){@('audiolib-desktop/asio','audiolib-cli/asio')}else{@()}
+$licenseGraph=Get-AudioLibLicenseGraph -Root $taskRoot -Packages @('audiolib-server','audiolib-db') -Target $Target -Features $licenseFeatures -NoDefaultFeatures:(!$Asio)
+$packages=$licenseGraph.packages
 Push-Location -LiteralPath $taskRoot
 try {
-    $metadataArguments = @('metadata', '--format-version', '1', '--locked', '--filter-platform', $Target)
-    if ($Asio) { $metadataArguments += @('--features', 'audiolib-desktop/asio,audiolib-cli/asio') }
-    $metadataText = (& cargo @metadataArguments 2>$null | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw 'Server dependency metadata generation failed.' }
-    $metadata = $metadataText | ConvertFrom-Json
     $commit = (& git -c ('safe.directory=' + $taskRoot.Replace('\', '/')) rev-parse HEAD 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Cannot obtain server package source commit.' }
 } finally { Pop-Location }
-$serverPackages = @($metadata.packages | Where-Object { $_.name -eq 'audiolib-server' -and $_.source -eq $null })
-if ($serverPackages.Count -ne 1 -or $serverPackages[0].version -cne $version -or $null -eq $metadata.resolve) { throw 'Server dependency/version identity is invalid.' }
-$nodes = @{}
-foreach ($node in $metadata.resolve.nodes) { $nodes[$node.id] = $node }
-$included = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-$queue = [Collections.Generic.Queue[string]]::new()
-$queue.Enqueue($serverPackages[0].id)
-while ($queue.Count) {
-    $id = $queue.Dequeue()
-    if (!$included.Add($id)) { continue }
-    if (!$nodes.ContainsKey($id)) { throw 'Server dependency graph is incomplete.' }
-    foreach ($dependency in $nodes[$id].deps) {
-        if (@($dependency.dep_kinds | Where-Object { $_.kind -ne 'dev' }).Count) { $queue.Enqueue($dependency.pkg) }
-    }
-}
-$packages = @($metadata.packages | Where-Object { $included.Contains($_.id) } | Sort-Object name, version)
-if ($packages.Count -ne $included.Count) { throw 'Server dependency package list is incomplete.' }
+$serverPackages = @($packages | Where-Object { $_.name -eq 'audiolib-server' -and $_.source -eq $null })
+if ($serverPackages.Count -ne 1 -or $serverPackages[0].version -cne $version) { throw 'Server dependency/version identity is invalid.' }
 $hasAsio = @($packages | Where-Object { $_.name -ceq 'asio-sys' }).Count -gt 0
 if ($hasAsio -ne [bool]$Asio) { throw 'Server ASIO dependency closure differs from the selected -Asio mode.' }
 
@@ -179,45 +177,17 @@ try {
     $stageOwned = $true
     New-Item -ItemType Directory -Path $payloadRoot | Out-Null
     Copy-PublicFile $binarySource $binaryName
+    Copy-PublicFile $migratorSource $migratorName
     $updateChannel = if ($Tag.Contains('-')) { 'beta' } else { 'stable' }
     Set-Content -LiteralPath (Join-Path $payloadRoot 'update-channel.txt') -Value $updateChannel -Encoding ascii
     Set-Content -LiteralPath (Join-Path $payloadRoot 'update-version.txt') -Value $Tag.Substring(1) -Encoding ascii
     $null = $plannedFiles.Add('update-channel.txt')
     $null = $plannedFiles.Add('update-version.txt')
     foreach ($relative in $publicFiles) { Copy-PublicFile (Join-Path $taskRoot $relative) $relative }
-    if ($Asio) {
-        Copy-PublicFile $sdkLicenseSource $sdkLicenseRelative
-        if ((Get-FileHash -LiteralPath (Join-Path $payloadRoot $sdkLicenseRelative) -Algorithm SHA256).Hash -cne $sdkLicenseHash) { throw 'Packaged ASIO SDK notice identity changed.' }
-    }
-    $licenseManifest = @()
-    foreach ($package in $packages) {
-        if ($package.name -notmatch '^[A-Za-z0-9_-]+$' -or $package.version -notmatch '^[A-Za-z0-9.+_-]+$') { throw 'Unsafe dependency identity.' }
-        $repository = if ($package.repository -and $package.repository -match '^https?://[^/@\s]+(?:/[^\s]*)?$') { $package.repository } else { $null }
-        $licenseManifest += [pscustomobject][ordered]@{ name=$package.name; version=$package.version; license=$package.license; repository=$repository }
-        $sourceRoot = Split-Path -Parent $package.manifest_path
-        Assert-Unlinked $sourceRoot
-        $destination = 'licenses/' + $package.name + '-' + $package.version
-        $copiedNotices = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($notice in (Get-ChildItem -LiteralPath $sourceRoot -Force | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE)' })) {
-            if ($notice.PSIsContainer) {
-                if ($notice.Name -match '^(LICENSES?|COPYING|NOTICE)$') { Copy-LicenseTree $notice.FullName ($destination + '/' + $notice.Name) }
-            } else {
-                Copy-PublicFile $notice.FullName ($destination + '/' + $notice.Name)
-                $null = $copiedNotices.Add($notice.FullName)
-            }
-        }
-        if ($package.license_file) {
-            $licenseSource = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($package.license_file)) { $package.license_file } else { Join-Path $sourceRoot $package.license_file }))
-            Assert-Within $licenseSource $sourceRoot
-            if (!$copiedNotices.Contains($licenseSource)) { Copy-PublicFile $licenseSource ($destination + '/' + [IO.Path]::GetFileName($licenseSource)) }
-        }
-        # This upstream crate stores its combined-work notice below the source tree.
-        if ($package.name -eq 'soundtouch-ffi') { Copy-PublicFile (Join-Path $sourceRoot 'soundtouch-2_3_2/COPYING.TXT') ($destination + '/SoundTouch-LGPL.txt') }
-    }
-    $dependencyPath = Join-Path $payloadRoot 'licenses/dependencies.json'
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dependencyPath) | Out-Null
-    ConvertTo-Json -InputObject @($licenseManifest) -Depth 5 | Set-Content -LiteralPath $dependencyPath -Encoding utf8NoBOM
-    $null = $plannedFiles.Add('licenses/dependencies.json')
+    $licenseExtras=@{};if($Asio){$licenseExtras['Steinberg-ASIO-SDK-2.3.4.txt']=$sdkLicenseSource}
+    foreach($relative in (Write-AudioLibLicenseBundle -Graph $licenseGraph -Root $taskRoot -PayloadRoot $payloadRoot -Artifacts @{$binaryName=(Join-Path $payloadRoot $binaryName);$migratorName=(Join-Path $payloadRoot $migratorName)} -ExtraFiles $licenseExtras)){if(!$plannedFiles.Add($relative)){throw 'Duplicate generated dependency notice.'}}
+    $null=Test-AudioLibLicenseBundle -PayloadRoot $payloadRoot -ExpectedRoots @('audiolib-server','audiolib-db') -Target $Target -Features $licenseFeatures -NoDefaultFeatures:(!$Asio) -ExpectedArtifacts @($binaryName,$migratorName)
+    if($Asio -and (Get-FileHash -LiteralPath (Join-Path $payloadRoot $sdkLicenseRelative) -Algorithm SHA256).Hash -cne $sdkLicenseHash){throw 'Packaged ASIO SDK notice identity changed.'}
 
     # Check both known machine prefixes and exact payload names before archiving.
     $privatePrefixes = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -234,6 +204,8 @@ try {
     Assert-UnlinkedTree $payloadRoot
     $payloadFiles = @(Get-ChildItem -LiteralPath $payloadRoot -File -Recurse -Force)
     if ($payloadFiles.Count -ne $plannedFiles.Count) { throw 'Server package file count differs from its allowlist.' }
+    $compatibilityEntries = @($payloadFiles | ForEach-Object { [IO.Path]::GetRelativePath($payloadRoot, $_.FullName).Replace('\', '/') })
+    $layout=Test-ServerPackageLayout -ServerBinaryName $binaryName -Entries $compatibilityEntries
     foreach ($file in $payloadFiles) {
         $relative = [IO.Path]::GetRelativePath($payloadRoot, $file.FullName).Replace('\', '/')
         if (!$plannedFiles.Contains($relative) -or $file.Extension -in @('.db', '.sqlite', '.sqlite3', '.log', '.wav') -or
@@ -241,7 +213,7 @@ try {
             $file.Name -match '(?:-wal|-shm|\.server-state\.json)$' -or $relative -match '(?:^|/)(?:logs?|cache|recovery)/') { throw "Non-public server package file: $relative" }
         $bytes = [IO.File]::ReadAllBytes($file.FullName)
         $texts = @([Text.Encoding]::UTF8.GetString($bytes))
-        if ($relative -eq $binaryName) {
+        if ($relative -in @($binaryName,$migratorName)) {
             $texts += [Text.Encoding]::Unicode.GetString($bytes)
             if ($bytes.Length -gt 1) { $texts += [Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1) }
         }
@@ -253,7 +225,7 @@ try {
         }
         if (!$IsWindows) {
             # Normalize public file permissions: no private mode/owner metadata.
-            $mode = if ($relative -in @($binaryName, 'server/deploy/redeploy-server.sh')) { 493 } else { 420 }
+            $mode = if ($relative -in @($binaryName,$migratorName, 'server/deploy/redeploy-server.sh')) { 493 } else { 420 }
             [IO.File]::SetUnixFileMode($file.FullName, [IO.UnixFileMode]$mode)
         } elseif ($file.LastWriteTime -lt [datetime]::new(1980, 1, 1)) {
             $file.LastWriteTime = [datetime]::new(1980, 1, 1)
@@ -265,6 +237,7 @@ try {
         }
     }
     if ((Get-FileHash -LiteralPath (Join-Path $payloadRoot $binaryName)).Hash -cne $binaryHash) { throw 'Copied server binary identity changed.' }
+    if ((Get-FileHash -LiteralPath (Join-Path $payloadRoot $migratorName)).Hash -cne $migratorHash) { throw 'Copied migration tool identity changed.' }
     $stagedArchive = Join-Path $stageRoot $archiveName
     if ($IsWindows) {
         [IO.Compression.ZipFile]::CreateFromDirectory($payloadRoot, $stagedArchive, [IO.Compression.CompressionLevel]::Optimal, $false)
@@ -290,7 +263,8 @@ try {
     $report = [ordered]@{
         success=$true
         version=$version; tag=$Tag; commit=$commit; target=$Target
-        binary_sha256=$binaryHash; archive_sha256=$archiveHash
+        binary_sha256=$binaryHash; migrator_sha256=$migratorHash; archive_sha256=$archiveHash
+        layout_revision=$layout.layout_revision;automatic_upgrade_compatible=$layout.automatic_upgrade_compatible;manual_bootstrap_required=$layout.manual_bootstrap_required;minimum_updater_version=$layout.minimum_updater_version;old_updater_policy=$layout.old_updater_policy
         checks=[ordered]@{ version=$true; allowlist=$true; unlinked_paths=$true; privacy=$true; archive_contents=$true; executable_mode=$true }
     }
     $stagedReport = Join-Path $stageRoot $reportName

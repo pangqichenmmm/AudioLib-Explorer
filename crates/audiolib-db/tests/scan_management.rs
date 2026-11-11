@@ -293,7 +293,7 @@ fn extensible_valid_bits_are_removed_after_pcm_replacement_preserving_user_data(
     let conn = Connection::open(provider.database_path()).unwrap();
     audiolib_db::register_library_functions(&conn).unwrap();
     conn.execute(
-        "UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.plugin_private','keep') WHERE id=?1",
+        "UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.plugin_private','keep') WHERE id=?1",
         [audio.id],
     )
     .unwrap();

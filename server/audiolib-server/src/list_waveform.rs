@@ -3580,26 +3580,41 @@ mod tests {
     }
 
     #[test]
-    fn non_wav_containers_are_rejected_by_both_compute_paths() {
-        // The decoder is WAV-only (RIFF/RF64/BW64; Symphonia is built with wav/pcm/adpcm
-        // only), so FLAC/MP3 never reach the single-open frame count: both paths fail
-        // at the container check and no list summary is produced.
+    fn malformed_or_unsupported_sources_fail_both_compute_paths() {
+        // Valid bundled source formats now reach both summary paths. Retain
+        // rejection coverage for malformed audio and the unsupported Opus decoder.
         let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
         let mut flac = b"fLaC".to_vec();
         flac.extend_from_slice(&[0x80, 0, 0, 34]);
         flac.extend_from_slice(&[0; 34]);
-        let mut mp3 = b"ID3\x04\0\0\0\0\0\0".to_vec();
-        for _ in 0..8 {
-            mp3.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
-            mp3.extend_from_slice(&[0; 413]);
-        }
-        for (name, bytes) in [("a.flac", flac), ("a.mp3", mp3)] {
+        let mut mp3 =
+            include_bytes!("../../../crates/audiolib-audio/src/fixtures/mp3/cbr-info.mp3").to_vec();
+        mp3.pop();
+        let opus =
+            include_bytes!("../../../crates/audiolib-audio/src/fixtures/vorbis/comments.opus")
+                .to_vec();
+        for (name, bytes) in [("a.flac", flac), ("a.mp3", mp3), ("a.opus", opus)] {
             let path = dir.path().join(name);
             std::fs::write(&path, bytes).unwrap();
             assert!(compute(&path, &cancel).is_err(), "{name}");
             assert!(compute_probed(&path, &cancel).is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn supported_mp3_has_equivalent_list_compute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned.mp3");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../crates/audiolib-audio/src/fixtures/mp3/cbr-info.mp3"),
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let actual = compute(&path, &cancel).unwrap();
+        assert!(actual.iter().any(|peak| *peak != 0));
+        assert_eq!(actual, compute_probed(&path, &cancel).unwrap());
     }
 
     #[test]

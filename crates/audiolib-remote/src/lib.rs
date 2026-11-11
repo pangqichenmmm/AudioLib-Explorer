@@ -31,10 +31,18 @@
 //! * Remote folder browsing ([`RemoteDirectory`]) and sound-library root registration,
 //!   path changes and database-only root removal ([`RootRemoveReport`]), guarded by
 //!   [`Capabilities::may_manage_roots`].
+//! * Optional embedded covers ([`RemoteClient::artwork`]): bounded image responses with
+//!   conditional ETags; gate requests with [`Capabilities::album_artwork_usable`].
+//!   At most two cover requests are in flight. `503 BUSY` retries on `Retry-After`
+//!   seconds (one second when the header is missing) a bounded number of times; HTTP 409
+//!   is not retried. HTTP 405 is logged and still means no cover.
+//!   Shared albums use [`RemoteClient::album_artwork_for_snapshot`], retaining legacy
+//!   source provenance and checking server-authoritative album identities.
 //! * Server profiles (`profiles` module): the data source dialog saved against the
 //!   active profile, "use the external address" as a sibling profile, switching and
 //!   removal, with per-profile tokens in [`RemoteSecrets`].
 mod abort;
+mod artwork;
 mod bandwidth;
 mod cache_cleanup;
 mod client;
@@ -56,18 +64,22 @@ mod resume_regression_tests;
 mod roots;
 mod route;
 mod secrets;
+mod snapshot_staging;
 mod snapshot_transfer;
 mod stream;
 mod sync;
 #[cfg(test)]
 mod test_server;
 mod tls;
+mod upgrade_hints;
 mod util;
+mod vendor_import;
 mod waveform_cache;
 mod writes;
 pub use waveform_cache::waveform_cache_error;
 
 pub use abort::set_connection_warming;
+pub use artwork::{ArtworkReply, MAX_ARTWORK_BYTES, cover_busy_delay};
 pub use bandwidth::{Bandwidth, bandwidth};
 pub use client::{
     BatchWrite, CONNECT_TIMEOUT, DownloadStage, FileWrite, HealthInfo, LIBRARY_ID_HEADER,
@@ -76,7 +88,8 @@ pub use client::{
 };
 pub use download::{
     DEFAULT_DOWNLOAD_CACHE_BYTES, DownloadCache, DownloadItem, DownloadProbe, DownloadProgress,
-    MARKER_FILE, content_disposition_filename, etag_token, probe_download, sanitize_filename,
+    MARKER_FILE, OriginalVersion, OwnedOriginal, content_disposition_filename, etag_token,
+    probe_download, probe_download_with_cancel, sanitize_filename,
 };
 pub use error::{NetworkFailure, RemoteError, Result, TlsFailure};
 pub use list_waveforms::{
@@ -125,6 +138,7 @@ pub use sync::{
     validate_snapshot,
 };
 pub use tls::{TRUST_STORE, TlsInfo};
+pub use upgrade_hints::{retry_during_migration, server_upgrade_status};
 pub use util::encode_path_segment;
 pub use writes::{
     CacheUpdate, RemoteProvider, RemoteWriter, WriteEvent, WriteListener, WriteOutcome,

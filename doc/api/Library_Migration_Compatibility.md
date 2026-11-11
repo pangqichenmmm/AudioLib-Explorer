@@ -1,5 +1,14 @@
 # 客户端、服务端与数据库迁移兼容契约
 
+当前 0.8.1 候选写入 schema 8 / `ale-s8-cld1-t3-m2-p1-a1`，增加
+`album_entities: 1`，Metadata 保持原始 JSON TEXT，压缩暂缓；认可的 3–7 来源须经备份及 owned
+候选迁移，不能按 schema 数字忽略格式特征。业务摘要解码 Metadata 后比较原始
+JSON 字节，共享专辑绑定纳入目标摘要。详见[共享专辑与 Metadata 存储](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Shared_Albums.md)。
+已识别的实验 `a1-z1` 仅保留只读兼容；本地/服务端写入先通过 owned 转换恢复 TEXT，
+保留 namespace、专辑及音频 ID。旧 recipe 未完成的迁移须用匹配版本完成或回退，
+不能由新 recipe 修改标记后接管。外层快照 zstd 传输不受此取舍影响。
+下段保留契约建立时的历史状态；当前验收结果以本轮记录为准。
+
 状态：**2026-10-21 下一版契约，隔离实现，正在进行 CR 后复验，尚未发布**。与 [搜索存储 B](Search_Storage_B.md) 一并验证；实现与验收边界以 [Implementation_B_Status.md](Implementation_B_Status.md) 为准。原工作目录的当前应用、安装和工作库不变。首轮为 `0.5.0-dev.1`；合入已发布 0.5.0 主线后的 CR 分支使用 `0.6.0-dev.1`，两端共享该开发标识。
 
 ## 1. 三种判定与版本范围
@@ -19,6 +28,8 @@
 未知未来格式返回“升级工具版本/取得对应迁移器后重试”，不能仅因当前工具不认识便判定数据必须销毁重建。磁盘不足、锁被占用、权限不足、网络故障是 `blocked` 执行状态，不是第四种数据迁移类别，也不能被误报为必须重建。
 
 ## 2. 多维版本描述
+
+新增音频源通过必需持久 feature `audio_sources:1` 声明，schema 数字仍为 8/9，对应精确格式 `ale-s8-cld1-t3-m2-p1-a1-af1` 和 `ale-s9-cld1-t3-m2-p1-a1-sd1-af1`。只在成功发布新格式记录的同一事务中启用；空库和原格式库保持既有 ID。新目录接受 base/af1，旧目录不能因 schema 数字相同而放行 af1。schema-9 的既有 WAV-only 派生快照移除该 feature 并恢复原 schema-8 ID，排除伪 `.wav` 名称下的新容器。迁移和回滚须保留已存在的 af1 能力要求。已经打开的旧本地实例（包括读写进程）不参与新的检查，启用新源前必须关闭旧实例。
 
 同一次发布的桌面客户端、CLI 和服务端继续采用同一个 workspace SemVer。已部署两端允许暂时处于不同程序版本，但现代握手须各自明确接纳对方的实际版本并共享 API 协议，不能只看两个版本区间是否有交集；实际格式另行检查。
 

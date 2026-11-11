@@ -433,15 +433,24 @@ fn feature_revision_newer_schema_version_is_a_newer_database_error() {
         .pragma_update(None, "user_version", 99)
         .unwrap();
     let original = fs::read(&database).unwrap();
-    for result in [
-        SqliteProvider::open_existing(&database).map(|_| ()),
-        SqliteProvider::open(&database).map(|_| ()),
-        SqliteProvider::open_read_only(&database).map(|_| ()),
-        SqliteProvider::upgrade_owned_snapshot(&database).map(|_| ()),
+    for (result, expected_limit) in [
+        (
+            SqliteProvider::open_existing(&database).map(|_| ()),
+            SCHEMA_VERSION,
+        ),
+        (SqliteProvider::open(&database).map(|_| ()), SCHEMA_VERSION),
+        (
+            SqliteProvider::open_read_only(&database).map(|_| ()),
+            audiolib_db::MAX_SNAPSHOT_SCHEMA,
+        ),
+        (
+            SqliteProvider::upgrade_owned_snapshot(&database).map(|_| ()),
+            audiolib_db::MAX_SNAPSHOT_SCHEMA,
+        ),
     ] {
         assert!(
             matches!(&result, Err(Error::NewerDatabase { what, found: 99, supported })
-                if what == "schema" && *supported == SCHEMA_VERSION),
+                if what == "schema" && *supported == expected_limit),
             "{result:?}"
         );
         assert_eq!(fs::read(&database).unwrap(), original);

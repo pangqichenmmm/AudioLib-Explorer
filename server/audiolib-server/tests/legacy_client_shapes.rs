@@ -203,7 +203,7 @@ async fn every_released_client_shape_parses_probes_and_reaches_the_upgrade_409()
     assert!(v050.list_waveforms.is_some());
     let v060: CapabilitiesV060 = serde_json::from_slice(&body).expect("v0.6.0–v0.7.1 shape");
     let manifest = v060.compatibility.expect("manifest emitted");
-    assert_eq!(manifest.catalog_revision, 1);
+    assert_eq!(manifest.catalog_revision, 2);
     assert!(manifest.api_protocols.contains(&"api/v1".to_owned()));
     assert!(!manifest.direct_use_application_ranges.is_empty());
     assert!(!manifest.auto_migrate_application_ranges.is_empty());

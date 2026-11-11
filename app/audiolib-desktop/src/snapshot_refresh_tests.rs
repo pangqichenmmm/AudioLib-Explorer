@@ -2,7 +2,7 @@
 //! Isolated regressions for automatic server refresh during audition and search retention.
 use super::super::*;
 use super::source_transition_tests::{
-    configuration, isolated_module, request, respond, root, run_until,
+    CapabilityProbeServer, configuration, isolated_module, request, respond, root, run_until,
 };
 use super::*;
 use audiolib_core::config::{ActiveSource, ServerProfile};
@@ -136,6 +136,66 @@ fn await_results(controller: &Arc<Controller>, ui: &AppWindow, rows: usize) {
 #[test]
 fn a_same_library_refresh_retains_the_filtered_search_folder_and_page() {
     isolated_module("snapshot_refresh_tests", "child_search_retention");
+}
+
+#[test]
+fn same_library_refresh_keeps_an_armed_result_scroll() {
+    isolated_module(
+        "snapshot_refresh_tests",
+        "child_server_library_switch_resets_result_scroll",
+    );
+}
+
+#[test]
+#[ignore = "isolated Slint result-scroll retention across server libraries"]
+fn child_server_library_switch_resets_result_scroll() {
+    i_slint_backend_testing::init_integration_test_with_system_time();
+    let (controller, ui, _engine, same, _) = fixture(1);
+    ui.show().unwrap();
+    ui.set_remote_mode(true);
+    ui.invoke_restore_search_task_viewport(-640.0, -12.0, 0.0, 0.0, 0.0);
+    assert!(
+        ui.get_task_result_scroll_y() < -600.0,
+        "armed offset {}",
+        ui.get_task_result_scroll_y()
+    );
+    assert!(controller.is_same_library_snapshot_refresh(&same));
+    controller.reset_library_view(&ui, false, true);
+    assert!(
+        ui.get_task_restoring(),
+        "same-library refresh discarded the armed result restore"
+    );
+    assert!(
+        ui.get_task_result_scroll_y() < -600.0,
+        "same-library refresh reset the armed result scroll to {}",
+        ui.get_task_result_scroll_y()
+    );
+    assert!(
+        ui.get_task_result_scroll_x() < -10.0,
+        "same-library refresh reset the armed horizontal scroll to {}",
+        ui.get_task_result_scroll_x()
+    );
+
+    let DataSourceSwitch::Server { database, state } = &same else {
+        unreachable!("fixture opens a server snapshot")
+    };
+    let mut other = state.clone().expect("snapshot state");
+    other.library_id = "library-b".into();
+    let other_library = DataSourceSwitch::Server {
+        database: database.clone(),
+        state: Some(other),
+    };
+    assert!(!controller.is_same_library_snapshot_refresh(&other_library));
+    controller.reset_library_view(&ui, true, false);
+    assert!(!ui.get_task_restoring());
+    let cleared = ui.get_task_result_scroll_y();
+    let cleared_x = ui.get_task_result_scroll_x();
+    assert!(
+        cleared.abs() < 1.0 && cleared_x.abs() < 1.0,
+        "server library A→B must clear the result list, y={cleared} x={cleared_x}"
+    );
+    controller.shutdown();
+    ui.hide().unwrap();
 }
 
 #[test]
@@ -464,7 +524,8 @@ impl SnapshotServer {
                         let format = serde_json::to_string(&audiolib_core::compatibility::LibraryFormat::target()).unwrap();
                         let manifest = serde_json::to_string(&audiolib_core::compatibility::compatibility_manifest()).unwrap();
                         let format_id = audiolib_core::compatibility::PLAN_B_FORMAT;
-                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nX-Library-Id: {library_id}\r\nX-Library-Revision: {revision}\r\nX-Schema-Version: 6\r\nX-Audiolib-Snapshot-Format: {format_id}\r\nX-Audiolib-Library-Format: {format}\r\nX-Audiolib-Server-Compatibility: {manifest}\r\nX-Search-Storage-Revision: 1\r\nX-Tokenization-Revision: 3\r\nX-Source-Search-Revision: 2\r\nX-Source-Tags-Revision: 2\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                        let schema_version = audiolib_db::SCHEMA_VERSION;
+                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nX-Library-Id: {library_id}\r\nX-Library-Revision: {revision}\r\nX-Schema-Version: {schema_version}\r\nX-Audiolib-Snapshot-Format: {format_id}\r\nX-Audiolib-Library-Format: {format}\r\nX-Audiolib-Server-Compatibility: {manifest}\r\nX-Search-Storage-Revision: 1\r\nX-Tokenization-Revision: 3\r\nX-Source-Search-Revision: 2\r\nX-Source-Tags-Revision: 2\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
                         socket.write_all(&bytes).unwrap();
                     }
                     _ => respond(
@@ -587,9 +648,8 @@ fn play_source_switch(transition: PlayTransition) {
         state.revision,
         std::fs::read(b_snapshot).unwrap(),
     );
-    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url_a = format!("http://{}", a.local_addr().unwrap());
-    a.set_nonblocking(true).unwrap();
+    let a = CapabilityProbeServer::start();
+    let url_a = a.url.clone();
     state.server_url = url_a.clone();
     let cache = RemoteCache::new(&controller.data_root());
     cache.save_state(&state).unwrap();
@@ -685,7 +745,11 @@ fn play_source_switch(transition: PlayTransition) {
                     state.revision == 1 && cached_source_matches(&state.server_url, &url_b)
                 })
     });
-    assert!(matches!(a.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    // A completed provider swap refreshes /capabilities. The strict mock rejects
+    // every play, mutation or snapshot request instead of rejecting this read.
+    if !snapshot_swap {
+        assert_eq!(a.request_count(), 0);
+    }
     assert!(history_path.is_file());
     assert_eq!(local_history.page(10, 0).unwrap().len(), 2);
     if close {
@@ -702,6 +766,7 @@ fn play_source_switch(transition: PlayTransition) {
                 .is_none()
         );
         controller.shutdown();
+        a.finish();
         b.finish();
         return;
     }
@@ -731,6 +796,7 @@ fn play_source_switch(transition: PlayTransition) {
         );
         controller.shutdown();
         ui.hide().unwrap();
+        a.finish();
         b.finish();
         return;
     }
@@ -756,5 +822,6 @@ fn play_source_switch(transition: PlayTransition) {
     );
     controller.shutdown();
     ui.hide().unwrap();
+    a.finish();
     b.finish();
 }

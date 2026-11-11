@@ -6,6 +6,7 @@
 //! LAN-only admin page (`/admin`) manages the public URL, authentication and library
 //! management modes, tokens and optional native TLS.
 pub mod admin;
+mod artwork;
 pub mod auth;
 pub mod browse;
 mod compatibility;
@@ -13,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod list_waveform;
 pub mod manage;
+mod migration;
 pub mod pcm;
 pub mod preview;
 pub mod revision;
@@ -26,6 +28,7 @@ pub mod state;
 pub mod stream;
 pub mod tls;
 pub mod update;
+mod vendor_import;
 pub mod waveform;
 pub mod wf_job;
 pub mod wfdb;

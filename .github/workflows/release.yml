@@ -1,6 +1,10 @@
 # Release packages are built, validated and published on local machines:
 #   - Windows x64 ASIO client (AudioLibExplorer-<tag>-win-x64-portable.zip)
+#   - macOS arm64 client     (AudioLibExplorer-<tag>-macos-arm64.zip; >= 0.8.3)
 #   - macOS arm64 server     (AudioLibServer-<tag>-macos-arm64.tar.gz)
+#   - Linux x64 server       (AudioLibServer-<tag>-linux-x64.tar.gz; >= 0.8.4)
+#   - Windows x64 server     (AudioLibServer-<tag>-win-x64.zip; >= 0.8.5)
+#   - Docker amd64/arm64     (AudioLibServer-<tag>-docker-linux-<arch>.tar.gz; >= 0.8.4)
 # each with a .sha256, via tools/release-create.sh <tag> <assets...> or
 # `gh release upload <tag> <files>`. Pre-release status is derived from the tag
 # by tools/release-create.sh (vX.Y.Z-beta.N / -rc.N => --prerelease --latest=false).
@@ -8,7 +12,8 @@
 # This workflow is VERIFY-ONLY. It has no push/tag trigger (workflow_dispatch
 # only), builds nothing, and never creates, edits or uploads a release or asset
 # (permissions: contents: read). Run it manually after the local upload to check
-# that the release carries exactly the four expected assets with valid checksums.
+# that the release carries the exact expected assets with valid checksums:
+# fourteen from 0.8.5 onward, twelve for 0.8.4, six for 0.8.3, four through 0.8.2.
 # See doc/Rust_Versioning.md.
 name: Release verify
 
@@ -36,29 +41,25 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Verify the release has the client and macOS server packages with SHA-256
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify the published platform packages and SHA-256 files
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:RELEASE_TAG -cnotmatch '^v(\d+\.\d+\.\d+)(-(rc|beta)\.\d+)?$') { throw "Tag '$($env:RELEASE_TAG)' must be vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N." }
-          $expectPre = [bool]$Matches[2]
-          $json = gh release view $env:RELEASE_TAG --json name,isPrerelease,assets
+          if ($env:RELEASE_TAG -cnotmatch '^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:rc|beta)\.(?:0|[1-9]\d*))?$') { throw 'The release tag is not canonical vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N.' }
+          # The verifier comes from this workflow's source ref, so its historical
+          # policy can also verify tags that predate the shared script.
+          $json = gh release view $env:RELEASE_TAG --json tagName,name,isPrerelease,assets
           if ($LASTEXITCODE -ne 0) { throw "Release $($env:RELEASE_TAG) not found or not readable." }
-          $rel = $json | ConvertFrom-Json
-          if ($rel.name -cne "AudioLib Explorer $($env:RELEASE_TAG)") { throw "Release title '$($rel.name)' does not match tag." }
-          if ([bool]$rel.isPrerelease -ne $expectPre) { throw "Release prerelease flag $($rel.isPrerelease) does not match tag (expected $expectPre)." }
-          $packages = @("AudioLibExplorer-$env:RELEASE_TAG-win-x64-portable.zip", "AudioLibServer-$env:RELEASE_TAG-macos-arm64.tar.gz")
-          $assetNames = @($rel.assets | ForEach-Object name)
-          $missing = @()
-          foreach ($p in $packages) { foreach ($n in @($p, "$p.sha256")) { if ($assetNames -cnotcontains $n) { $missing += $n } } }
-          if ($missing) { throw "Missing release assets: $($missing -join ', ')" }
-          # Download (read-only) into a temp dir and check each SHA-256 file.
-          $dir = Join-Path $env:RUNNER_TEMP 'release-verify'
+          $metadataPath = Join-Path $env:RUNNER_TEMP ('release-' + [guid]::NewGuid().ToString('N') + '.json')
+          [IO.File]::WriteAllText($metadataPath, ($json | Out-String), [Text.UTF8Encoding]::new($false))
+          $packages = @(& ./tools/verify-release-assets.ps1 -Tag $env:RELEASE_TAG -ReleaseJsonPath $metadataPath)
+          # Download (read-only) into a fresh temp dir, then verify all digests.
+          $dir = Join-Path $env:RUNNER_TEMP ('release-verify-' + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           foreach ($p in $packages) {
             gh release download $env:RELEASE_TAG --dir $dir --pattern $p --pattern "$p.sha256"
             if ($LASTEXITCODE -ne 0) { throw "Download of $p failed." }
-            $parts = (Get-Content -LiteralPath (Join-Path $dir "$p.sha256") -Raw).Trim() -split '\s+'
-            if ($parts.Count -ne 2 -or $parts[1].TrimStart('*') -cne $p -or $parts[0] -notmatch '^[0-9A-Fa-f]{64}$') { throw "Malformed checksum file for $p." }
-            if ((Get-FileHash -LiteralPath (Join-Path $dir $p) -Algorithm SHA256).Hash -ine $parts[0]) { throw "Checksum mismatch for $p." }
-            "OK $p"
           }
+          & ./tools/verify-release-assets.ps1 -Tag $env:RELEASE_TAG -ReleaseJsonPath $metadataPath -AssetDirectory $dir | Out-Null

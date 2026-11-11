@@ -1,13 +1,13 @@
 // crates/audiolib-core/src/search_workspace.rs
 //! Owned client-local search tasks and explicitly saved search definitions.
-use crate::{Error, Result, SearchFilters, SearchRequest, SortOrder};
+use crate::{Error, Result, SearchFilters, SearchRequest, SearchScope, SortOrder};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
 /// Persistent workspace encoding, independent of the library and snapshot schema.
-pub const SEARCH_WORKSPACE_VERSION: u32 = 1;
+pub const SEARCH_WORKSPACE_VERSION: u32 = 2;
 /// Hard limit on simultaneously open search tasks; favorites do not count toward it.
-pub const MAX_SEARCH_TASKS: usize = 6;
+pub const MAX_SEARCH_TASKS: usize = 30;
 
 /// A user-data directory and immutable library scope captured before worker dispatch.
 /// Writers hold the desktop instance lease and serialize saves for this data directory.
@@ -49,14 +49,33 @@ pub struct SearchAudioRef {
     pub file_path: String,
 }
 
+/// An album's semantic owner within one identity namespace. Numeric IDs alone
+/// cannot survive an independent import or a legacy server's native upgrade.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumFilterBinding {
+    pub namespace: String,
+    pub kind: crate::AlbumKind,
+    pub metadata_key: Option<String>,
+    pub folder_path: Option<String>,
+    /// Preserve an unresolved filter visibly instead of searching another album
+    /// which happens to reuse its numeric ID. Restoring may retry the binding.
+    #[serde(default)]
+    pub unavailable: bool,
+}
+
 /// Live search conditions. Saving a favorite stores conditions, never result rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchTaskDefinition {
     pub query: String,
+    /// Saved match scope. Older workspaces preserve their legacy main-field search.
+    #[serde(default, skip_serializing_if = "crate::scope_is_main")]
+    pub scope: SearchScope,
     pub folder: Option<SearchFolderRef>,
     pub include_subfolders: bool,
     pub filters: SearchFilters,
+    #[serde(default)]
+    pub album_binding: Option<AlbumFilterBinding>,
     pub order_by: SortOrder,
     pub descending: bool,
 }
@@ -65,9 +84,11 @@ impl Default for SearchTaskDefinition {
     fn default() -> Self {
         Self {
             query: String::new(),
+            scope: SearchScope::Main,
             folder: None,
             include_subfolders: true,
             filters: SearchFilters::default(),
+            album_binding: None,
             order_by: SortOrder::Relevance,
             descending: false,
         }
@@ -76,6 +97,8 @@ impl Default for SearchTaskDefinition {
 
 impl SearchTaskDefinition {
     /// Build a request for the caller's page. Execution still validates the request.
+    /// Resolve `album_binding` against the chosen library namespace before running
+    /// an album-ID filter; an unresolved binding must never execute its numeric ID.
     pub fn to_request(&self, limit: usize, offset: usize) -> SearchRequest {
         SearchRequest {
             query: self.query.clone(),
@@ -86,6 +109,9 @@ impl SearchTaskDefinition {
             offset,
             order_by: self.order_by,
             descending: self.descending,
+            scope: self.scope,
+            cursor: None,
+            page: None,
         }
     }
 
@@ -104,6 +130,36 @@ impl SearchTaskDefinition {
         request.validate()?;
         if let Some(folder) = &self.folder {
             validate_reference(&folder.path)?;
+        }
+        if let Some(binding) = &self.album_binding {
+            if self.filters.album_id.is_none() {
+                return Err(invalid("An album binding requires its album filter"));
+            }
+            validate_name(&binding.namespace, 128, "album namespace")?;
+            match binding.kind {
+                crate::AlbumKind::Metadata => {
+                    let key = binding
+                        .metadata_key
+                        .as_deref()
+                        .ok_or_else(|| invalid("Metadata album binding needs its key"))?;
+                    validate_reference(key)?;
+                    if binding.folder_path.is_some() {
+                        return Err(invalid(
+                            "Metadata album binding cannot contain a folder path",
+                        ));
+                    }
+                }
+                crate::AlbumKind::Folder => {
+                    if binding.metadata_key.is_some() {
+                        return Err(invalid(
+                            "Folder album binding cannot contain a Metadata key",
+                        ));
+                    }
+                    if let Some(path) = &binding.folder_path {
+                        validate_reference(path)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -231,6 +287,16 @@ impl SearchWorkspace {
         }
     }
 
+    /// Admit a fully decoded legacy workspace without changing any conditions.
+    /// Storage readers must reject unknown fields before invoking this conversion.
+    /// The next ordered save writes v2, which v1 readers refuse before execution.
+    pub fn upgrade_legacy_version(&mut self) -> Result<()> {
+        if self.format_version == 1 {
+            self.format_version = SEARCH_WORKSPACE_VERSION;
+        }
+        self.validate()
+    }
+
     /// Validate persistent identities, search conditions and the hard open-task limit.
     pub fn validate(&self) -> Result<()> {
         if self.format_version != SEARCH_WORKSPACE_VERSION {
@@ -238,7 +304,9 @@ impl SearchWorkspace {
         }
         validate_scope(&self.library_scope)?;
         if self.session.tasks.len() > MAX_SEARCH_TASKS {
-            return Err(invalid("At most six search tasks may be open"));
+            return Err(invalid(format!(
+                "At most {MAX_SEARCH_TASKS} search tasks may be open"
+            )));
         }
         let mut tasks = std::collections::HashSet::new();
         for task in &self.session.tasks {
@@ -307,6 +375,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saved_scopes_round_trip_and_legacy_definitions_keep_main_fields() {
+        let legacy: SearchTaskDefinition = serde_json::from_str(r#"{"query":"wind"}"#).unwrap();
+        assert_eq!(legacy.scope, SearchScope::Main);
+        assert_eq!(legacy.to_request(200, 400).scope, SearchScope::Main);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("scope")
+                .is_none()
+        );
+        for scope in [
+            SearchScope::Main,
+            SearchScope::All,
+            SearchScope::Path,
+            SearchScope::Filename,
+        ] {
+            let definition = SearchTaskDefinition {
+                scope,
+                query: "wind".into(),
+                ..Default::default()
+            };
+            let restored: SearchTaskDefinition =
+                serde_json::from_slice(&serde_json::to_vec(&definition).unwrap()).unwrap();
+            assert_eq!(restored, definition);
+            assert_eq!(restored.to_request(200, 400).scope, scope);
+            restored.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn title_provenance_defaults_for_legacy_json_and_round_trips_explicit_names() {
         let mut task: SearchTask =
             serde_json::from_str(r#"{"id":"task","title":"Search 2"}"#).unwrap();
@@ -353,6 +451,70 @@ mod tests {
     }
 
     #[test]
+    fn album_binding_round_trips_and_legacy_name_filters_remain_readable() {
+        let mut legacy = serde_json::to_value(SearchTaskDefinition {
+            filters: SearchFilters {
+                album: Some("Legacy Library".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        legacy.as_object_mut().unwrap().remove("album_binding");
+        let old: SearchTaskDefinition = serde_json::from_value(legacy).unwrap();
+        assert!(old.album_binding.is_none());
+        old.validate().unwrap();
+        let mut definition = SearchTaskDefinition {
+            filters: SearchFilters {
+                album_id: Some(7),
+                ..Default::default()
+            },
+            album_binding: Some(AlbumFilterBinding {
+                namespace: "namespace-one".into(),
+                kind: crate::AlbumKind::Metadata,
+                metadata_key: Some("Library A".into()),
+                folder_path: None,
+                unavailable: true,
+            }),
+            ..Default::default()
+        };
+        definition.validate().unwrap();
+        let restored: SearchTaskDefinition =
+            serde_json::from_slice(&serde_json::to_vec(&definition).unwrap()).unwrap();
+        assert_eq!(restored, definition);
+        definition.album_binding.as_mut().unwrap().folder_path = Some("/unrelated".into());
+        assert!(definition.validate().is_err());
+        definition.album_binding.as_mut().unwrap().folder_path = None;
+        definition.filters.album_id = None;
+        assert!(definition.validate().is_err());
+    }
+
+    #[test]
+    fn workspace_v1_is_explicitly_admitted_and_newer_versions_remain_protected() {
+        let mut old = SearchWorkspace::for_scope("server-library");
+        old.session.tasks.push(SearchTask {
+            id: "task".into(),
+            title: "Original".into(),
+            ..Default::default()
+        });
+        old.favorites.push(SavedSearchTask {
+            id: "saved".into(),
+            title: "Favorite".into(),
+            ..Default::default()
+        });
+        old.format_version = 1;
+        assert!(old.validate().is_err());
+        let original = old.clone();
+        old.upgrade_legacy_version().unwrap();
+        assert_eq!(old.format_version, 2);
+        assert_eq!(old.session, original.session);
+        assert_eq!(old.favorites, original.favorites);
+        old.format_version = 3;
+        assert!(old.upgrade_legacy_version().is_err());
+        assert_eq!(old.format_version, 3);
+    }
+
+    #[test]
     fn session_validates_identity_and_limit_without_changing_favorites() {
         let mut workspace = SearchWorkspace::for_scope("server-library");
         workspace.favorites.push(SavedSearchTask {
@@ -377,13 +539,41 @@ mod tests {
         workspace.session.active_task_id = Some("missing".into());
         assert!(workspace.validate().is_err());
         workspace.session.active_task_id = None;
-        workspace.session.tasks = (0..7)
+        workspace.session.tasks = (0..=MAX_SEARCH_TASKS)
             .map(|index| SearchTask {
                 id: index.to_string(),
                 title: "Search".into(),
                 ..Default::default()
             })
             .collect();
+        assert!(workspace.validate().is_err());
+    }
+
+    #[test]
+    fn thirty_task_session_round_trip_retains_order_and_last_active_task() {
+        let mut workspace = SearchWorkspace::for_scope("server-library");
+        workspace.session.tasks = (0..30)
+            .map(|index| SearchTask {
+                id: format!("task-{index}"),
+                title: format!("Search {}", index + 1),
+                definition: SearchTaskDefinition {
+                    query: format!("sound {index}"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect();
+        workspace.session.active_task_id = Some("task-29".into());
+        workspace.validate().unwrap();
+        let restored: SearchWorkspace =
+            serde_json::from_slice(&serde_json::to_vec(&workspace).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, workspace);
+        workspace.session.tasks.push(SearchTask {
+            id: "task-30".into(),
+            title: "Search 31".into(),
+            ..Default::default()
+        });
         assert!(workspace.validate().is_err());
     }
 }

@@ -142,13 +142,14 @@ fn child_folder_identity_drift() {
             .unwrap()
             .modified
     );
-    for _ in 1..6 {
+    let capacity = audiolib_core::search_workspace::MAX_SEARCH_TASKS;
+    for _ in 1..capacity {
         new_task(&fixture);
     }
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     ui.invoke_saved_search_opened(saved.id.clone().into());
     wait_task(&fixture, &first);
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     let row = ui
         .get_search_tasks()
         .iter()
@@ -204,8 +205,9 @@ fn definition_identity_allows_id_drift_without_merging_distinct_indexed_aliases(
     assert!(!same_search_definition(&original, &compared));
     compared.folder = None;
     assert!(!same_search_definition(&original, &compared));
-    let changes: [fn(&mut SearchTaskDefinition); 5] = [
+    let changes: [fn(&mut SearchTaskDefinition); 6] = [
         |definition: &mut SearchTaskDefinition| definition.query.push_str(" rain"),
+        |definition: &mut SearchTaskDefinition| definition.scope = audiolib_core::SearchScope::Path,
         |definition: &mut SearchTaskDefinition| definition.include_subfolders = false,
         |definition: &mut SearchTaskDefinition| definition.filters.favorites_only = true,
         |definition: &mut SearchTaskDefinition| definition.order_by = SortOrder::Filename,
@@ -267,7 +269,8 @@ fn child_case_distinct_full_capacity() {
         .unwrap()
         .unwrap();
     assert_ne!(upper.id, lower.id);
-    for _ in 1..6 {
+    let capacity = audiolib_core::search_workspace::MAX_SEARCH_TASKS;
+    for _ in 1..capacity {
         new_task(&fixture);
     }
     let before = active_id(ui);
@@ -297,7 +300,7 @@ fn child_case_distinct_full_capacity() {
     controller.publish_search_tasks(ui);
     ui.invoke_saved_search_opened(saved.id.clone().into());
     assert_eq!(active_id(ui), before);
-    assert_eq!(ui.get_search_tasks().row_count(), 6);
+    assert_eq!(ui.get_search_tasks().row_count(), capacity);
     assert!(ui.get_status().contains("limit"));
     let state = controller.task_workspace.lock().unwrap();
     assert_eq!(state.workspace.favorites, vec![saved]);

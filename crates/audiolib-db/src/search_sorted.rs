@@ -77,7 +77,7 @@ pub(super) fn filtered_filename_page(
     let filtered_ids = if let Some(filter_from) = filter_from.filter(|_| !query_ids.is_empty()) {
         let mut filter_request = request.clone();
         filter_request.query.clear();
-        let filter_sql = search_sql(tokenizer, &filter_request, false, false)?;
+        let filter_sql = search_sql(tx, tokenizer, &filter_request, false, false)?;
         let Some(ids) = search_candidates::filtered_ids_full_scan(
             tx,
             &format!(
@@ -100,6 +100,7 @@ pub(super) fn filtered_filename_page(
     let total_count = ids.len() as u64;
     if request.offset as u64 >= total_count {
         return Ok(Some(SearchPage {
+            total_count_exact: true,
             total_count,
             query: request.query.clone(),
             execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -125,12 +126,14 @@ pub(super) fn filtered_filename_page(
         .map_err(db_error)?;
     check_cancel()?;
     Ok(Some(SearchPage {
+        total_count_exact: true,
         returned_count: results.len(),
         results,
         total_count,
         query: request.query.clone(),
         execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
         cache_hit: false,
+        next_cursor: None,
     }))
 }
 
@@ -545,9 +548,12 @@ mod tests {
                 1,
                 "{plan:?}"
             );
+            // Album DTO lookups hydrate only the already bounded page. The
+            // ranking/membership prefix must still avoid correlated probes.
             assert!(
                 !plan
                     .iter()
+                    .take_while(|step| !step.contains("SEARCH af USING INTEGER PRIMARY KEY"))
                     .any(|step| step.contains("CORRELATED") || step.contains("=M")),
                 "{plan:?}"
             );
@@ -728,7 +734,10 @@ mod tests {
                     "{plan:?}"
                 );
                 assert!(
-                    !plan.iter().any(|line| line.contains("CORRELATED")),
+                    !plan
+                        .iter()
+                        .take_while(|line| !line.contains("SEARCH af USING INTEGER PRIMARY KEY"))
+                        .any(|line| line.contains("CORRELATED")),
                     "{plan:?}"
                 );
                 let all = SearchRequest {
@@ -786,7 +795,10 @@ mod tests {
             "{plan:?}"
         );
         assert!(
-            !plan.iter().any(|line| line.contains("CORRELATED")),
+            !plan
+                .iter()
+                .take_while(|line| !line.contains("SEARCH af USING INTEGER PRIMARY KEY"))
+                .any(|line| line.contains("CORRELATED")),
             "{plan:?}"
         );
         let hydrate = plan

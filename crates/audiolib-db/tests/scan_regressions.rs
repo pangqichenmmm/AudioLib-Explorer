@@ -102,7 +102,10 @@ fn parallel_probes_match_serial_metadata_and_incremental_counts() {
         let records = page
             .results
             .into_iter()
-            .map(|audio| (audio.file_path, audio.attributes))
+            .map(|audio| {
+                let audio = audio.into_data();
+                (audio.file_path, audio.attributes)
+            })
             .collect::<std::collections::BTreeMap<_, _>>();
         // Runtime timestamps/encoding are hydrated as attributes; compare source fields only.
         let source: std::collections::BTreeMap<_, _> = records
@@ -287,7 +290,7 @@ fn successful_probe_removes_absent_bwf_ixml_and_fts_but_preserves_user_data() {
     audiolib_db::register_library_functions(&conn).unwrap();
     conn.execute("UPDATE audio_files SET user_rating=5 WHERE id=?1", [id])
         .unwrap();
-    conn.execute("UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.plugin_private','keep','$.bwf_plugin_private','independent') WHERE id=?1",[id]).unwrap();
+    conn.execute("UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.plugin_private','keep','$.bwf_plugin_private','independent') WHERE id=?1",[id]).unwrap();
     fs::write(&file, b"damaged file").unwrap();
     let failed = service
         .scan(

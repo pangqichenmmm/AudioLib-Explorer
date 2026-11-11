@@ -232,6 +232,94 @@ fn historical_binary_only_mac_layout_cannot_bypass_public_package_validation() {
 }
 
 #[test]
+fn current_server_archives_require_the_platform_migrator_and_keep_unix_tools_executable() {
+    let migrator = if cfg!(windows) {
+        "audiolib-migrate.exe"
+    } else {
+        "audiolib-migrate"
+    };
+    let other_migrator = if cfg!(windows) {
+        "audiolib-migrate"
+    } else {
+        "audiolib-migrate.exe"
+    };
+    for tar_archive in [false, true] {
+        for complete in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let name = if tar_archive {
+                "update.tar.gz"
+            } else {
+                "update.zip"
+            };
+            let archive = root.path().join(name);
+            let mut files = package::required(Product::Server).to_vec();
+            if !complete {
+                files.retain(|name| *name != migrator);
+                // An allowed executable for the other platform cannot stand in
+                // for the migrator paired with this platform's server.
+                files.push(other_migrator);
+            }
+            if tar_archive {
+                let encoder = flate2::write::GzEncoder::new(
+                    std::fs::File::create(&archive).unwrap(),
+                    flate2::Compression::default(),
+                );
+                let mut tar = tar::Builder::new(encoder);
+                for file in files {
+                    let mut header = tar::Header::new_ustar();
+                    header.set_path(file).unwrap();
+                    header.set_size(7);
+                    // Extraction owns the executable policy; do not rely on
+                    // permissive input mode bits to make this test pass.
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    tar.append(&header, b"fixture".as_slice()).unwrap();
+                }
+                tar.into_inner().unwrap().finish().unwrap();
+            } else {
+                let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+                for file in files {
+                    zip.start_file(file, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(b"fixture").unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            let payload = root.path().join("payload");
+            std::fs::create_dir(&payload).unwrap();
+            let result = package::extract(&archive, &payload, Product::Server, name);
+            if complete {
+                result.unwrap();
+                for file in package::required(Product::Server) {
+                    assert_eq!(std::fs::read(payload.join(file)).unwrap(), b"fixture");
+                }
+                #[cfg(unix)]
+                if tar_archive {
+                    use std::os::unix::fs::PermissionsExt;
+                    for executable in ["audiolib-server", "audiolib-migrate"] {
+                        assert_eq!(
+                            std::fs::metadata(payload.join(executable))
+                                .unwrap()
+                                .permissions()
+                                .mode()
+                                & 0o777,
+                            0o755
+                        );
+                    }
+                }
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(&format!("Required update file is missing: {migrator}")),
+                    "{error}"
+                );
+                assert!(!payload.join(migrator).exists());
+            }
+        }
+    }
+}
+
+#[test]
 fn staged_updates_exclude_another_updater_for_the_same_installation() {
     let root = tempfile::tempdir().unwrap();
     let first_stage = tempfile::Builder::new()
@@ -347,6 +435,55 @@ fn installed_beta_marker_is_bound_to_binary_core_version() {
     assert_eq!(client.channel, Channel::Beta);
     assert_eq!(client.current.to_string(), "0.6.2-beta.12");
     assert!(UpdateClient::for_install(Product::Desktop, "0.6.1", root.path()).is_err());
+}
+
+#[test]
+fn installed_development_markers_retain_identity_and_require_matching_binary_version() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("update-channel.txt"), "beta\n").unwrap();
+    for (marker, development) in [
+        ("0.8.6-0", true),
+        ("0.8.6-0+local.0123456789ab", true),
+        ("0.8.6", false),
+        ("0.8.6-beta.2", false),
+        ("0.8.6-rc.1", false),
+        ("0.8.6-0.1", false),
+        ("0.8.6+local.0123456789ab", false),
+    ] {
+        std::fs::write(
+            root.path().join("update-version.txt"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        for product in [Product::Desktop, Product::Server] {
+            let client = UpdateClient::for_install(product, "0.8.6", root.path()).unwrap();
+            assert_eq!(client.current_version(), marker);
+            assert_eq!(client.is_development(), development, "{marker}");
+            assert_eq!(client.channel(), Channel::Beta);
+            assert!(UpdateClient::for_install(product, "0.8.5", root.path()).is_err());
+        }
+    }
+}
+
+#[test]
+fn development_detection_does_not_change_server_release_selection() {
+    let client =
+        UpdateClient::new(Product::Server, Channel::Beta, "0.8.6-0+local.0123456789ab").unwrap();
+    assert!(client.is_development());
+    let selected = client
+        .select_for_platform(
+            vec![release_for_platform(
+                Product::Server,
+                "v0.8.6",
+                false,
+                false,
+                Platform::WindowsX64,
+            )],
+            Platform::WindowsX64,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.version, "0.8.6");
 }
 
 #[test]

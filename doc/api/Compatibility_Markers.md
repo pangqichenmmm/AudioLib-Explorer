@@ -1,8 +1,8 @@
-# 基于标记的同步兼容判定（设计草案）
+# 基于标记的同步兼容判定（历史设计）
 
-状态：**设计草案，未实现**（PR #97）。目标：客户端与服务端同步兼容**不再依赖应用版本号**，改由三类标记判定：`protocol`、库格式 ID（schema/format）、`features`。应用版本只用于显示、更新检查和可选的已知坏版本黑名单。现行契约见 [Library_Migration_Compatibility.md](Library_Migration_Compatibility.md)。
+状态：**历史设计记录**（[PR #97](https://github.com/Freedragonlancer/AudioLib-Explorer/pull/97)，不再作为待合并实现）。当前 `audiolib-core/src/compatibility.rs` 已按协议标记、完整库格式和 feature 判定兼容性；具备标记的双方不再以应用版本范围作为同步硬门槛。本文保留设计时的问题、方案与示例，不代表当前完整字段、格式目录或实现状态。现行契约以 [Library_Migration_Compatibility.md](Library_Migration_Compatibility.md) 和当前源码为准。
 
-## 1. 现状（代码对照）
+## 1. 设计时现状（历史代码对照）
 
 | 位置 | 现行字段/逻辑 | 问题 |
 |---|---|---|

@@ -588,6 +588,8 @@ impl AppState {
                 added: session.added,
                 updated: session.updated,
                 unchanged: session.unchanged,
+                // Older persisted ScanSession rows have no table-level counters.
+                vendor_metadata: Default::default(),
                 removed: session.removed,
                 errors: session.errors,
                 error_details: session.error_details,
@@ -826,7 +828,10 @@ fn run_scan_inner(
     // Conservative: count the scan as a change unless it provably changed nothing
     // client-visible and no other connection committed meanwhile.
     let unchanged = result.as_ref().is_ok_and(|progress| {
-        progress.added == 0 && progress.updated == 0 && progress.removed == 0
+        progress.added == 0
+            && progress.updated == 0
+            && progress.removed == 0
+            && progress.vendor_metadata.updated == 0
     }) || (!session_started && result.is_err());
     let unchanged = unchanged
         && same_shape(&shape_before, &library_shape(state))
@@ -869,6 +874,11 @@ fn run_scan_inner(
             unchanged = progress.unchanged,
             removed = progress.removed,
             errors = progress.errors,
+            vendor_tables = progress.vendor_metadata.tables,
+            vendor_matched = progress.vendor_metadata.matched,
+            vendor_updated = progress.vendor_metadata.updated,
+            vendor_ambiguous = progress.vendor_metadata.ambiguous,
+            vendor_unmatched = progress.vendor_metadata.unmatched,
             revision = revision.unwrap_or_default(),
             bumped = !unchanged,
             secs = started.elapsed().as_secs_f64(),

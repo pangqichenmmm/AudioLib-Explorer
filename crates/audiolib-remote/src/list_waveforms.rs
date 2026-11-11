@@ -2388,6 +2388,28 @@ mod bundle_tests {
     }
 
     #[test]
+    fn a_corrupt_bundle_preserves_both_surviving_store_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        // The response checksum and library header are valid, but SQLite bytes
+        // are corrupt: rejection must happen before any live store is replaced.
+        let (server, _) = server(CAPS, ok_reply(b"not a SQLite database".to_vec()));
+        let old = service(&server, directory.path());
+        seed(&old);
+        let current = service(&server, directory.path());
+        assert!(matches!(
+            current.import_bundle(&AtomicBool::new(false)),
+            Err(RemoteError::Protocol(_))
+        ));
+        for service in [&old, &current] {
+            let store = service.i8_store().unwrap();
+            assert_eq!(store.len().unwrap(), 1);
+            assert_eq!(store.get(9).unwrap().unwrap().etag, "W/\"keep-l1i8\"");
+            assert!(store.get(1).unwrap().is_none());
+        }
+        assert!(leftovers(directory.path()).is_empty());
+    }
+
+    #[test]
     fn every_rejected_bundle_keeps_the_store_and_leaves_no_temporary_file() {
         let good = bundle_bytes(LIBRARY, "");
         let mut truncated_etag = ok_reply(good[..good.len() / 2].to_vec());

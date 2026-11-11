@@ -68,7 +68,10 @@ fn semicolon_keyword_list_items_are_all_searchable() {
         .unwrap()
         .results
         .into_iter()
-        .map(|file| (file.id, file.attributes))
+        .map(|file| {
+            let file = file.into_data();
+            (file.id, file.attributes)
+        })
         .collect();
     let check = |stage: &str| {
         for term in [

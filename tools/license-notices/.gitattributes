@@ -1,0 +1,2 @@
+# Preserve upstream notice bytes and whitespace exactly; hashes bind these files.
+* -text -whitespace

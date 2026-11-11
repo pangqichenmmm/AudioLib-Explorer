@@ -1,12 +1,18 @@
 # tools/build-release.ps1
+# Build only the portable client's two executables and their dependencies.
+# Servers use build-server-release.ps1; benchmarks are built on demand.
 [CmdletBinding()]
 param([switch]$WithoutAsio)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'build-cache.ps1')
+$buildLease = $null
 $savedEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $nativeFlagKey = 'CXXFLAGS_x86_64_pc_windows_msvc'
 $savedNativeFlags = [Environment]::GetEnvironmentVariable($nativeFlagKey)
 $savedHyphenNativeFlags = [Environment]::GetEnvironmentVariable('CXXFLAGS_x86_64-pc-windows-msvc')
+$savedAsioDirectory = $env:CPAL_ASIO_DIR
+$savedClangDirectory = $env:LIBCLANG_PATH
 $flagSeparator = [char]31
 # Cargo's encoded form preserves paths containing spaces. Keep caller flags and
 # the workspace's static CRT choice when overriding target rustflags.
@@ -45,17 +51,23 @@ $nativeFlags = if ($savedHyphenNativeFlags) { $savedHyphenNativeFlags } elseif (
 [Environment]::SetEnvironmentVariable('CXXFLAGS_x86_64-pc-windows-msvc', ($nativeFlags + ' /DNDEBUG').Trim())
 Push-Location -LiteralPath $taskRoot
 try {
+    $buildLease = Enter-AudioLibBuildLease $taskRoot
+    # The packager consumes this exact target even if the caller overrides
+    # CARGO_BUILD_TARGET. Keep one build invocation for both feature choices.
+    $buildArguments = @('build', '-p', 'audiolib-desktop', '-p', 'audiolib-cli', '--bins', '--release', '--locked', '--target', 'x86_64-pc-windows-msvc')
     if (!$WithoutAsio) {
         . (Join-Path $PSScriptRoot 'prepare-asio.ps1')
-        cargo build --workspace --release --locked --features 'audiolib-desktop/asio,audiolib-cli/asio'
-    } else {
-        cargo build --workspace --release --locked
+        $buildArguments += @('--features', 'audiolib-desktop/asio,audiolib-cli/asio')
     }
+    cargo @buildArguments
     if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed.' }
 } finally {
+    if ($buildLease) { $buildLease.Dispose() }
     $env:CARGO_ENCODED_RUSTFLAGS = $savedEncodedFlags
     [Environment]::SetEnvironmentVariable($nativeFlagKey, $savedNativeFlags)
     [Environment]::SetEnvironmentVariable('CXXFLAGS_x86_64-pc-windows-msvc', $savedHyphenNativeFlags)
+    $env:CPAL_ASIO_DIR = $savedAsioDirectory
+    $env:LIBCLANG_PATH = $savedClangDirectory
     Pop-Location
 }
 

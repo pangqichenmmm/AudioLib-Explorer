@@ -8,7 +8,7 @@ use std::{fs, path::Path};
 fn fixture(path: &Path) {
     let conn = Connection::open(path).unwrap();
     // This suite exercises the supported external-content snapshot family.
-    // A freshly created schema-6 database cannot represent those historical inputs.
+    // A freshly created contentless database cannot represent those historical inputs.
     conn.execute_batch(include_str!("fixtures/schema-v5.sql"))
         .unwrap();
     conn.execute_batch(
@@ -111,7 +111,7 @@ fn obsolete_v3_v4_v5_derived_snapshots_keep_source_bytes_annotations_and_identit
 }
 
 #[test]
-fn current_derived_v3_v4_v5_snapshots_keep_the_original_readonly_path_and_version() {
+fn current_derived_v3_v4_v5_snapshots_use_owned_album_projection_without_source_writes() {
     let directory = tempfile::tempdir().unwrap();
     for version in [3, 4, 5] {
         let path = directory.path().join(format!("current-v{version}.db"));
@@ -122,9 +122,41 @@ fn current_derived_v3_v4_v5_snapshots_keep_the_original_readonly_path_and_versio
             .unwrap();
         let original = fs::read(&path).unwrap();
         let provider = SqliteProvider::open_read_only(&path).unwrap();
-        assert_eq!(provider.database_path(), path.as_path());
-        assert_eq!(provider.library_info().unwrap().schema_version, version);
+        assert_ne!(provider.database_path(), path.as_path());
+        assert_eq!(
+            provider.library_info().unwrap().schema_version,
+            SCHEMA_VERSION
+        );
+        assert!(SqliteProvider::has_current_album_state(provider.database_path()).unwrap());
+        let file = provider.get_audio(42).unwrap();
+        assert_eq!((&*file.tags, &*file.notes), ("private", "retain notes"));
+        assert!(file.favorite);
+        assert_eq!(file.attributes["private"], "keep");
+        assert_eq!(file.album_id, Some(file.album_entity.as_ref().unwrap().id));
+        assert!(matches!(
+            provider.update_metadata(
+                42,
+                &audiolib_core::MetadataPatch {
+                    favorite: Some(false),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::Validation(_))
+        ));
+        assert!(provider.get_audio(42).unwrap().favorite);
+        let source =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            source
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            version
+        );
+        drop(source);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let owned_directory = provider.database_path().parent().unwrap().to_path_buf();
         drop(provider);
+        assert!(!owned_directory.exists());
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 }

@@ -4,7 +4,7 @@ members = ["crates/audiolib-core", "crates/audiolib-db", "crates/audiolib-audio"
 exclude = ["vendor/libsqlite3-sys"]
 
 [workspace.package]
-version = "0.7.5"
+version = "0.9.5"
 edition = "2024"
 rust-version = "1.97"
 license = "GPL-3.0-only"
@@ -19,7 +19,7 @@ rusqlite = { version = "=0.40.2", features = ["bundled", "backup", "chrono"] }
 slint = { version = "=1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "unstable-winit-030"] }
 slint-build = "=1.17.1"
 cpal = "=0.18.2"
-symphonia = { version = "=0.6.1", default-features = false, features = ["wav", "pcm", "adpcm"] }
+symphonia = { version = "=0.6.1", default-features = false, features = ["wav", "pcm", "adpcm", "flac", "ogg", "vorbis", "mp3"] }
 rubato = "=5.0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -46,6 +46,7 @@ toml = "1"
 uuid = { version = "1", features = ["v4"] }
 semver = "1"
 sha2 = "0.10"
+flate2 = "=1.1.10"
 
 # Pin the engine containing the contentless-delete statistics fix. The released
 # libsqlite3-sys 0.38.2 still bundles 3.53.2; this reviewed vendor uses 3.54.1.

@@ -5,13 +5,13 @@
 # launched through AudioLibExplorer-beta.cmd, which sets AUDIOLIB_DATA_DIR to a
 # separate directory (default %LOCALAPPDATA%\AudioLibExplorer\beta) so a beta
 # never shares settings, database, caches or logs with the stable v1 data root.
-# Only package-owned files are overwritten; nothing is deleted and no running
-# process is stopped.
+# Only package-owned files are overwritten. A published install also removes the
+# installer's development marker; no running process is stopped.
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$Source = 'dist/latest/portable',
     [string]$Destination = 'beta_release',
-    # Untagged local beta snapshots sort before the first beta/rc of this version.
+    # Local snapshots have a binary-derived identity and cannot self-update.
     [switch]$Development
 )
 $ErrorActionPreference = 'Stop'
@@ -39,7 +39,8 @@ $updateVersion = (Get-Content -LiteralPath (Join-Path $sourceRoot 'update-versio
 if ($updateVersion -cnotmatch '^\d+\.\d+\.\d+(?:-(?:rc|beta)\.(?:0|[1-9]\d*))?$') { throw 'The beta source has an invalid update version.' }
 if ($Development) {
     if ($updateVersion.Contains('-')) { throw '-Development requires an untagged local package; preserve the full release tag for a published candidate.' }
-    $updateVersion += '-0'
+    $developmentHash = (Get-FileHash -LiteralPath (Join-Path $sourceRoot 'AudioLibExplorer.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $updateVersion += '-0+local.' + $developmentHash.Substring(0, 12)
 }
 $leaf = [IO.Path]::GetFileName($destinationRoot)
 if ($leaf -ieq 'local_release' -or $destinationRoot -ieq $taskRoot -or $destinationRoot -ieq $sourceRoot) { throw 'Beta destination must be a dedicated directory, not the stable installation, repository root or package source.' }
@@ -55,7 +56,14 @@ foreach ($file in $files) {
     if (!$target.StartsWith($destinationRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Beta installation target escaped its owned directory.' }
     Assert-UnlinkedPath $target
 }
-foreach ($name in @('AudioLibExplorer-beta.cmd', 'update-channel.txt', 'update-version.txt')) { Assert-UnlinkedPath (Join-Path $destinationRoot $name) }
+foreach ($name in @('AudioLibExplorer-beta.cmd', 'update-channel.txt', 'update-version.txt', 'update-development.txt')) { Assert-UnlinkedPath (Join-Path $destinationRoot $name) }
+$developmentMarker = Join-Path $destinationRoot 'update-development.txt'
+$previousDevelopmentVersion = $null
+if (Test-Path -LiteralPath $developmentMarker) {
+    if (!(Test-Path -LiteralPath $developmentMarker -PathType Leaf)) { throw 'The beta development marker must be a regular file.' }
+    $previousDevelopmentVersion = (Get-Content -LiteralPath $developmentMarker -Raw).Trim()
+    if ($previousDevelopmentVersion -cnotmatch '^\d+\.\d+\.\d+-0\+local\.[0-9a-f]{12}$') { throw 'The beta development marker is not owned by this installer; preserve it for inspection.' }
+}
 if ($PSCmdlet.ShouldProcess($destinationRoot, "Install $($files.Count) package files and AudioLibExplorer-beta.cmd")) {
     New-Item -ItemType Directory -Force -Path $destinationRoot | Out-Null
     foreach ($file in $files) {
@@ -65,14 +73,24 @@ if ($PSCmdlet.ShouldProcess($destinationRoot, "Install $($files.Count) package f
         Copy-Item -LiteralPath $file.FullName -Destination $target -Force
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'AudioLibExplorer-beta.cmd') -Destination $destinationRoot -Force
-    # Keep the exact packaged version; a local untagged build is never invented
-    # as beta.N. Channel membership survives subsequent stable-release updates.
+    # Published packages retain their exact version. Development identities are
+    # installed here only and must never enter a published package's allowlist.
     Set-Content -LiteralPath (Join-Path $destinationRoot 'update-channel.txt') -Value 'beta' -Encoding ASCII
-    if ($Development) { Set-Content -LiteralPath (Join-Path $destinationRoot 'update-version.txt') -Value $updateVersion -Encoding ASCII }
     foreach ($binary in @('AudioLibExplorer.exe', 'AudioLibCli.exe')) {
         $expected = (Get-FileHash -LiteralPath (Join-Path $sourceRoot $binary) -Algorithm SHA256).Hash
         $actual = (Get-FileHash -LiteralPath (Join-Path $destinationRoot $binary) -Algorithm SHA256).Hash
         if ($expected -ne $actual) { throw "Installed $binary does not match the package." }
+        if ($Development -and $binary -eq 'AudioLibExplorer.exe' -and $expected -ine $developmentHash) { throw 'The development source executable changed during installation.' }
+    }
+    if ($Development) {
+        Set-Content -LiteralPath $developmentMarker -Value $updateVersion -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $destinationRoot 'update-version.txt') -Value $updateVersion -Encoding ASCII
+    } elseif ($null -ne $previousDevelopmentVersion) {
+        # Recheck the single owned cleanup target after copying. Never recursively
+        # delete, follow a linked marker, or remove a concurrently replaced file.
+        Assert-UnlinkedPath $developmentMarker
+        if (!(Test-Path -LiteralPath $developmentMarker -PathType Leaf) -or (Get-Content -LiteralPath $developmentMarker -Raw).Trim() -cne $previousDevelopmentVersion) { throw 'The beta development marker changed during installation.' }
+        Remove-Item -LiteralPath $developmentMarker -Force
     }
     Write-Host "Beta installed to $destinationRoot ($($files.Count) files). Launch with AudioLibExplorer-beta.cmd."
 }

@@ -1,5 +1,13 @@
 # Rust Remote (Server) Mode — Client
 
+Search Metadata v2 candidate: snapshot schemas 3–9 are admitted only with the
+matching complete format. Completed schema 9 is validated and opened read-only;
+older schemas retain their existing owned-copy preparation rules. Local working
+libraries remain schema 8. The candidate now negotiates a native schema-9 snapshot
+or a separate WAV-only schema-8 compatibility copy; actual paired-client and migration
+acceptance is recorded separately. See the
+[candidate migration plan](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/codex/release-090-prepare/doc/Rust_Release_0.9.0.md).
+
 AudioLib Explorer can browse a library hosted by `server/audiolib-server` instead of the
 local working library. The client side is the `crates/audiolib-remote` crate (blocking
 HTTP client, snapshot sync, WebDAV mapping, audio cache, secrets) plus the desktop
@@ -14,6 +22,30 @@ the server management API. The local working library and its settings are never 
 modified or replaced while in server mode; switching back to local mode reopens it as before.
 
 ## Settings and secrets
+
+Artwork within a shared album is scoped to the selected WAV's immediate parent
+folder. The optional `album_folder_artwork` version 1 capability binds native
+schema-8 requests to the library, album namespace, album and folder; responses
+also bind `X-Album-Folder-Id`. Older servers use bounded, sorted members of that
+same folder through their supported per-audio artwork API. The client does not
+reuse a whole-album result from another subfolder, including when the selected
+folder's members fall beyond the whole album's first 64 records. Files without
+their own embedded picture may reuse another member's picture in the same
+album and immediate folder.
+
+Source schemas 3–7 still use an owned schema-8 projection; source and local
+formats remain separate, so projection does not cause repeated synchronization.
+Unsupported embedded-artwork capabilities skip automatic covers while retaining
+normal sync and playback. The active server's **Cache and export** page offers
+client-local custom images, hiding/restoring, display preferences and thumbnail
+cleanup. Manual choices are isolated by source, shared album and immediate
+folder. Older whole-album choices remain read-only inherited preferences;
+explicit folder choices take precedence. Restoring embedded artwork records a
+folder-local ignore-inherited marker without deleting the retained whole-album
+preference. These choices never write to the server snapshot or WAV files and
+do not sync to other PCs. Shared Album entities, schema 8 and original Metadata
+TEXT remain unchanged; Metadata compression is deferred. See
+[Album artwork](https://github.com/Freedragonlancer/AudioLib-Explorer/blob/main/doc/Rust_Artwork.md).
 
 `settings.json` gains a `data_source` section (all fields have serde defaults, so older
 settings files load as local mode):
@@ -205,6 +237,33 @@ report shows each root's effective URL and its source (user / server / base URL)
 
 ## Sync and the snapshot cache
 
+The catalog revision is 2. A client can read the known complete schema-3–9 formats,
+but ordinary local writers still target schema 8. `/capabilities` reports the server's
+actual write format and `library_schema.current`/`source_search_rev`, separately from
+the snapshot formats it serves. `/library.schema_version`, `snapshot_format` and
+statistics describe the negotiated representation; its new `library_schema` field
+describes the actual source. Library identity and revision always belong to that source.
+Modern `/library` requests send the same complete catalog/accept/max headers as snapshot
+requests. Historical unmarked `/library` requests can see compatibility information;
+an unmarked snapshot download is still refused.
+
+`legacy_snapshot_enabled` defaults to true for the planned 0.9 transition cycle.
+A peer explicitly accepting schema 9 receives it. A valid peer accepting only schema 8
+receives a separately cached owned projection with non-WAV rows and newer normalized
+tables removed. The server preserves WAV rows, original Metadata, user annotations,
+opaque vendor mirrors and the existing main FTS text, without rebuilding that index;
+folder statistics reflect the remaining WAV rows. New source revisions require new
+latest snapshots; retained fixed representations keep their immutable identity.
+Failure never publishes a partial projection or replaces the
+client's last valid database, `cache.json` or `active.json`.
+
+Compatibility replies carry the shared recommended upgrade header and capability hint;
+native schema-9 replies do not carry a downgrade prompt. Disabling the transition returns
+409 `SNAPSHOT_FORMAT_UNSUPPORTED` and a required hint for old peers while preserving their
+offline cache and native9 access. Writes are admitted against the actual source format,
+so a derived8 reader cannot write the schema-9 source. The candidate program version is
+frozen at 0.9.0: upgrade `min` uses the actual build identity; 0.9.0 remains unpublished.
+
 Layout under `<data dir>/remote/`:
 
 | Path | Content |
@@ -215,6 +274,7 @@ Layout under `<data dir>/remote/`:
 | `.transfers/<endpoint-sha256>/payload.part` | Durable HTTP representation bytes retained for snapshot resume; zstd stays compressed |
 | `.transfers/<endpoint-sha256>/checkpoint.json` | Atomic transfer identity, encoding, lengths, durable offset and prefix SHA256; never contains credentials |
 | `.staging-locks/<library-key>.lock` | Retained OS lock shared by snapshot preparation and conservative housekeeping |
+| `snapshot-workdir.json` | Optional per-machine directory for snapshot preparation jobs |
 | `placeholder/library.db` | Empty library in the current local schema shown before the first successful sync |
 | `secrets.bin` | DPAPI-protected token and WebDAV password |
 
@@ -244,6 +304,31 @@ Audition no longer writes to disk; the `audio-cache/` directories
 of earlier versions are checked once (`remove_audition_caches`, at startup in server mode
 and on a server switch). Only their generated flat-file namespace is removed;
 unknown entries and linked paths are retained.
+
+**Optional preparation workspace.** To keep the temporary work of upgrading or
+validating a server snapshot on another volume, create a plain, existing directory
+and put a file named `snapshot-workdir.json` under `<data dir>/remote/`. For example,
+on Windows its contents can be:
+
+```json
+{"directory":"E:\\AudioLib-Snapshot-Work"}
+```
+
+This is a local machine preference: it is not synchronized with the server or
+stored alongside a shared portable executable. Without the file, preparation uses
+the cache directory as before. If the file or directory is invalid, unavailable,
+or reached through a link, preparation fails clearly rather than silently using the
+cache volume. Each job uses an owned temporary subdirectory; it is removed on normal
+completion. An interrupted process may leave a recovery job, which is not removed
+automatically.
+
+The active cache, transfer checkpoint and resumable wire payload remain on the
+original data volume. A completed snapshot is copied there, checked against the
+prepared bytes and published without replacing an existing file. Thus the original
+volume still needs free space for the final snapshot, any transfer payload and the
+normal safety margin; the workspace volume needs space for preparation and SQLite
+working data. System-managed SQLite temporary files may also require free space on
+the system volume. A failed or cancelled preparation keeps the old active cache.
 
 **Replaced libraries.** When a sync of a server URL installs library B,
 `RemoteCache::discard_replaced` checks other libraries whose `cache.json` names the
@@ -308,9 +393,11 @@ changed connection of the active one), on "Sync now" and on Refresh (F5). Steps:
    another process. A downloaded snapshot belongs only to the sync, so it needs no copy.
    That saves a second copy on disk (in `%TEMP%`) and a second pass. On a 645 MB snapshot
    validation dropped from 9.2 s to 1.4 s.
-7. Atomic rename to the final file, `cache.json`/`active.json` update, provider swap
-   through the existing library-operation machinery (metadata FIFO drained, reader and UI
-   generations invalidated, selection and drafts cleared).
+7. Publish to a unique final file (an atomic rename normally, or a verified copy
+   and atomic no-replace publication for an external workspace), then update
+   `cache.json`/`active.json` and swap the provider through the existing
+   library-operation machinery (metadata FIFO drained, reader and UI generations
+   invalidated, selection and drafts cleared).
 
 ### Interrupted downloads and resume
 
@@ -325,7 +412,7 @@ again before reuse. A transfer lease excludes another desktop/CLI writer for the
 normalized API endpoint. Profiles with different endpoints never append to one
 another's partial file; neither tokens nor WebDAV credentials enter the checkpoint.
 
-After a disconnect or 30 s with no network read progress, the client retries up to
+After a disconnect or 90 s with no network read progress, the client retries up to
 three times after 2, 5 and 10 s. It requests the same immutable snapshot using
 `snapshot_id`, `Range: bytes=<offset>-` and `If-Range`. Only a matching `206` whose
 Content-Range, ETag, encoding, identity and lengths agree can append. A full `200`
@@ -399,7 +486,7 @@ an unchanged prepared snapshot is reused without copying, downloading or rebuild
 
 Timeouts: connect 3 s, ordinary JSON responses 15 s (bodies 30 s), library statistics
 response/body 60 s, root path PATCH and root DELETE responses up to 1 h (bodies 30 s),
-snapshot response 240 s and a 30 s network-read stall limit (no one-hour total
+snapshot response 240 s and a 90 s network-read stall limit (no one-hour total
 transfer deadline), audio stream first byte 100 s (a NAS disk spinning up, see *Playback*). The stall limit excludes local prefix replay, decompression and disk work. Errors map to localized messages for unreachable server, timeout, 401
 (invalid token, or "token required" when none is configured), 404, BUSY, validation and
 server `INTERNAL` errors. Root PATCH/DELETE have no generic server 30 s request limit.
@@ -588,6 +675,27 @@ local mode), the client posts `POST /audio/{id}/plays` on a short-lived worker t
 record is identified by the playback cache path it was played from. Nothing of this runs
 on the audio thread.
 ## Server management (scans, history, removals)
+
+Vendor preview has two source modes at the capability-advertised origin-relative
+`/api/vendor-import/preview` endpoint: multipart uploads, or `application/json`
+`{"root":"<configured root name>","root_relative_dir":"tables/vendor","options":{...}}`.
+The server-directory JSON mode and opened-handle isolation are integrated in the
+development candidate; current-run acceptance is recorded separately. Its JSON body is capped at
+1 MiB. It recursively discovers only regular CSV/TSV/TXT/XLS/XLSX files under the
+resolved configured root, skips discovered links, and rejects parent/absolute paths,
+unknown roots and root escapes. Relative directory link components are refused.
+Unix opens remain relative to held directory FDs with no-follow; Windows checks the
+actual opened object's path and rejects reparses while pinning the directory chain.
+Validated file handles are copied into owned staging with their original names;
+the parser never reopens a mutable external source path. Copies retain at most the
+per-file limit plus one byte for individual oversize refusal, within a 512 MiB batch
+input budget, so other valid tables can still preview. Limits are 512 tables and 100,000 directory
+entries. Empty relative directory selects the whole root. Unless supplied explicitly,
+`options.vendor_root` defaults to the configured root's real path for audio matching,
+not the selected table subdirectory. Preview creates owned parsing/recovery artifacts
+but commits no library Metadata; commit remains a separate identity-bound managed
+request with an idempotency key. Both preview modes retain bearer/manage, actual-format
+and library-identity admission before body parsing. See [API §6.11](api/README.md#vendor-import-preview).
 
 `audiolib_remote::RemoteClient` has typed calls for API §6.6–§6.10; the CLI exposes the
 read-only ones. The desktop's 服务器音效库 page (design B1/B2) uses `roots`,
@@ -921,8 +1029,9 @@ cache for 200 items was 108 KiB.
 
 Result rows can be dragged to Explorer, a DAW or any program that accepts dropped files.
 Dragging a checked row drags all checked rows; otherwise only the dragged row. The drag is a
-native OLE `DoDragDrop` (`audiolib_windows::drag_files`) offering `CF_HDROP` with real file
-paths and only `DROPEFFECT_COPY`, so the target always copies and never moves a file.
+native drag (`audiolib_windows::drag_files`): on Windows OLE `DoDragDrop` + `CF_HDROP`, on
+macOS AppKit `beginDraggingSession` + `NSURL`/`public.file-url`, copy-only, so the target
+always copies and never moves a file.
 There are no virtual or delayed-rendered files.
 
 - **Local mode** offers the library files themselves (missing records are skipped).
@@ -1124,12 +1233,17 @@ The CLI uses the same settings and secrets file as the desktop and never prints 
 `pwsh -File tools/validate-remote-resume.ps1 -BinaryDirectory <current-binary-directory>`
 builds an owned 32-WAV synthetic library, obtains its valid zstd snapshot from an owned
 loopback server, and injects truncated/silent response bodies with a second loopback
-listener. It checks automatic Range recovery after truncation and after an actual
-30-second silent-read timeout, a new CLI process reusing the saved
-prefix, preservation of an existing validated cache after an interrupted replacement,
+listener. Its intended coverage includes automatic Range recovery after truncation
+and a production silent-read timeout, a new CLI process reusing the saved prefix,
+preservation of an existing validated cache after an interrupted replacement,
 explicit `--restart` beginning at zero, and native desktop WM_CLOSE during a
-silent body followed by desktop restart/resume. Requests must retain the strong ETag
-and snapshot ID. `-ServerBinary <path>` selects a separately built current server;
+silent body followed by desktop restart/resume. The current production snapshot
+read-stall limit is **90 s** (`SNAPSHOT_READ_STALL_TIMEOUT`); the script still labels
+that case as 30 s and requires recovery within 28–60 s. Those assertions and wait
+budgets have not been updated, so this script does not currently establish passing
+acceptance of the 90-second behaviour. Update them before using it for that acceptance;
+this documentation correction does not claim a new script pass.
+Requests must retain the strong ETag and snapshot ID. `-ServerBinary <path>` selects a separately built current server;
 `-SkipDesktop` runs only CLI cases and is reported as such. All settings, snapshots,
 source WAVs and server state live in a checked owned temporary tree, and normal
 environment variables are restored. Failure preserves that fixture for diagnosis.

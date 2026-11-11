@@ -1,7 +1,9 @@
 // crates/audiolib-windows/src/drag.rs
-//! Native file drag source: OLE `DoDragDrop` with a `CF_HDROP` data object listing real,
-//! complete local files. Only the copy effect is offered, so a drop target can never move
-//! (and thereby remove) the dragged file. No virtual or delayed-rendered files.
+//! Native file drag source for dragging real, complete local files out of the desktop app.
+//! Windows uses OLE `DoDragDrop` with `CF_HDROP`; macOS uses AppKit `beginDraggingSession`
+//! with `NSURL` / `NSPasteboardWriting` (`public.file-url`). Only the copy effect is offered,
+//! so a drop target can never move (and thereby remove) the dragged file. No virtual or
+//! delayed-rendered files.
 use std::path::PathBuf;
 
 /// How a drag ended.
@@ -227,6 +229,10 @@ mod native {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "drag_macos.rs"]
+mod macos;
+
 /// True while the primary mouse button is physically held (respects swapped buttons).
 /// A drag that had to wait for downloads only starts if the user is still dragging.
 pub fn primary_button_down() -> bool {
@@ -234,13 +240,17 @@ pub fn primary_button_down() -> bool {
     {
         native::primary_button_down()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::primary_button_down()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         false
     }
 }
 
-/// Run a modal OLE drag of `paths` (existing local files) with the copy effect only.
+/// Run a modal native drag of `paths` (existing local files) with the copy effect only.
 /// Call on the UI thread while the mouse button is held.
 pub fn drag_files(paths: &[PathBuf]) -> std::io::Result<DragOutcome> {
     if paths.is_empty() {
@@ -256,11 +266,15 @@ pub fn drag_files(paths: &[PathBuf]) -> std::io::Result<DragOutcome> {
     {
         native::drag(paths)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::drag(paths)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "file drag and drop is only available on Windows",
+            "file drag and drop is only available on Windows and macOS",
         ))
     }
 }
@@ -313,10 +327,20 @@ mod tests {
             assert!(data.GetData(&other).is_err());
         }
     }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use std::path::PathBuf;
 
     #[test]
     fn missing_files_are_never_offered() {
-        let error = super::drag_files(&[PathBuf::from(r"Z:\definitely\missing.wav")]).unwrap_err();
+        let missing = if cfg!(windows) {
+            PathBuf::from(r"Z:\definitely\missing.wav")
+        } else {
+            PathBuf::from("/definitely/missing-audiolib-drag.wav")
+        };
+        let error = super::drag_files(&[missing]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(
             super::drag_files(&[]).unwrap(),

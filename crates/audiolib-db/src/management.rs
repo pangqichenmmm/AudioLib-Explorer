@@ -5,6 +5,7 @@ use audiolib_core::{ScanIssue, ScanState, TagEditMode};
 use std::{
     collections::HashSet,
     io::{BufRead, BufReader, BufWriter, Read, Write},
+    sync::{Arc, Mutex, Weak},
 };
 
 // Stored POSIX paths retain case even when read by a Windows process. This
@@ -53,25 +54,112 @@ pub(crate) struct AdministrationLease(fs::File);
 
 /// Search upgrades commit incomplete derived state between batches. Ordinary
 /// maintenance keeps its established read-snapshot behavior and does not take this lock.
-pub(crate) struct SearchUpgradeLease(fs::File);
+pub(crate) struct SearchUpgradeLease {
+    file: Option<fs::File>,
+    pool: Option<Weak<Mutex<SearchUpgradePoolState>>>,
+}
+
+const MAX_IDLE_SEARCH_UPGRADE_HANDLES: usize = 8;
+
+struct SearchUpgradeBinding {
+    database: PathBuf,
+    sidecar: PathBuf,
+}
+
+#[derive(Default)]
+struct SearchUpgradePoolState {
+    binding: Option<SearchUpgradeBinding>,
+    // Every idle File has already been explicitly unlocked. Never clone a File:
+    // leases must own independent open handles and independent OS lock lifetimes.
+    idle: Vec<fs::File>,
+}
+
+/// Provider-local open handles for the persistent search-upgrade sidecar. The
+/// original database path binds once to its canonical lock path; later calls
+/// must use that same path. Idle handles hold no lock, and every acquisition
+/// still takes a fresh nonblocking shared OS lock. Neither API deletes sidecars.
+/// The canonical lock identity and persistent sidecar must remain stable for
+/// this provider's lifetime; library replacement must preserve that sidecar.
+#[derive(Default)]
+pub(crate) struct SearchUpgradePool {
+    state: Arc<Mutex<SearchUpgradePoolState>>,
+}
+
+impl SearchUpgradePool {
+    /// Reuse only unlocked handles belonging to this provider's bound database.
+    /// A failed OS lock closes that handle instead of returning it to the pool.
+    pub(crate) fn acquire_shared(&self, database: &Path) -> Result<SearchUpgradeLease> {
+        let file = {
+            let mut state = self.state.lock().map_err(|_| {
+                Error::Database("Search upgrade handle pool lock was poisoned".into())
+            })?;
+            match &state.binding {
+                Some(binding) if binding.database.as_os_str() != database.as_os_str() => {
+                    return Err(Error::Validation(
+                        "Search upgrade handle pool belongs to a different library path".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    state.binding = Some(SearchUpgradeBinding {
+                        database: database.to_path_buf(),
+                        sidecar: search_upgrade_lock_path(database)?,
+                    });
+                }
+            }
+            match state.idle.pop() {
+                Some(file) => file,
+                None => open_search_upgrade_file(
+                    &state
+                        .binding
+                        .as_ref()
+                        .expect("pool was bound above")
+                        .sidecar,
+                )?,
+            }
+        };
+        SearchUpgradeLease::lock(file, false, Some(Arc::downgrade(&self.state)))
+    }
+}
+
+fn search_upgrade_lock_path(database: &Path) -> Result<PathBuf> {
+    let database = database.canonicalize()?;
+    let mut name = database.file_name().unwrap_or_default().to_os_string();
+    name.push(".upgrade.lock");
+    Ok(database.with_file_name(name))
+}
+
+fn open_search_upgrade_file(sidecar: &Path) -> Result<fs::File> {
+    Ok(fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sidecar)?)
+}
+
 impl SearchUpgradeLease {
+    /// One-shot acquisition for existing readers and exclusive upgrade owners.
     pub(crate) fn acquire(database: &Path, exclusive: bool) -> Result<Self> {
-        let database = database.canonicalize()?;
-        let mut name = database.file_name().unwrap_or_default().to_os_string();
-        name.push(".upgrade.lock");
-        let file = fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(database.with_file_name(name))?;
+        let file = open_search_upgrade_file(&search_upgrade_lock_path(database)?)?;
+        Self::lock(file, exclusive, None)
+    }
+
+    fn lock(
+        file: fs::File,
+        exclusive: bool,
+        pool: Option<Weak<Mutex<SearchUpgradePoolState>>>,
+    ) -> Result<Self> {
         let result = if exclusive {
             file.try_lock()
         } else {
             file.try_lock_shared()
         };
         match result {
-            Ok(()) => Ok(Self(file)),
+            Ok(()) => Ok(Self {
+                file: Some(file),
+                pool,
+            }),
             Err(fs::TryLockError::WouldBlock) => Err(Error::Busy(
                 "Library search upgrade conflicts with an active reader".into(),
             )),
@@ -81,9 +169,26 @@ impl SearchUpgradeLease {
 }
 impl Drop for SearchUpgradeLease {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        // An unlock error must close the handle, never make a possibly locked
+        // File available to a later query. Closing also covers a retired pool.
+        if file.unlock().is_err() {
+            return;
+        }
+        if let Some(pool) = self.pool.as_ref().and_then(Weak::upgrade)
+            && let Ok(mut state) = pool.lock()
+            && state.idle.len() < MAX_IDLE_SEARCH_UPGRADE_HANDLES
+        {
+            state.idle.push(file);
+        }
     }
 }
+
+#[cfg(test)]
+mod search_upgrade_pool_tests;
+
 fn administration_lock_path(database: &Path) -> Result<PathBuf> {
     let database = database.canonicalize()?;
     let mut name = database.file_name().unwrap_or_default().to_os_string();
@@ -297,7 +402,7 @@ fn check_connection(conn: &Connection) -> Result<IntegrityReport> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    let current = version == schema::SCHEMA_VERSION;
+    let current = version >= 6;
     match conn.execute(
         if current {
             "INSERT INTO audio_search(audio_search) VALUES('integrity-check')"
@@ -464,6 +569,25 @@ impl SqliteProvider {
             ));
         }
         Ok(())
+    }
+
+    // Relinking preserves the business schema and maintains the directory index.
+    // Restore/maintenance still require the ordinary schema-8 writer contract.
+    #[cfg(feature = "scanner")]
+    fn require_relink_writable(&self) -> Result<()> {
+        if self.server_schema9 {
+            let conn = self.writer_unlocked()?;
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .map_err(db_error)?;
+            if version == 9 {
+                if self.read_only || conn.is_readonly("main").map_err(db_error)? {
+                    return Err(validation("Library was opened read-only"));
+                }
+                return crate::migration9::validate_ready(&conn);
+            }
+        }
+        self.require_writable()
     }
     pub(crate) fn management_info(&self) -> Result<LibraryInfo> {
         let stats = self.stats()?;
@@ -655,6 +779,9 @@ impl SqliteProvider {
             Self::upgrade_owned_snapshot(stage.path())?;
             let target = Connection::open(stage.path()).map_err(db_error)?;
             schema::register_tokenizer(&target, self.tokenizer.clone())?;
+            // Cache lineage is derived state. The restored destination must not
+            // inherit a watermark which names a prior live reader generation.
+            crate::search_tracking::drop_owned(&target)?;
             // A restore may bring back fewer/lower IDs than this installation has
             // already issued. Keep those identities retired even after replacement.
             let high_water = {
@@ -662,6 +789,11 @@ impl SqliteProvider {
                 schema::audio_id_high_water(&writer)?
             };
             schema::retain_audio_id_high_water(&target, high_water)?;
+            let album_high_water = {
+                let writer = self.writer_unlocked()?;
+                crate::albums::high_water(&writer)?
+            };
+            crate::albums::retain_high_water(&target, album_high_water)?;
             let page_size = self
                 .writer_unlocked()?
                 .pragma_query_value(None, "page_size", |row| row.get(0))
@@ -680,6 +812,7 @@ impl SqliteProvider {
                 .lock()
                 .map_err(|_| Error::Database("Reader pool lock was poisoned".into()))?
                 .clear();
+            self.reset_search_caches()?;
             snapshot_to_file(&mut writer, &rollback_backup)?;
             let replacement =
                 Connection::open_with_flags(stage.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -704,6 +837,22 @@ impl SqliteProvider {
                 std::sync::atomic::Ordering::Release,
             );
         }
+        let identity = {
+            let writer = self.writer_unlocked()?;
+            (
+                crate::albums::namespace(&writer)?,
+                crate::albums::legacy_scope(&writer)?,
+            )
+        };
+        *self
+            .album_namespace
+            .write()
+            .map_err(|_| Error::Database("Album namespace lock was poisoned".into()))? = identity.0;
+        *self
+            .legacy_album_scope
+            .write()
+            .map_err(|_| Error::Database("Legacy album scope lock was poisoned".into()))? =
+            identity.1;
         Ok(RestoreReport {
             source: source.to_path_buf(),
             rollback_backup,
@@ -729,6 +878,7 @@ impl SqliteProvider {
                 .lock()
                 .map_err(|_| Error::Database("Reader pool lock was poisoned".into()))?
                 .clear();
+            self.reset_search_caches()?;
             snapshot_to_file(&mut writer, &rollback_backup)?;
             let operation = (|| -> Result<IntegrityReport> {
                 match action {
@@ -827,9 +977,21 @@ impl SqliteProvider {
         let mut writer = self.writer()?;
         let tx = writer.transaction().map_err(db_error)?;
         let mut removed = 0;
+        let mut folders = Vec::new();
         for id in ids {
+            let folder: Option<i64> = tx
+                .query_row(
+                    "SELECT folder_id FROM audio_files WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if let Some(folder) = folder {
+                folders.push(folder);
+            }
             removed += remove_one(&tx, id)?;
         }
+        crate::dir_search::maintain(&tx, &[], &folders)?;
         refresh_folder_statistics(&tx)?;
         tx.commit().map_err(db_error)?;
         Ok(removed)
@@ -875,6 +1037,7 @@ impl SqliteProvider {
             tx.execute("DELETE FROM folders WHERE id=?1", [folder])
                 .map_err(db_error)?;
         }
+        crate::dir_search::maintain(&tx, &folder_ids, &folder_ids)?;
         refresh_folder_statistics(&tx)?;
         tx.commit().map_err(db_error)?;
         Ok(removed)
@@ -905,7 +1068,7 @@ impl SqliteProvider {
         target: &Path,
         cancel: &AtomicBool,
     ) -> Result<u64> {
-        self.require_writable()?;
+        self.require_relink_writable()?;
         if !source.is_absolute() || !target.is_absolute() {
             return Err(validation("Folder relocation requires absolute paths"));
         }
@@ -924,6 +1087,9 @@ impl SqliteProvider {
         check_cancel()?;
         let _scan = LibraryLease::acquire(&self.path)?;
         let _administration = AdministrationLease::exclusive(&self.path)?;
+        // Publication may have completed between initial admission and these
+        // leases. Recheck before examining targets or writing a rollback copy.
+        self.require_relink_writable()?;
         let target = audiolib_core::validate_scan_root(target, &[])?;
         if target.file_name().is_none() {
             return Err(validation("File system or drive roots cannot be relocated"));
@@ -1123,7 +1289,7 @@ impl SqliteProvider {
             let audio = audio.map_err(db_error)?;
             check_cancel()?;
             let desired = target.join(suffix(&audio.file_path)?);
-            let real = audiolib_core::validate_wav_path(&desired, std::slice::from_ref(&target))
+            let real = audiolib_core::validate_audio_path(&desired, std::slice::from_ref(&target))
                 .map_err(|error| {
                     validation(format!(
                         "Invalid corresponding relocation WAV {}: {error}",
@@ -1172,7 +1338,9 @@ impl SqliteProvider {
                     .as_nanos(),
             )
             .map_err(validation)?;
-            moved_files.push((audio.id, text, key, mtime_ns));
+            let extended_sources =
+                schema::metadata_requires_audio_sources(&real, &metadata.attributes);
+            moved_files.push((audio.id, text, key, mtime_ns, extended_sources));
         }
         drop(statement);
         check_cancel()?;
@@ -1206,13 +1374,18 @@ impl SqliteProvider {
             ],
         )
         .map_err(db_error)?;
-        for (id, text, key, mtime) in &moved_files {
+        crate::dir_search::maintain(&tx, &[root], &[])?;
+        for (id, text, key, mtime, extended_sources) in &moved_files {
             check_cancel()?;
+            if *extended_sources {
+                schema::require_audio_sources(&tx)?;
+            }
             tx.execute("UPDATE audio_files SET file_path=?2,path_key=?3,source_mtime_ns=?4,missing=0,modified_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?1", params![id,text,key,mtime]).map_err(db_error)?;
             tx.execute("DELETE FROM waveform_cache WHERE audio_file_id=?1", [id])
                 .map_err(db_error)?;
         }
         refresh_folder_statistics(&tx)?;
+        tx.execute("UPDATE albums SET name=COALESCE((SELECT folder_name FROM folders WHERE id=albums.folder_id),name) WHERE kind='folder'",[]).map_err(db_error)?;
         check_cancel()?;
         tx.commit().map_err(db_error)?;
         Ok(moved_files.len() as u64)
@@ -1232,12 +1405,10 @@ impl SqliteProvider {
     pub(crate) fn management_relink(&self, id: i64, path: &Path) -> Result<AudioFile> {
         let _lease = LibraryLease::acquire(&self.path)?;
         let path = path.canonicalize()?;
-        if !path.is_file()
-            || !path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
-        {
-            return Err(validation("Relink target must be an existing WAV file"));
+        if !path.is_file() || !audiolib_core::is_supported_audio_extension(&path) {
+            return Err(validation(
+                "Relink target must be an existing supported audio file",
+            ));
         }
         let before = fs::metadata(&path)?;
         let metadata = audiolib_audio::probe(&path)?;

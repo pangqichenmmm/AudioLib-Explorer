@@ -238,8 +238,14 @@ fn unchanged_imported_non_present_flags_reappear_without_updating_present_rows()
     );
     let after = provider.search(&SearchRequest::default()).unwrap().results;
     assert_eq!(after.len(), 4);
+    let representative = after.iter().map(|file| file.id).min().unwrap();
     for mut expected in before {
         expected.missing = false;
+        // Shared representatives are derived from all present members. Returning
+        // lower-ID members changes this DTO field without rewriting present rows.
+        let album = expected.album_entity.as_mut().unwrap();
+        assert_eq!(album.representative_audio_id, Some(present_id));
+        album.representative_audio_id = Some(representative);
         let actual = after.iter().find(|file| file.id == expected.id).unwrap();
         assert_eq!(
             serde_json::to_value(actual).unwrap(),

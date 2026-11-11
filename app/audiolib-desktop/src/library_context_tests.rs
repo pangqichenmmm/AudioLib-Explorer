@@ -55,11 +55,11 @@ fn metadata_refresh_includes_full_text_and_annotation_dependencies() {
 
 #[test]
 fn playback_stops_only_for_the_affected_record_or_library() {
-    let file = AudioFile {
+    let file = AudioFile::from(audiolib_core::AudioFileData {
         id: 7,
         folder_id: Some(3),
         ..Default::default()
-    };
+    });
     let folders = HashSet::from([3]);
     assert!(
         !LibraryOperation::Batch(BatchMetadataRequest {
@@ -82,11 +82,11 @@ fn playback_stops_only_for_the_affected_record_or_library() {
 
 #[test]
 fn removal_confirmation_discloses_names_and_hidden_records() {
-    let files = vec![AudioFile {
+    let files = vec![AudioFile::from(audiolib_core::AudioFileData {
         id: 2,
         filename: "visible.wav".into(),
         ..Default::default()
-    }];
+    })];
     for chinese in [false, true] {
         let text = removal_selection_preview(&[2, 7], &files, chinese);
         assert!(text.contains("visible.wav") && text.contains("#7"));

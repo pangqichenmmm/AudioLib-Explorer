@@ -6,6 +6,208 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel, platform::WindowEvent};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 #[test]
+fn artwork_management_actions_are_reachable_in_both_modes_and_languages() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        for remote in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window()
+                .set_size(slint::LogicalSize::new(1400.0, 1000.0));
+            ui.set_chinese(chinese);
+            ui.set_sm_sources(source_rows(remote));
+            ui.set_remote_mode(remote);
+            ui.invoke_open_library(0);
+            ui.set_sm_selected(if remote { 1 } else { 0 });
+            ui.set_sm_page(if remote { 2 } else { 0 });
+            ui.set_has_selection(true);
+            ui.set_selected_album("Sound pack".into());
+            let actions = Rc::new(RefCell::new(Vec::new()));
+            let observed = actions.clone();
+            ui.on_artwork_action_requested(move |action| observed.borrow_mut().push(action));
+            ui.show().unwrap();
+            click_label(
+                &ui,
+                if chinese {
+                    "当前目录的专辑封面 ▸"
+                } else {
+                    "Album cover in this folder ▸"
+                },
+            );
+            assert!(ui.get_artwork_management_expanded());
+            let labels = if chinese {
+                [
+                    "指定 / 替换本目录图片…",
+                    "移除本目录封面",
+                    "恢复本目录默认",
+                    "重新加载本目录封面",
+                ]
+            } else {
+                [
+                    "Set folder image…",
+                    "Remove folder cover",
+                    "Restore folder default",
+                    "Reload folder cover",
+                ]
+            };
+            for (label, action) in labels.into_iter().zip([2, 3, 4, 0]) {
+                click_label(&ui, label);
+                assert_eq!(actions.borrow().last(), Some(&action));
+            }
+            ui.set_artwork_busy(true);
+            click_label(
+                &ui,
+                if chinese {
+                    "移除本目录封面"
+                } else {
+                    "Remove folder cover"
+                },
+            );
+            assert_eq!(
+                actions.borrow().len(),
+                4,
+                "busy artwork actions are disabled"
+            );
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn artwork_preferences_and_actions_are_disabled_during_library_transitions_and_close() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        for remote in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window()
+                .set_size(slint::LogicalSize::new(1400.0, 1000.0));
+            ui.set_chinese(chinese);
+            ui.set_sm_sources(source_rows(remote));
+            ui.set_remote_mode(remote);
+            ui.invoke_open_library(0);
+            ui.set_sm_selected(if remote { 1 } else { 0 });
+            ui.set_sm_page(if remote { 2 } else { 0 });
+            ui.set_has_selection(true);
+            ui.set_selected_album("Sound pack".into());
+            ui.set_artwork_management_expanded(true);
+            let actions = Rc::new(RefCell::new(Vec::new()));
+            let observed = actions.clone();
+            ui.on_artwork_action_requested(move |action| observed.borrow_mut().push(action));
+            let preferences = Rc::new(RefCell::new(Vec::new()));
+            let observed = preferences.clone();
+            ui.on_artwork_enabled_requested(move |enabled| observed.borrow_mut().push(enabled));
+            ui.show().unwrap();
+            let labels = if chinese {
+                [
+                    "指定 / 替换本目录图片…",
+                    "移除本目录封面",
+                    "恢复本目录默认",
+                    "重新加载本目录封面",
+                ]
+            } else {
+                [
+                    "Set folder image…",
+                    "Remove folder cover",
+                    "Restore folder default",
+                    "Reload folder cover",
+                ]
+            };
+            for gate in 0..4 {
+                ui.set_artwork_busy(gate == 0);
+                ui.set_library_busy(gate == 1);
+                ui.set_ds_applying(gate == 2);
+                ui.set_closing(gate == 3);
+                for label in labels {
+                    click_label(&ui, label);
+                }
+                assert!(ui.get_artwork_enabled());
+                assert!(preferences.borrow().is_empty());
+                assert!(actions.borrow().is_empty());
+            }
+            ui.set_closing(false);
+            click_label(&ui, labels[1]);
+            assert_eq!(&*actions.borrow(), &[3]);
+            ui.invoke_close_library_manager();
+            ui.invoke_open_global_settings(1);
+            let toggle = if chinese {
+                "显示封面（本地与服务器）"
+            } else {
+                "Show covers (local and server)"
+            };
+            for gate in 0..4 {
+                ui.set_artwork_busy(gate == 0);
+                ui.set_library_busy(gate == 1);
+                ui.set_ds_applying(gate == 2);
+                ui.set_closing(gate == 3);
+                click_label(&ui, toggle);
+                assert!(ui.get_artwork_enabled());
+                assert!(preferences.borrow().is_empty());
+            }
+            ui.set_closing(false);
+            click_label(&ui, toggle);
+            assert!(!ui.get_artwork_enabled());
+            assert_eq!(&*preferences.borrow(), &[false]);
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn local_cover_cache_actions_live_in_global_settings_in_both_modes() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        for remote in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window()
+                .set_size(slint::LogicalSize::new(1400.0, 1000.0));
+            ui.set_chinese(chinese);
+            ui.set_remote_mode(remote);
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            let observed = requests.clone();
+            ui.on_artwork_action_requested(move |action| observed.borrow_mut().push(action));
+            ui.show().unwrap();
+            ui.invoke_open_global_settings(4);
+            let clear = if chinese {
+                "清理本机封面缓存…"
+            } else {
+                "Clear cover thumbnails"
+            };
+            ui.set_artwork_busy(true);
+            click_label(&ui, clear);
+            assert!(requests.borrow().is_empty());
+            ui.set_artwork_busy(false);
+            click_label(&ui, clear);
+            assert!(
+                requests.borrow().is_empty(),
+                "opening cache cleanup confirmation must not clear anything"
+            );
+            click_label(
+                &ui,
+                if chinese {
+                    "取消清理封面"
+                } else {
+                    "Cancel cover cleanup"
+                },
+            );
+            assert!(requests.borrow().is_empty());
+            click_label(&ui, clear);
+            let confirm = if chinese {
+                "确认清理封面缓存"
+            } else {
+                "Clear cover cache"
+            };
+            ui.set_artwork_busy(true);
+            click_label(&ui, confirm);
+            assert!(requests.borrow().is_empty());
+            ui.set_artwork_busy(false);
+            click_label(&ui, confirm);
+            assert_eq!(&*requests.borrow(), &[1]);
+            assert!(!ui.get_library_visible());
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
 fn mirror_folder_action_requires_an_existing_cache_and_remains_available_during_sync() {
     i_slint_backend_testing::init_no_event_loop();
     for chinese in [false, true] {
@@ -124,7 +326,7 @@ fn snapshot_sync_controls_pause_once_and_offer_continue_and_restart_on_both_page
 }
 
 #[test]
-fn server_cache_page_hides_local_scan_buttons_and_keeps_audition_hold_option() {
+fn server_cache_page_hides_local_scans_and_shared_audition_preferences() {
     i_slint_backend_testing::init_no_event_loop();
     for chinese in [false, true] {
         let ui = AppWindow::new().unwrap();
@@ -178,17 +380,12 @@ fn server_cache_page_hides_local_scan_buttons_and_keeps_audition_hold_option() {
             has_label(&ui, scan_note),
             "missing short scan redirect note"
         );
-        assert!(
-            has_label(&ui, audition),
-            "missing Audition / performance section"
-        );
-        assert!(
-            has_label(&ui, hold),
-            "hold list-waveform option must remain"
-        );
+        assert!(!has_label(&ui, audition));
+        assert!(!has_label(&ui, hold));
 
         // Local settings still expose the scan controls unchanged.
         ui.set_remote_mode(false);
+        ui.set_sm_sources(source_rows(false));
         ui.set_sm_selected(0);
         ui.set_sm_page(0);
         for label in [add, incr, full] {
@@ -210,8 +407,19 @@ fn server_cache_page_hides_local_scan_buttons_and_keeps_audition_hold_option() {
         );
         assert!(
             !has_label(&ui, hold),
-            "hold list-waveform option is server-mode only"
+            "shared audition preferences do not belong to a local library"
         );
+        ui.invoke_close_library_manager();
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let observed = changes.clone();
+        ui.on_hold_list_waveform_batches_requested(move |hold| observed.borrow_mut().push(hold));
+        ui.invoke_open_global_settings(3);
+        for remote in [false, true] {
+            ui.set_remote_mode(remote);
+            click_label(&ui, hold);
+            assert_eq!(changes.borrow().len(), if remote { 2 } else { 1 });
+        }
+        assert_eq!(&*changes.borrow(), &[true, false]);
         ui.hide().unwrap();
     }
 }
@@ -238,7 +446,9 @@ fn keyboard_selection_keeps_compact_result_rows_visible() {
             ui.set_selected_row((ui.get_selected_row() + step).clamp(0, 119));
         });
         ui.show().unwrap();
-        click_label(&ui, "Scroll 0.wav");
+        // A row spans horizontally scrollable columns, so its midpoint can be clipped
+        // behind the inspector. Focus the visible left edge before sending real keys.
+        click_at(&ui, result_row_position(&ui, "Scroll 0.wav"));
         for (key, targets) in [
             (
                 slint::platform::Key::DownArrow,
@@ -321,7 +531,7 @@ fn scan_progress_controls_pause_resume_cancel_and_guard_terminal_phases() {
         assert!(ui.get_scan_paused());
         click_label(&ui, resume);
         assert!(!ui.get_scan_paused());
-        click_menu_item(&ui, if chinese { "扫描" } else { "Scan" }, pause);
+        click_scan_item(&ui, pause);
         assert!(ui.get_scan_paused());
         click_label(&ui, cancel);
         click_label(&ui, resume);
@@ -346,9 +556,122 @@ fn scan_progress_controls_pause_resume_cancel_and_guard_terminal_phases() {
 }
 
 #[test]
+fn classic_transport_keeps_separate_play_pause_and_shared_transform_state() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    ui.set_audio_ready(true);
+    ui.set_playback_state(2);
+    ui.set_pitch_text("7.00".into());
+    ui.set_speed_text("0.50".into());
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let observed = actions.clone();
+    let weak = ui.as_weak();
+    ui.on_start_requested(move || {
+        observed.borrow_mut().push("play".to_owned());
+        let ui = weak.upgrade().unwrap();
+        ui.set_playback_state(3);
+        ui.set_playing(true);
+    });
+    let observed = actions.clone();
+    let weak = ui.as_weak();
+    ui.on_pause_requested(move || {
+        observed.borrow_mut().push("pause".to_owned());
+        let ui = weak.upgrade().unwrap();
+        ui.set_playback_state(4);
+        ui.set_playing(false);
+    });
+    let observed = actions.clone();
+    ui.on_transform_requested(move |pitch, rate, mono, repeat| {
+        observed
+            .borrow_mut()
+            .push(format!("{pitch}/{rate}/{mono}/{repeat}"));
+    });
+    ui.show().unwrap();
+    click_label(&ui, "Play");
+    click_label(&ui, "Pause");
+    click_label(&ui, "Mono monitoring");
+    // A round trip through Studio must retain the toggled transform state.
+    crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
+    crate::theme::apply_theme(&ui, audiolib_core::config::DEFAULT_THEME);
+    click_label(&ui, "Repeat sound");
+    assert_eq!(
+        &*actions.borrow(),
+        &[
+            "play",
+            "pause",
+            "7.00/0.50/true/false",
+            "7.00/0.50/true/true"
+        ]
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
+fn studio_workbench_view_menu_reaches_library_and_inspector_without_the_rail() {
+    use audiolib_core::config::{DEFAULT_V2_THEME, STUDIO_THEME};
+
+    i_slint_backend_testing::init_no_event_loop();
+    for id in [DEFAULT_V2_THEME, STUDIO_THEME] {
+        for chinese in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+            ui.set_chinese(chinese);
+            crate::theme::apply_theme(&ui, id);
+            ui.set_sidebar_visible(false);
+            ui.set_inspector_visible(false);
+            ui.show().unwrap();
+            let view = if chinese { "视图" } else { "View" };
+            click_menu_item(
+                &ui,
+                view,
+                if chinese {
+                    "显示素材目录"
+                } else {
+                    "Show library sidebar"
+                },
+            );
+            assert!(ui.get_sidebar_visible());
+            click_menu_item(
+                &ui,
+                view,
+                if chinese {
+                    "显示筛选"
+                } else {
+                    "Show filters"
+                },
+            );
+            assert!(ui.get_inspector_visible() && ui.get_filters_visible());
+            click_menu_item(
+                &ui,
+                view,
+                if chinese {
+                    "显示声音详情"
+                } else {
+                    "Show sound details"
+                },
+            );
+            assert!(ui.get_inspector_visible() && !ui.get_filters_visible());
+            click_menu_item(
+                &ui,
+                view,
+                if chinese {
+                    "显示侧栏（筛选 / 详情）"
+                } else {
+                    "Show side panel (filters / details)"
+                },
+            );
+            assert!(!ui.get_inspector_visible());
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
 fn audition_buttons_have_distinct_transport_actions_and_submit_transform_settings() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
+    crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
     ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
     ui.set_audio_ready(true);
     ui.set_pitch_text("7.00".into());
@@ -364,7 +687,16 @@ fn audition_buttons_have_distinct_transport_actions_and_submit_transform_setting
             .push(format!("{pitch}/{rate}/{mono}/{repeat}"));
     });
     ui.show().unwrap();
+    // Play and Pause share one toggle whose label follows the transport.
     for label in ["Play", "Pause", "Mono monitoring", "Repeat sound"] {
+        ui.set_playing(label == "Pause");
+        assert_eq!(
+            ElementHandle::find_by_accessible_label(&ui, "Pause")
+                .next()
+                .is_some(),
+            label == "Pause",
+            "the toggle reads Pause only while playing"
+        );
         let item = ElementHandle::find_by_accessible_label(&ui, label)
             .next()
             .expect(label);
@@ -599,24 +931,47 @@ fn click_at(ui: &AppWindow, position: slint::LogicalPosition) {
     });
 }
 
+fn software_menu_bar(ui: &AppWindow) -> ElementHandle {
+    // The compiler-generated MenuBarImpl wrapper has no debug type metadata;
+    // its stock MenuBar child retains this source-qualified element id.
+    ElementHandle::find_by_element_id(ui, "MenuBarImpl::base")
+        .next()
+        .expect("software menu bar")
+}
+
 fn menu_bar_entry(ui: &AppWindow, title: &str) -> ElementHandle {
-    ElementHandle::find_by_element_type_name(ui, "MenuBarItem")
-        .find(|entry| {
+    software_menu_bar(ui)
+        .query_descendants()
+        .match_type_name("MenuBarItem")
+        .match_predicate({
             let title = title.to_owned();
-            entry
-                .query_descendants()
-                .match_predicate(move |element| {
-                    element
-                        .accessible_label()
-                        .is_some_and(|label| label == title)
-                })
-                .find_first()
-                .is_some()
+            move |entry| {
+                let title = title.clone();
+                entry
+                    .query_descendants()
+                    .match_predicate(move |element| {
+                        element
+                            .accessible_label()
+                            .is_some_and(|label| label == title)
+                    })
+                    .find_first()
+                    .is_some()
+            }
         })
+        .find_first()
         .unwrap_or_else(|| panic!("Missing menu bar entry: {title}"))
 }
 
-fn open_menu(ui: &AppWindow, title: &str) -> slint::LogicalPosition {
+fn menu_popup_position(ui: &AppWindow, title: &str) -> slint::LogicalPosition {
+    let entry = menu_bar_entry(ui, title);
+    let bar = software_menu_bar(ui);
+    slint::LogicalPosition::new(
+        entry.absolute_position().x,
+        bar.absolute_position().y + bar.size().height,
+    )
+}
+
+pub(crate) fn open_menu(ui: &AppWindow, title: &str) -> slint::LogicalPosition {
     let entry = menu_bar_entry(ui, title);
     let origin = entry.absolute_position();
     let size = entry.size();
@@ -624,8 +979,34 @@ fn open_menu(ui: &AppWindow, title: &str) -> slint::LogicalPosition {
         ui,
         slint::LogicalPosition::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0),
     );
-    // Slint's fallback popup positions are relative to the menu bar entry.
-    slint::LogicalPosition::new(origin.x, origin.y + size.height)
+    // The stock menu uses the complete bar height, independently of item padding.
+    menu_popup_position(ui, title)
+}
+
+fn hover_menu(ui: &AppWindow, title: &str) {
+    let entry = menu_bar_entry(ui, title);
+    let (origin, size) = (entry.absolute_position(), entry.size());
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(
+            origin.x + size.width / 2.0,
+            origin.y + size.height / 2.0,
+        ),
+    });
+}
+
+fn open_menu_has_label(ui: &AppWindow, label: &str) -> bool {
+    ElementHandle::find_by_element_type_name(ui, "MenuFrame").any(|frame| {
+        let label = label.to_owned();
+        frame
+            .query_descendants()
+            .match_predicate(move |element| {
+                element
+                    .accessible_label()
+                    .is_some_and(|value| value == label)
+            })
+            .find_first()
+            .is_some()
+    })
 }
 
 fn click_menu_item(ui: &AppWindow, title: &str, label: &str) {
@@ -647,6 +1028,11 @@ fn click_menu_item(ui: &AppWindow, title: &str, label: &str) {
 // Fallback submenus open beside their entry; their items report popup-relative positions.
 fn click_submenu_item(ui: &AppWindow, title: &str, submenu: &str, label: &str) {
     let popup = open_menu(ui, title);
+    let parent_width = ElementHandle::find_by_element_type_name(ui, "MenuFrame")
+        .next()
+        .expect("open parent menu frame")
+        .size()
+        .width;
     let entry = ElementHandle::find_by_accessible_label(ui, submenu)
         .next()
         .unwrap_or_else(|| panic!("Missing {title} submenu: {submenu}"));
@@ -658,7 +1044,8 @@ fn click_submenu_item(ui: &AppWindow, title: &str, submenu: &str, label: &str) {
             popup.y + origin.y + size.height / 2.0,
         ),
     );
-    let nested = slint::LogicalPosition::new(popup.x + origin.x + size.width, popup.y + origin.y);
+    // The label is content-sized; Slint opens the submenu beside the full frame.
+    let nested = slint::LogicalPosition::new(popup.x + parent_width, popup.y + origin.y);
     let item = ElementHandle::find_by_accessible_label(ui, label)
         .find(|item| item.absolute_position().x < origin.x + size.width / 2.0)
         .unwrap_or_else(|| panic!("Missing {submenu} item: {label}"));
@@ -672,8 +1059,147 @@ fn click_submenu_item(ui: &AppWindow, title: &str, submenu: &str, label: &str) {
     );
 }
 
+fn click_scan_item(ui: &AppWindow, label: &str) {
+    let (library, scan) = if ui.get_chinese() {
+        ("音效库", "扫描与索引")
+    } else {
+        ("Library", "Scan and index")
+    };
+    click_submenu_item(ui, library, scan, label);
+}
+
 #[test]
-fn library_menu_file_status_and_view_sort_show_a_footer_reset() {
+fn menu_hover_switches_only_during_an_open_session_in_all_themes() {
+    i_slint_backend_testing::init_no_event_loop();
+    for theme in audiolib_core::config::THEME_IDS {
+        for chinese in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+            crate::theme::apply_theme(&ui, theme);
+            ui.set_chinese(chinese);
+            ui.show().unwrap();
+            let (file, view, help, create, theme_label, shortcuts) = if chinese {
+                (
+                    "文件",
+                    "视图",
+                    "帮助",
+                    "新建本地音效库…",
+                    "主题",
+                    "快捷键与基本操作…",
+                )
+            } else {
+                (
+                    "File",
+                    "View",
+                    "Help",
+                    "New local library…",
+                    "Theme",
+                    "Shortcuts and basics…",
+                )
+            };
+
+            hover_menu(&ui, view);
+            assert!(
+                ElementHandle::find_by_element_type_name(&ui, "MenuFrame")
+                    .next()
+                    .is_none(),
+                "hovering a closed menu must not open it: {theme}/{chinese}"
+            );
+            open_menu(&ui, file);
+            assert!(open_menu_has_label(&ui, create));
+            hover_menu(&ui, view);
+            assert!(open_menu_has_label(&ui, theme_label));
+            assert!(!open_menu_has_label(&ui, create));
+            hover_menu(&ui, help);
+            assert!(open_menu_has_label(&ui, shortcuts));
+            assert!(!open_menu_has_label(&ui, theme_label));
+            close_menu(&ui);
+
+            hover_menu(&ui, file);
+            assert!(
+                ElementHandle::find_by_element_type_name(&ui, "MenuFrame")
+                    .next()
+                    .is_none(),
+                "Escape ends hover switching"
+            );
+            open_menu(&ui, file);
+            click_at(&ui, slint::LogicalPosition::new(1432.0, 450.0));
+            hover_menu(&ui, view);
+            assert!(
+                ElementHandle::find_by_element_type_name(&ui, "MenuFrame")
+                    .next()
+                    .is_none(),
+                "an outside click ends hover switching"
+            );
+
+            click_menu_item(&ui, help, shortcuts);
+            assert!(ui.get_help_visible());
+            assert!(
+                ElementHandle::find_by_element_type_name(&ui, "MenuFrame")
+                    .next()
+                    .is_none(),
+                "activating a command closes its menu"
+            );
+            send_keys(&ui, &[slint::platform::Key::Escape.into()]);
+            assert!(!ui.get_help_visible());
+            hover_menu(&ui, file);
+            assert!(
+                ElementHandle::find_by_element_type_name(&ui, "MenuFrame")
+                    .next()
+                    .is_none(),
+                "a completed command does not leave hover switching armed"
+            );
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn view_language_menu_dispatches_quick_switches_in_every_theme() {
+    i_slint_backend_testing::init_no_event_loop();
+    for theme in audiolib_core::config::THEME_IDS {
+        for initial_chinese in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+            crate::theme::apply_theme(&ui, theme);
+            ui.set_chinese(initial_chinese);
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            let observed = requests.clone();
+            let weak = ui.as_weak();
+            ui.on_language_requested(move |chinese| {
+                observed.borrow_mut().push(chinese);
+                weak.upgrade().unwrap().set_chinese(chinese);
+            });
+            ui.show().unwrap();
+            for chinese in [!initial_chinese, initial_chinese] {
+                let (view, language) = if ui.get_chinese() {
+                    ("视图", "语言")
+                } else {
+                    ("View", "Language")
+                };
+                click_submenu_item(
+                    &ui,
+                    view,
+                    language,
+                    if chinese { "简体中文" } else { "English" },
+                );
+                assert_eq!(ui.get_chinese(), chinese);
+                assert_eq!(requests.borrow().last(), Some(&chinese));
+                assert!(!ui.get_settings_visible());
+                assert!(
+                    ElementHandle::find_by_element_type_name(&ui, "MenuFrame")
+                        .next()
+                        .is_none()
+                );
+            }
+            assert_eq!(&*requests.borrow(), &[!initial_chinese, initial_chinese]);
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn view_menu_file_status_and_sort_show_a_footer_reset() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
@@ -681,7 +1207,7 @@ fn library_menu_file_status_and_view_sort_show_a_footer_reset() {
     let observed = searches.clone();
     ui.on_filter_requested(move || *observed.borrow_mut() += 1);
     ui.show().unwrap();
-    click_submenu_item(&ui, "Library", "Show files: Present files", "Missing files");
+    click_submenu_item(&ui, "View", "Show files: Present files", "Missing files");
     assert_eq!(ui.get_visibility_index(), 1);
     assert_eq!(*searches.borrow(), 1);
     // The footer keeps the menu-only scope visible and restores it in one click.
@@ -742,13 +1268,17 @@ fn menu_bar_library_workflows_hide_technical_actions_in_both_languages() {
     let observed = actions.clone();
     ui.on_library_action(move |action| observed.borrow_mut().push(action));
     ui.show().unwrap();
-    for chinese in [false, true] {
+    for (theme, chinese) in audiolib_core::config::THEME_IDS
+        .into_iter()
+        .flat_map(|theme| [false, true].map(|chinese| (theme, chinese)))
+    {
+        crate::theme::apply_theme(&ui, theme);
         ui.set_chinese(chinese);
         let titles = if chinese {
-            ["文件", "编辑", "音效库", "扫描", "视图", "播放", "帮助"]
+            ["文件", "编辑", "音效库", "视图", "播放", "设置", "帮助"]
         } else {
             [
-                "File", "Edit", "Library", "Scan", "View", "Playback", "Help",
+                "File", "Edit", "Library", "View", "Playback", "Settings", "Help",
             ]
         };
         for title in titles {
@@ -840,7 +1370,11 @@ fn menu_bar_library_workflows_hide_technical_actions_in_both_languages() {
             [("Scan history…", 0), ("Recent playback…", 1)]
         } {
             actions.borrow_mut().clear();
-            click_menu_item(&ui, library, label);
+            if kind == 0 {
+                click_scan_item(&ui, label);
+            } else {
+                click_menu_item(&ui, if chinese { "播放" } else { "Playback" }, label);
+            }
             assert_eq!(&*actions.borrow(), &[0]);
             assert_eq!(ui.get_history_kind(), kind);
             assert!(ui.get_library_visible());
@@ -915,14 +1449,9 @@ fn library_management_prioritizes_scanning_and_collapses_advanced_maintenance() 
             );
         }
         for label in if chinese {
-            ["添加文件夹…", "增量扫描…", "全量扫描…", "修复文件引用"]
+            ["添加文件夹…", "增量扫描…", "全量扫描…"]
         } else {
-            [
-                "Add folder…",
-                "Incremental scan…",
-                "Full scan…",
-                "Repair file references",
-            ]
+            ["Add folder…", "Incremental scan…", "Full scan…"]
         } {
             let element = ElementHandle::find_by_accessible_label(&ui, label)
                 .next()
@@ -938,6 +1467,29 @@ fn library_management_prioritizes_scanning_and_collapses_advanced_maintenance() 
                 "{label} is vertically clipped"
             );
         }
+        let remove_root = if chinese {
+            "从库中移除此根目录…"
+        } else {
+            "Remove root from library…"
+        };
+        let remove = ElementHandle::find_by_accessible_label(&ui, remove_root)
+            .next()
+            .expect(remove_root);
+        assert_eq!(
+            remove.accessible_enabled(),
+            Some(false),
+            "Remove root stays disabled with an empty selection"
+        );
+        // Scan-roots list sits above repair; scroll so the maintenance action stays reachable.
+        scroll_library_management(&ui, -400.0);
+        let repair = if chinese {
+            "修复文件引用"
+        } else {
+            "Repair file references"
+        };
+        ElementHandle::find_by_accessible_label(&ui, repair)
+            .next()
+            .expect(repair);
         scroll_library_management(&ui, -5000.0);
         click_label(&ui, advanced);
         scroll_library_management(&ui, -5000.0);
@@ -1019,14 +1571,35 @@ fn repair_references_shows_missing_files_across_the_library_in_both_languages() 
                         "Manage library"
                     },
                 );
-                click_label(
-                    &ui,
-                    if chinese {
-                        "修复文件引用"
-                    } else {
-                        "Repair file references"
-                    },
-                );
+                let repair = if chinese {
+                    "修复文件引用"
+                } else {
+                    "Repair file references"
+                };
+                // Library settings can exceed a compact window's viewport.
+                // Bring the real action into view before exercising its pointer path.
+                let scroll = ElementHandle::find_by_element_id(&ui, "AppWindow::library-scroll")
+                    .next()
+                    .expect("library settings scroll view");
+                for _ in 0..8 {
+                    if has_label(&ui, repair) {
+                        break;
+                    }
+                    scroll_library_management(&ui, -scroll.size().height * 0.6);
+                }
+                let action = ElementHandle::find_by_accessible_label(&ui, repair)
+                    .next()
+                    .expect("repair references action is reachable by scrolling");
+                let top = scroll.absolute_position().y + 4.0;
+                let bottom = scroll.absolute_position().y + scroll.size().height - 4.0;
+                let action_top = action.absolute_position().y;
+                let action_bottom = action_top + action.size().height;
+                if action_top < top {
+                    scroll.scroll(0.0, top - action_top);
+                } else if action_bottom > bottom {
+                    scroll.scroll(0.0, bottom - action_bottom);
+                }
+                click_label(&ui, repair);
             } else {
                 click_menu_item(
                     &ui,
@@ -1097,9 +1670,8 @@ fn folder_menu_modal_focus_keeps_path_input_and_tabs_out_of_background_metadata(
         assert_ne!(draft, "original", "Calibrate the background editor focus");
         assert_eq!(*edits.borrow(), 1);
         ui.set_metadata_dirty(false);
-        click_menu_item(
+        click_scan_item(
             &ui,
-            if chinese { "扫描" } else { "Scan" },
             if chinese {
                 "增量扫描文件夹…"
             } else {
@@ -1139,9 +1711,8 @@ fn folder_menu_modal_focus_keeps_path_input_and_tabs_out_of_background_metadata(
         send_keys(&ui, &[slint::platform::Key::Escape.into()]);
         assert!(!ui.get_import_visible());
         // With an empty path, reverse traversal must skip disabled Start to Cancel.
-        click_menu_item(
+        click_scan_item(
             &ui,
-            if chinese { "扫描" } else { "Scan" },
             if chinese {
                 "增量扫描文件夹…"
             } else {
@@ -1297,9 +1868,8 @@ fn pending_scan_dialog_guards_inputs_and_cancels_with_button_or_escape() {
             let observed = browses.clone();
             ui.on_scan_browse_requested(move || *observed.borrow_mut() += 1);
             ui.show().unwrap();
-            click_menu_item(
+            click_scan_item(
                 &ui,
-                if chinese { "扫描" } else { "Scan" },
                 if chinese {
                     "增量扫描文件夹…"
                 } else {
@@ -1446,9 +2016,8 @@ fn folder_scan_dialog_browses_preserves_cancelled_draft_and_guards_submission() 
             ui.set_import_visible(false);
         });
         ui.show().unwrap();
-        click_menu_item(
+        click_scan_item(
             &ui,
-            if chinese { "扫描" } else { "Scan" },
             if chinese {
                 "增量扫描文件夹…"
             } else {
@@ -1547,9 +2116,8 @@ fn folder_scan_dialog_browses_preserves_cancelled_draft_and_guards_submission() 
             "Cancellation preserves the path draft"
         );
         assert!(scans.borrow().is_empty());
-        click_menu_item(
+        click_scan_item(
             &ui,
-            if chinese { "扫描" } else { "Scan" },
             if chinese {
                 "全量扫描文件夹…"
             } else {
@@ -1611,29 +2179,36 @@ fn menu_bar_record_actions_use_displayed_id_and_current_folder_path() {
         ("Add to favorites", 5),
         ("Reveal in Explorer", 2),
         ("Repair selected file reference…", 20),
-        ("Remove selected record (keep WAV)…", 21),
+        ("Remove current sound (keep source files)…", 21),
     ] {
         click_menu_item(&ui, "Edit", label);
         assert_eq!(files.borrow().last(), Some(&("42".to_owned(), action)));
     }
-    click_menu_item(&ui, "Edit", "Remove current folder (keep WAV)…");
+    click_menu_item(&ui, "Library", "Remove current folder (keep source files)…");
     assert_eq!(&*folders.borrow(), &[("D:\\Sounds\\Aircraft".into(), 1)]);
     ui.set_checked_count(2);
-    click_menu_item(&ui, "Edit", "Remove selected records (keep WAV)…");
+    click_menu_item(&ui, "Edit", "Edit checked records (2)…");
+    assert!(ui.get_batch_visible());
+    ui.set_batch_visible(false);
+    click_menu_item(&ui, "Edit", "Remove 2 checked records (keep source files)…");
     assert_eq!(&*library.borrow(), &[11]);
 
     ui.set_has_selection(false);
     ui.set_checked_count(0);
     ui.set_selected_folder_path("".into());
+    click_menu_item(&ui, "Edit", "Edit checked records (0)…");
+    assert!(!ui.get_batch_visible());
+    close_menu(&ui);
     let file_count = files.borrow().len();
     for label in [
-        "Remove selected record (keep WAV)…",
-        "Remove selected records (keep WAV)…",
-        "Remove current folder (keep WAV)…",
+        "Remove current sound (keep source files)…",
+        "Remove 0 checked records (keep source files)…",
     ] {
         click_menu_item(&ui, "Edit", label);
         close_menu(&ui);
     }
+    click_menu_item(&ui, "Library", "Remove current folder (keep source files)…");
+    close_menu(&ui);
     assert_eq!(files.borrow().len(), file_count);
     assert_eq!(folders.borrow().len(), 1);
     assert_eq!(&*library.borrow(), &[11]);
@@ -1660,15 +2235,15 @@ fn menu_bar_scan_modes_and_active_scan_guards_preserve_current_folder() {
     let observed = cancels.clone();
     ui.on_scan_cancel_requested(move || *observed.borrow_mut() += 1);
     ui.show().unwrap();
-    click_menu_item(&ui, "Scan", "Full folder rescan…");
+    click_scan_item(&ui, "Full folder rescan…");
     assert!(ui.get_import_visible());
     assert_eq!(ui.get_scan_mode(), 1);
     ui.set_import_visible(false);
-    click_menu_item(&ui, "Scan", "Incremental folder scan…");
+    click_scan_item(&ui, "Incremental folder scan…");
     assert!(ui.get_import_visible());
     assert_eq!(ui.get_scan_mode(), 0);
     ui.set_import_visible(false);
-    click_menu_item(&ui, "Scan", "Full rescan of current folder");
+    click_scan_item(&ui, "Full rescan of current folder");
     assert!(ui.get_import_visible());
     assert_eq!(ui.get_scan_path(), "D:\\Sounds\\Aircraft");
     assert_eq!(ui.get_scan_mode(), 1);
@@ -1678,7 +2253,7 @@ fn menu_bar_scan_modes_and_active_scan_guards_preserve_current_folder() {
     );
     click_label(&ui, "Start scan");
     assert!(!ui.get_import_visible());
-    click_menu_item(&ui, "Scan", "Incremental scan of current folder");
+    click_scan_item(&ui, "Incremental scan of current folder");
     assert!(ui.get_import_visible());
     assert_eq!(ui.get_scan_path(), "D:\\Sounds\\Aircraft");
     assert_eq!(ui.get_scan_mode(), 0);
@@ -1690,21 +2265,21 @@ fn menu_bar_scan_modes_and_active_scan_guards_preserve_current_folder() {
             ("D:\\Sounds\\Aircraft".into(), 0)
         ]
     );
-    click_menu_item(&ui, "Scan", "Cancel current scan");
+    click_scan_item(&ui, "Cancel current scan");
     assert_eq!(*cancels.borrow(), 0);
     close_menu(&ui);
     ui.set_scanning(true);
-    for (title, label) in [
-        ("Scan", "Incremental folder scan…"),
-        ("Scan", "Full folder rescan…"),
-        ("Scan", "Full rescan of current folder"),
+    for label in [
+        "Incremental folder scan…",
+        "Full folder rescan…",
+        "Full rescan of current folder",
     ] {
-        click_menu_item(&ui, title, label);
+        click_scan_item(&ui, label);
         assert!(!ui.get_import_visible());
         close_menu(&ui);
     }
     assert_eq!(scans.borrow().len(), 2);
-    click_menu_item(&ui, "Scan", "Cancel current scan");
+    click_scan_item(&ui, "Cancel current scan");
     assert_eq!(*cancels.borrow(), 1);
     ui.hide().unwrap();
 }
@@ -1783,7 +2358,12 @@ fn menu_bar_playback_view_and_help_preserve_selection_and_modal_guards() {
     ui.on_library_action(move |action| observed.borrow_mut().push(action));
     click_menu_item(&ui, "Help", "Shortcuts and basics…");
     assert!(ui.get_help_visible());
-    click_menu_item(&ui, "Library", "Manage sound library…");
+    let library_menu = menu_bar_entry(&ui, "Library");
+    let (origin, size) = (library_menu.absolute_position(), library_menu.size());
+    click_at(
+        &ui,
+        slint::LogicalPosition::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0),
+    );
     assert!(libraries.borrow().is_empty());
     assert!(!ui.get_library_visible());
     assert!(ui.get_help_visible());
@@ -1849,7 +2429,7 @@ fn menu_bar_shortcuts_dispatch_once_and_respect_all_modal_guards() {
     send_keys(&ui, &[slint::platform::Key::Control.into(), "q".into()]);
     assert_eq!(*exits.borrow(), 1);
 
-    let modal_setters: [fn(&AppWindow, bool); 10] = [
+    let modal_setters: [fn(&AppWindow, bool); 12] = [
         AppWindow::set_library_visible,
         AppWindow::set_confirmation_visible,
         AppWindow::set_batch_visible,
@@ -1858,12 +2438,15 @@ fn menu_bar_shortcuts_dispatch_once_and_respect_all_modal_guards() {
         AppWindow::set_peaks_visible,
         AppWindow::set_about_visible,
         AppWindow::set_help_visible,
+        AppWindow::set_debug_visible,
+        AppWindow::set_update_visible,
         AppWindow::set_library_busy,
         AppWindow::set_closing,
     ];
     for (index, set_modal) in modal_setters.into_iter().enumerate() {
         set_modal(&ui, true);
-        for key in ["d", "s", "q", "i"] {
+        let settings_were_open = ui.get_settings_visible();
+        for key in ["d", "s", "q", "i", ","] {
             send_keys(&ui, &[slint::platform::Key::Control.into(), key.into()]);
         }
         send_keys(&ui, &[slint::platform::Key::F5.into()]);
@@ -1872,6 +2455,11 @@ fn menu_bar_shortcuts_dispatch_once_and_respect_all_modal_guards() {
         assert_eq!(*exits.borrow(), 1, "Guard {index}");
         assert_eq!(*refreshes.borrow(), 1, "Guard {index}");
         assert_eq!(ui.get_inspector_visible(), !inspector, "Guard {index}");
+        assert_eq!(
+            ui.get_settings_visible(),
+            settings_were_open,
+            "Guard {index}"
+        );
         set_modal(&ui, false);
     }
     ui.set_has_selection(false);
@@ -2143,6 +2731,358 @@ fn database_batch_and_confirmation_actions_are_reachable_in_both_languages() {
 }
 
 #[test]
+fn audition_sliders_keep_bilingual_accessible_names_in_both_themes() {
+    use audiolib_core::config::THEME_IDS;
+
+    i_slint_backend_testing::init_no_event_loop();
+    for id in THEME_IDS {
+        for chinese in [false, true] {
+            let ui = AppWindow::new().unwrap();
+            crate::theme::apply_theme(&ui, id);
+            ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+            ui.set_chinese(chinese);
+            ui.set_audio_ready(true);
+            ui.set_play_duration(20.0);
+            ui.set_view_end(20.0);
+            ui.set_wave_zoom(4.0);
+            let volumes = Rc::new(RefCell::new(Vec::new()));
+            let observed = volumes.clone();
+            ui.on_volume_db_requested(move |db| observed.borrow_mut().push(db));
+            ui.show().unwrap();
+            for (label, minimum, maximum) in [
+                (if chinese { "音量" } else { "Volume" }, -60.0, 0.0),
+                (
+                    if chinese {
+                        "波形可视范围"
+                    } else {
+                        "Visible waveform range"
+                    },
+                    0.0,
+                    1.0,
+                ),
+            ] {
+                let slider = ElementHandle::find_by_accessible_label(&ui, label)
+                    .find(|element| element.accessible_role() == Some(AccessibleRole::Slider))
+                    .unwrap_or_else(|| panic!("{id}: missing named slider {label}"));
+                assert_eq!(slider.accessible_value_minimum(), Some(minimum));
+                assert_eq!(slider.accessible_value_maximum(), Some(maximum));
+                assert_eq!(slider.accessible_enabled(), Some(true));
+                if minimum < 0.0 {
+                    slider.set_accessible_value("-6");
+                    assert!((ui.get_volume_db() + 6.0).abs() < 0.001);
+                    assert_eq!(volumes.borrow().last(), Some(&-6.0));
+                }
+            }
+            ui.hide().unwrap();
+        }
+    }
+}
+
+#[test]
+fn classic_waveform_pan_requires_ready_audio_for_pointer_keyboard_and_accessibility() {
+    use slint::platform::Key;
+
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+        ui.set_chinese(chinese);
+        ui.set_audio_ready(true);
+        ui.set_play_duration(20.0);
+        ui.set_view_end(20.0);
+        ui.set_wave_zoom(4.0);
+        ui.set_wave_scroll(0.5);
+        let pans = Rc::new(RefCell::new(Vec::new()));
+        let observed = pans.clone();
+        ui.on_waveform_pan_requested(move |value| observed.borrow_mut().push(value));
+        ui.show().unwrap();
+        let label = if chinese {
+            "波形可视范围"
+        } else {
+            "Visible waveform range"
+        };
+        let pan = ElementHandle::find_by_accessible_label(&ui, label)
+            .find(|element| element.accessible_role() == Some(AccessibleRole::Slider))
+            .expect("classic pan has an accessible slider owner");
+        pan.set_accessible_value("0.5");
+        pan.invoke_accessible_increment_action();
+        assert!((ui.get_wave_scroll() - 0.505).abs() < 0.001);
+        assert_eq!(pans.borrow().last(), Some(&ui.get_wave_scroll()));
+        let origin = pan.absolute_position();
+        let size = pan.size();
+        click_at(
+            &ui,
+            slint::LogicalPosition::new(origin.x + size.width * 0.75, origin.y + size.height / 2.0),
+        );
+        assert!(ui.get_wave_scroll() > 0.7 && ui.get_wave_scroll() < 0.8);
+        let before_key = ui.get_wave_scroll();
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        assert!((ui.get_wave_scroll() - before_key - 0.005).abs() < 0.001);
+
+        for gate in ["not-ready", "missing", "maintenance", "full-range"] {
+            // Start each case with the real slider focused, then disable it.
+            ui.set_audio_ready(true);
+            ui.set_selected_missing(false);
+            ui.set_library_busy(false);
+            ui.set_wave_zoom(4.0);
+            pan.set_accessible_value("0.5");
+            click_at(
+                &ui,
+                slint::LogicalPosition::new(
+                    origin.x + size.width / 2.0,
+                    origin.y + size.height / 2.0,
+                ),
+            );
+            match gate {
+                "not-ready" => ui.set_audio_ready(false),
+                "missing" => ui.set_selected_missing(true),
+                "maintenance" => ui.set_library_busy(true),
+                "full-range" => ui.set_wave_zoom(1.0),
+                _ => unreachable!(),
+            }
+            assert_eq!(pan.accessible_enabled(), Some(false), "{gate}");
+            let previous = ui.get_wave_scroll();
+            let count = pans.borrow().len();
+            click_at(
+                &ui,
+                slint::LogicalPosition::new(
+                    origin.x + size.width * 0.75,
+                    origin.y + size.height / 2.0,
+                ),
+            );
+            send_keys(&ui, &[Key::RightArrow.into()]);
+            pan.set_accessible_value("0.8");
+            pan.invoke_accessible_increment_action();
+            pan.invoke_accessible_decrement_action();
+            assert_eq!(
+                pans.borrow().len(),
+                count,
+                "{gate}: disabled pan dispatched work"
+            );
+            assert_eq!(
+                ui.get_wave_scroll(),
+                previous,
+                "{gate}: disabled pan changed the view"
+            );
+        }
+        ui.set_audio_ready(true);
+        ui.set_selected_missing(false);
+        ui.set_library_busy(false);
+        ui.set_wave_zoom(4.0);
+        assert_eq!(pan.accessible_enabled(), Some(true));
+        pan.set_accessible_value("0.25");
+        assert!((ui.get_wave_scroll() - 0.25).abs() < 0.001);
+        assert_eq!(pans.borrow().last(), Some(&0.25));
+        ui.hide().unwrap();
+    }
+}
+
+#[test]
+fn classic_waveform_ruler_carries_minutes_and_distinguishes_short_ranges() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    ui.set_audio_ready(true);
+    ui.set_play_duration(120.0);
+    ui.show().unwrap();
+    for (start, end, decimals, precision) in [
+        (59.96_f32, 61.96_f32, 1, 0.1_f64),
+        (0.99, 1.04, 3, 0.001),
+        (59.996, 60.496, 2, 0.01),
+    ] {
+        ui.set_view_start(start);
+        ui.set_view_end(end);
+        let ruler = ElementHandle::find_by_accessible_label(&ui, "Waveform time ruler")
+            .next()
+            .expect("classic Waveform ruler");
+        let mut labels = ruler
+            .query_descendants()
+            .match_inherits("Text")
+            .find_all()
+            .into_iter()
+            .filter_map(|element| {
+                let text = element.accessible_label()?;
+                let (minutes, seconds) = text.split_once(':')?;
+                let minutes = minutes.parse::<u32>().expect("ruler minutes");
+                let seconds = seconds.parse::<f64>().expect("ruler seconds");
+                let decimals = text
+                    .split_once('.')
+                    .map_or(0, |(_, fraction)| fraction.len());
+                Some((element.absolute_position().x, minutes, seconds, decimals))
+            })
+            .collect::<Vec<_>>();
+        labels.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert_eq!(
+            labels.len(),
+            11,
+            "all visible ruler labels must be readable"
+        );
+        for (index, (_, minutes, seconds, digits)) in labels.iter().enumerate() {
+            assert!(
+                (0.0..60.0).contains(seconds),
+                "seconds must carry into minutes"
+            );
+            assert_eq!(*digits, decimals, "precision must follow the visible range");
+            let actual = f64::from(*minutes) * 60.0 + seconds;
+            let expected = f64::from(start) + f64::from(end - start) * index as f64 / 10.0;
+            assert!(
+                (actual - expected).abs() <= precision * 0.501,
+                "tick {index}: {actual} vs {expected}"
+            );
+        }
+        if start > 59.9 {
+            assert_eq!(
+                labels[0].1, 1,
+                "rounding must carry the first tick into the next minute"
+            );
+            assert_eq!(labels[0].2, 0.0);
+        }
+        for pair in labels.windows(2) {
+            let left = f64::from(pair[0].1) * 60.0 + pair[0].2;
+            let right = f64::from(pair[1].1) * 60.0 + pair[1].2;
+            assert!(right > left, "zoomed ruler labels must remain distinct");
+        }
+    }
+    ui.hide().unwrap();
+}
+
+#[test]
+fn waveform_overview_is_tab_reachable_and_keyboard_pan_preserves_playback() {
+    use slint::platform::Key;
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        let ui = AppWindow::new().unwrap();
+        crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
+        ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+        ui.set_chinese(chinese);
+        ui.set_audio_ready(true);
+        ui.set_play_duration(100.0);
+        ui.set_view_end(100.0);
+        ui.set_wave_zoom(4.0);
+        ui.set_wave_scroll(0.5);
+        let pans = Rc::new(RefCell::new(Vec::new()));
+        let observed = pans.clone();
+        ui.on_waveform_pan_requested(move |scroll| observed.borrow_mut().push(scroll));
+        let seeks = Rc::new(RefCell::new(Vec::new()));
+        let observed = seeks.clone();
+        ui.on_seek_requested(move |seconds| observed.borrow_mut().push(seconds));
+        ui.show().unwrap();
+        // Start from the preceding slider's real pointer focus, then Tab through
+        // the transport. Arrow presses on the Waveform itself seek, not pan.
+        click_label(&ui, if chinese { "音量" } else { "Volume" });
+        for _ in 0..10 {
+            send_keys(&ui, &[Key::Tab.into()]);
+            send_keys(&ui, &[Key::RightArrow.into()]);
+            if !pans.borrow().is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !pans.borrow().is_empty(),
+            "Tab must reach the zoomed Waveform overview"
+        );
+        assert!((ui.get_wave_scroll() - 0.55).abs() < 0.001);
+        let seek_count = seeks.borrow().len();
+        for (key, expected) in [
+            (Key::LeftArrow, 0.5),
+            (Key::DownArrow, 0.45),
+            (Key::UpArrow, 0.5),
+            (Key::PageUp, 0.75),
+            (Key::PageDown, 0.5),
+            (Key::End, 1.0),
+            (Key::Home, 0.0),
+            (Key::RightArrow, 0.05),
+        ] {
+            send_keys(&ui, &[key.into()]);
+            assert!((ui.get_wave_scroll() - expected).abs() < 0.001);
+            assert!((pans.borrow().last().copied().unwrap() - expected).abs() < 0.001);
+        }
+        assert_eq!(seeks.borrow().len(), seek_count, "overview keys only pan");
+        // Tab leaves the slider; reverse Tab returns to its keyboard owner.
+        let pan_count = pans.borrow().len();
+        send_keys(&ui, &[Key::Tab.into()]);
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        assert_eq!(pans.borrow().len(), pan_count);
+        send_keys(&ui, &[Key::Shift.into(), Key::Tab.into()]);
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        assert!((ui.get_wave_scroll() - 0.1).abs() < 0.001);
+        let overview = ElementHandle::find_by_accessible_label(
+            &ui,
+            if chinese {
+                "波形可视范围"
+            } else {
+                "Visible waveform range"
+            },
+        )
+        .next()
+        .unwrap();
+        assert_eq!(overview.accessible_role(), Some(AccessibleRole::Slider));
+        // A full-range view cannot pan, including through accessibility actions.
+        ui.set_wave_zoom(1.0);
+        let pan_count = pans.borrow().len();
+        send_keys(&ui, &[Key::RightArrow.into()]);
+        overview.invoke_accessible_increment_action();
+        assert_eq!(pans.borrow().len(), pan_count);
+        assert_eq!(overview.accessible_enabled(), Some(false));
+        ui.hide().unwrap();
+    }
+}
+
+#[test]
+fn player_bar_states_offer_recovery_and_mute_restores_the_level() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = AppWindow::new().unwrap();
+    crate::theme::apply_theme(&ui, audiolib_core::config::STUDIO_THEME);
+    ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let observed = actions.clone();
+    ui.on_file_action_requested(move |id, action| {
+        observed.borrow_mut().push(format!("file {id} {action}"));
+    });
+    let observed = actions.clone();
+    ui.on_audition_requested(move |row| observed.borrow_mut().push(format!("audition {row}")));
+    let observed = actions.clone();
+    ui.on_volume_db_requested(move |db| observed.borrow_mut().push(format!("volume {db}")));
+    ui.set_has_selection(true);
+    ui.set_selected_id("42".into());
+    ui.set_selected_row(3);
+    ui.show().unwrap();
+
+    // A missing source explains itself on the timeline and offers the repair.
+    ui.set_selected_missing(true);
+    click_label(&ui, "Locate the moved WAV and repair");
+    // A failed load offers a retry of the selected row.
+    ui.set_selected_missing(false);
+    ui.set_playback_state(7);
+    ui.set_playback_error("Decoder failed".into());
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Locate the moved WAV and repair")
+            .next()
+            .is_none()
+    );
+    click_label(&ui, "Reload and audition");
+    ui.set_playback_state(2);
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, "Reload and audition")
+            .next()
+            .is_none()
+    );
+
+    // Mute drops to silence; unmute restores the previous level.
+    ui.set_audio_ready(true);
+    ui.set_volume_db(-12.0);
+    click_label(&ui, "Mute");
+    assert_eq!(ui.get_volume_db(), -60.0);
+    click_label(&ui, "Unmute");
+    assert_eq!(ui.get_volume_db(), -12.0);
+    assert_eq!(
+        &*actions.borrow(),
+        &["file 42 20", "audition 3", "volume -60", "volume -12"]
+    );
+    ui.hide().unwrap();
+}
+
+#[test]
 fn missing_records_and_library_freeze_disable_audition_and_batch_apply() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
@@ -2271,6 +3211,9 @@ fn folder_context_menu_uses_window_coordinates_and_retains_its_original_path() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1440.0, 900.0));
+    // The retained native-menu path supplies a nonzero owner offset even though
+    // Windows workbenches now render their commands inside the main view.
+    ui.set_native_macos(true);
     let original = FolderRow {
         name: "Original folder".into(),
         path: "D:\\Sounds\\Original".into(),
@@ -2295,7 +3238,7 @@ fn folder_context_menu_uses_window_coordinates_and_retains_its_original_path() {
         path: "D:\\Sounds\\Replacement".into(),
         ..Default::default()
     }])));
-    let open = ElementHandle::find_by_accessible_label(&ui, "Open in Explorer")
+    let open = ElementHandle::find_by_accessible_label(&ui, "Open in Finder")
         .next()
         .expect("open folder context action");
     let origin = open.absolute_position();
@@ -2595,7 +3538,8 @@ fn pending_waveform_zoom_uses_the_image_still_visible_under_the_pointer() {
     scroll_timeline(&ui, "Waveform timeline", 0.25, 120.0);
     let first = view.borrow().range(100.0);
     assert!((first.0 - 12.5).abs() < 0.001 && (first.1 - 62.5).abs() < 0.001);
-    // The first render has not completed; the image and ruler still show 0..100.
+    // The first render has not completed and no target is published: the image
+    // and ruler still show 0..100.
     scroll_timeline(&ui, "Waveform time ruler", 0.75, 120.0);
     let second = view.borrow().range(100.0);
     assert!((second.0 - 56.25).abs() < 0.001 && (second.1 - 81.25).abs() < 0.001);
@@ -2606,6 +3550,14 @@ fn pending_waveform_zoom_uses_the_image_still_visible_under_the_pointer() {
     scroll_timeline(&ui, "Waveform timeline", 0.5, -120.0);
     let third = view.borrow().range(100.0);
     assert!((third.0 - 43.75).abs() < 0.001 && (third.1 - 93.75).abs() < 0.001);
+    // A published target is what the panel draws (the old image stretched into
+    // it), so the next step anchors to the target even before its render lands.
+    crate::controller::publish_wave_target(&ui, *view.borrow(), 100.0);
+    scroll_timeline(&ui, "Waveform timeline", 0.25, 120.0);
+    let fourth = view.borrow().range(100.0);
+    let anchor = third.0 + (third.1 - third.0) * 0.25;
+    assert!((fourth.0 + (fourth.1 - fourth.0) * 0.25 - anchor).abs() < 0.001);
+    assert!((fourth.1 - fourth.0 - 25.0).abs() < 0.001);
     ui.hide().unwrap();
 }
 
@@ -3302,21 +4254,9 @@ fn source_connection_fields_accept_pointer_focus_and_keyboard_edits() {
             assert_eq!(ui.get_ds_port(), "18790");
             assert_eq!(ui.get_ds_prefix(), "/sounds");
             assert_eq!(ui.get_ds_token(), "isolated-test-token");
-            click_connection_field(
-                &ui,
-                if chinese {
-                    "版本检查间隔（秒）"
-                } else {
-                    "Revision check interval (seconds)"
-                },
-            );
-            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
-            send_keys(&ui, &[slint::platform::Key::Control.into(), "a".into()]);
-            send_keys(&ui, &["90".into()]);
-            assert_eq!(ui.get_ds_poll_interval(), "90");
             ui.set_ds_applying(true);
             send_keys(&ui, &["ignored".into()]);
-            assert_eq!(ui.get_ds_poll_interval(), "90");
+            assert_eq!(ui.get_ds_token(), "isolated-test-token");
             ui.set_ds_applying(false);
             click_label(
                 &ui,
@@ -3327,6 +4267,19 @@ fn source_connection_fields_accept_pointer_focus_and_keyboard_edits() {
                 },
             );
             assert_eq!(*saves.borrow(), 1);
+            ui.set_ds_dirty(false);
+            ui.invoke_close_library_manager();
+            ui.invoke_open_global_settings(3);
+            ui.invoke_focus_settings_first();
+            send_keys(&ui, &[slint::platform::Key::Control.into(), "a".into()]);
+            send_keys(&ui, &["90".into()]);
+            assert_eq!(ui.get_ds_poll_interval(), "90");
+            assert!(ui.get_shared_sync_dirty());
+            assert!(!ui.get_ds_dirty());
+            ui.set_shared_sync_busy(true);
+            send_keys(&ui, &["ignored".into()]);
+            assert_eq!(ui.get_ds_poll_interval(), "90");
+            ui.set_shared_sync_busy(false);
             assert_eq!(ui.get_query(), "Background query");
             assert_eq!(ui.get_edit_tags(), "Background tags");
             ui.hide().unwrap();
@@ -3509,18 +4462,26 @@ fn unified_source_window_lists_sources_and_shows_server_pages_in_both_languages(
         click_label(
             &ui,
             if chinese {
-                "确认删除"
+                "确认移除"
             } else {
-                "Delete profile"
+                "Confirm removal"
             },
         );
         assert!(!ui.get_sm_confirm_delete());
         click_label(
             &ui,
             if chinese {
-                "＋ 添加服务器"
+                "＋ 添加源"
             } else {
-                "+ Add server"
+                "+ Add source"
+            },
+        );
+        click_label(
+            &ui,
+            if chinese {
+                "服务器音效库…"
+            } else {
+                "Server library…"
             },
         );
         assert_eq!(ui.get_sm_selected(), -1);
@@ -3561,6 +4522,131 @@ fn unified_source_window_lists_sources_and_shows_server_pages_in_both_languages(
         assert!(!ui.get_library_visible());
     }
     ui.hide().unwrap();
+}
+
+#[test]
+fn local_source_chooser_and_multiple_local_rows_keep_their_own_controls() {
+    i_slint_backend_testing::init_no_event_loop();
+    for chinese in [false, true] {
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(slint::LogicalSize::new(1080.0, 700.0));
+        ui.set_chinese(chinese);
+        let mut sources = source_rows(false).iter().collect::<Vec<_>>();
+        sources.insert(
+            1,
+            SourceRow {
+                id: "local-foley".into(),
+                name: "Foley".into(),
+                subtitle: "D:/Sounds/Foley.db".into(),
+                kind: 0,
+                ..Default::default()
+            },
+        );
+        ui.set_sm_sources(ModelRc::new(VecModel::from(sources)));
+        ui.set_sm_local_count(2);
+        let local_adds = Rc::new(RefCell::new(0));
+        let observed = local_adds.clone();
+        let weak = ui.as_weak();
+        ui.on_sm_local_add_requested(move || {
+            *observed.borrow_mut() += 1;
+            let ui = weak.upgrade().unwrap();
+            ui.set_sm_local_form(true);
+            ui.set_sm_local_editing(false);
+            ui.set_sm_local_pregenerate(true);
+        });
+        let weak = ui.as_weak();
+        ui.on_sm_source_selected(move |index| {
+            weak.upgrade().unwrap().set_sm_local_default(index == 0);
+        });
+        let deletions = Rc::new(RefCell::new(0));
+        let observed = deletions.clone();
+        ui.on_sm_delete_requested(move || *observed.borrow_mut() += 1);
+        ui.show().unwrap();
+        ui.invoke_open_library(0);
+        let add = if chinese {
+            "＋ 添加源"
+        } else {
+            "+ Add source"
+        };
+        let local = if chinese {
+            "本地音效库路径…"
+        } else {
+            "Local library path…"
+        };
+        click_label(&ui, add);
+        click_label(&ui, local);
+        assert_eq!(*local_adds.borrow(), 1);
+        assert!(ui.get_sm_local_form() && ui.get_sm_local_pregenerate());
+        assert_eq!(
+            ui.get_sm_selected(),
+            0,
+            "a draft keeps its real source selection"
+        );
+        assert!(!ui.get_sm_add_choice());
+        click_label(&ui, if chinese { "取消" } else { "Cancel" });
+        assert!(!ui.get_sm_local_form());
+
+        ui.invoke_sm_select_row(1);
+        assert!(!has_label(
+            &ui,
+            if chinese {
+                "测试连接"
+            } else {
+                "Test connection"
+            }
+        ));
+        assert!(has_label(
+            &ui,
+            if chinese {
+                "编辑音效库…"
+            } else {
+                "Edit library…"
+            }
+        ));
+        let remove = if chinese {
+            "移除此本地音效库…"
+        } else {
+            "Remove this local library…"
+        };
+        click_label(&ui, remove);
+        assert!(ui.get_sm_confirm_delete());
+        click_label(&ui, if chinese { "取消" } else { "Keep" });
+        ui.invoke_sm_select_row(0);
+        assert!(!has_label(&ui, remove), "default has no removal action");
+        assert_eq!(*deletions.borrow(), 0);
+
+        click_label(
+            &ui,
+            if chinese {
+                "服务器设置"
+            } else {
+                "Server settings"
+            },
+        );
+        assert_eq!(ui.get_sm_selected(), 2, "server tab skips every local row");
+        assert!(has_label(
+            &ui,
+            if chinese {
+                "测试连接"
+            } else {
+                "Test connection"
+            }
+        ));
+        ui.set_ds_dirty(true);
+        click_label(&ui, add);
+        click_label(&ui, local);
+        assert_eq!(ui.get_sm_pending_select(), -4);
+        assert_eq!(
+            *local_adds.borrow(),
+            1,
+            "dirty connection prompts before local creation"
+        );
+        click_label(&ui, if chinese { "放弃修改" } else { "Discard" });
+        assert_eq!(*local_adds.borrow(), 2);
+        assert!(ui.get_sm_local_form() && !ui.get_ds_dirty());
+        assert_eq!(ui.get_sm_selected(), 2);
+        ui.hide().unwrap();
+    }
 }
 
 #[test]
@@ -3882,9 +4968,9 @@ fn unified_source_window_gates_server_scans_and_removals_on_the_active_managed_s
             "Start a scan…"
         };
         let remove = if chinese {
-            "移除所选记录…"
+            "移除已勾选的 2 项…"
         } else {
-            "Remove checked records…"
+            "Remove 2 checked records…"
         };
         let folder = if chinese {
             "删除目录记录…"
@@ -3977,35 +5063,51 @@ fn unified_source_window_gates_server_scans_and_removals_on_the_active_managed_s
 }
 
 #[test]
-fn appearance_settings_live_in_the_view_menu_in_both_languages() {
+fn settings_menu_opens_one_global_dialog_with_the_requested_page() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = AppWindow::new().unwrap();
     ui.window().set_size(slint::LogicalSize::new(1080.0, 700.0));
     ui.show().unwrap();
     for chinese in [false, true] {
         ui.set_chinese(chinese);
-        let (view, playback, label) = if chinese {
-            ("视图", "播放", "外观设置…")
+        let (view, settings, global, general, audio, sync) = if chinese {
+            (
+                "视图",
+                "设置",
+                "全局设置…",
+                "通用与界面…",
+                "播放与音频…",
+                "服务器与同步…",
+            )
         } else {
-            ("View", "Playback", "Appearance settings…")
+            (
+                "View",
+                "Settings",
+                "Global settings…",
+                "General and interface…",
+                "Audio and playback…",
+                "Server and sync…",
+            )
         };
-        open_menu(&ui, playback);
+        open_menu(&ui, view);
         assert!(
-            ElementHandle::find_by_accessible_label(&ui, label)
+            ElementHandle::find_by_accessible_label(&ui, general)
                 .next()
                 .is_none(),
-            "Appearance settings must no longer be in the Playback menu"
+            "application preferences are reached through Settings"
         );
         close_menu(&ui);
-        ui.set_settings_visible(false);
-        ui.set_settings_page(0);
-        click_menu_item(&ui, view, label);
-        assert!(ui.get_settings_visible(), "View menu must open settings");
-        assert_eq!(
-            ui.get_settings_page(),
-            1,
-            "View menu must open the Appearance page"
-        );
-        ui.set_settings_visible(false);
+        for (label, page) in [(global, 1), (general, 1), (audio, 0), (sync, 3)] {
+            click_menu_item(&ui, settings, label);
+            assert!(ui.get_settings_visible());
+            assert_eq!(ui.get_settings_page(), page);
+            ui.invoke_request_close_settings();
+            assert!(!ui.get_settings_visible());
+        }
+        send_keys(&ui, &[slint::platform::Key::Control.into(), ",".into()]);
+        assert!(ui.get_settings_visible());
+        assert_eq!(ui.get_settings_page(), 1);
+        ui.invoke_request_close_settings();
     }
+    ui.hide().unwrap();
 }

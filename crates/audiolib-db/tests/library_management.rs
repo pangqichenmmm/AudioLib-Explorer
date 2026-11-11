@@ -55,7 +55,7 @@ fn fixture() -> Fixture {
     }
 }
 fn tags(f: &Fixture, id: i64) -> String {
-    f.provider.get_audio(id).unwrap().tags
+    f.provider.get_audio(id).unwrap().into_data().tags
 }
 fn patch(tags: &str) -> MetadataPatch {
     MetadataPatch {
@@ -793,7 +793,7 @@ fn root_relocation_after_a_case_only_rename_preserves_records_and_source_audio()
 
     let conn = support::connection(f.provider.database_path()).unwrap();
     conn.execute(
-        "UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.unknown_extension','keep') WHERE id=?1",
+        "UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.unknown_extension','keep') WHERE id=?1",
         [first.id],
     )
     .unwrap();
@@ -1072,7 +1072,7 @@ fn root_relocation_keeps_windows_case_aliases_as_a_noop() {
     let before: Vec<_> = f
         .ids
         .iter()
-        .map(|id| f.provider.get_audio(*id).unwrap().file_path)
+        .map(|id| f.provider.get_audio(*id).unwrap().into_data().file_path)
         .collect();
     assert_eq!(f.provider.relink_folder(&source, &equivalent).unwrap(), 0);
     assert_eq!(f.provider.stats().unwrap().audio_files, 2);
@@ -1111,7 +1111,7 @@ fn root_relocation_resolves_existing_source_aliases() {
     let conn = support::connection(f.provider.database_path()).unwrap();
     for id in &f.ids {
         conn.execute(
-            "UPDATE audio_files SET metadata_json=json_set(metadata_json,'$.unknown_extension',json(?1)) WHERE id=?2",
+            "UPDATE audio_files SET metadata_json=json_set(audiolib_metadata_json(metadata_json),'$.unknown_extension',json(?1)) WHERE id=?2",
             rusqlite::params![extension.to_string(), id],
         )
         .unwrap();

@@ -127,6 +127,10 @@ pub(crate) fn allowed(product: Product, text: &str) -> bool {
     }
 }
 
+/// Required files for a current automatic-install payload. Server layout 2
+/// always installs the matching platform migrator alongside the server. Older
+/// asset names remain discoverable, but historical layout 1 archives require
+/// manual installation; missing tools never silently select an older layout.
 pub(crate) fn required(product: Product) -> &'static [&'static str] {
     match product {
         Product::Desktop => &[
@@ -136,8 +140,18 @@ pub(crate) fn required(product: Product) -> &'static [&'static str] {
             "LICENSE",
             "THIRD_PARTY.md",
         ],
-        Product::Server if cfg!(windows) => &["audiolib-server.exe", "LICENSE", "THIRD_PARTY.md"],
-        Product::Server => &["audiolib-server", "LICENSE", "THIRD_PARTY.md"],
+        Product::Server if cfg!(windows) => &[
+            "audiolib-server.exe",
+            "audiolib-migrate.exe",
+            "LICENSE",
+            "THIRD_PARTY.md",
+        ],
+        Product::Server => &[
+            "audiolib-server",
+            "audiolib-migrate",
+            "LICENSE",
+            "THIRD_PARTY.md",
+        ],
     }
 }
 
@@ -284,7 +298,7 @@ pub(crate) fn extract(archive: &Path, payload: &Path, product: Product, name: &s
             );
             let executable = matches!(
                 name.as_str(),
-                "audiolib-server" | "server/deploy/redeploy-server.sh"
+                "audiolib-server" | "audiolib-migrate" | "server/deploy/redeploy-server.sh"
             );
             copy_entry(entry, payload, &name, size, executable)?;
         }

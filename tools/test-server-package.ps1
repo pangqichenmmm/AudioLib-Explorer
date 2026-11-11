@@ -13,12 +13,26 @@ function Assert-TestPath([string]$Path) {
     if (!$full.StartsWith($testRoot + [IO.Path]::DirectorySeparatorChar, $comparison)) { throw 'Server regression escaped its owned subtree.' }
 }
 function Expect-Rejection([scriptblock]$Action, [string]$Message) {
-    $rejected = $false
-    try { & $Action } catch { $rejected = $_.Exception.Message -match $Message }
-    if (!$rejected) { throw 'Server package failed to reject a boundary regression.' }
+    $rejected = $false; $observed=$null
+    try { & $Action } catch { $observed=$_.Exception.Message; $rejected = $observed -match $Message }
+    if (!$rejected) { throw "Server package failed to reject a boundary regression (expected: $Message; observed: $observed)." }
 }
-$target = if ($IsWindows) { 'x86_64-pc-windows-msvc' } elseif ($IsLinux) { 'x86_64-unknown-linux-gnu' } else { 'aarch64-apple-darwin' }
-$platformName = if ($IsWindows) { 'win-x64' } elseif ($IsLinux) { 'linux-x64' } else { 'macos-arm64' }
+$taskProcessArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+if ($IsWindows) {
+    $target = 'x86_64-pc-windows-msvc'; $platformName = 'win-x64'
+} elseif ($IsLinux) {
+    switch ($taskProcessArchitecture) {
+        ([Runtime.InteropServices.Architecture]::X64) {
+            $target = 'x86_64-unknown-linux-gnu'; $platformName = 'linux-x64'
+        }
+        ([Runtime.InteropServices.Architecture]::Arm64) {
+            $target = 'aarch64-unknown-linux-gnu'; $platformName = 'linux-arm64'
+        }
+        default { throw 'Server package regressions require Linux x64 or arm64.' }
+    }
+} else {
+    $target = 'aarch64-apple-darwin'; $platformName = 'macos-arm64'
+}
 $binaryName = if ($IsWindows) { 'audiolib-server.exe' } else { 'audiolib-server' }
 $extension = if ($IsWindows) { 'zip' } else { 'tar.gz' }
 New-Item -ItemType Directory -Path (Join-Path $testRoot 'tools') | Out-Null
@@ -27,8 +41,9 @@ try {
     # The validator's intentionally missing benchmark belongs to this synthetic
     # checkout. A developer's populated target directory must never satisfy it.
     $env:CARGO_TARGET_DIR = Join-Path $testRoot 'target'
-    foreach ($file in @('package-server.ps1', 'console-utf8.ps1', 'validate-server-package.ps1', 'server-files.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination (Join-Path $testRoot 'tools') }
-    $files = @(Get-Content -LiteralPath (Join-Path $testRoot 'tools/server-files.json') -Raw | ConvertFrom-Json)
+    foreach ($file in @('package-server.ps1','server-package-layout.ps1','dependency-licenses.ps1','license-notices.json','console-utf8.ps1','validate-server-package.ps1','validate-update-compatibility.ps1','update-compatible-files.json','server-files.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination (Join-Path $testRoot 'tools') }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'license-notices') -Destination (Join-Path $testRoot 'tools') -Recurse
+    $files = @(Get-Content -LiteralPath (Join-Path $testRoot 'tools/server-files.json') -Raw | ConvertFrom-Json|Where-Object {$_ -cnotin @('audiolib-migrate','audiolib-migrate.exe')})
     foreach ($file in $files) {
         $destination = Join-Path $testRoot $file
         Assert-TestPath $destination
@@ -50,11 +65,15 @@ try {
         [IO.File]::SetUnixFileMode($binary, [IO.UnixFileMode]493)
     }
     $licenseRoot = Join-Path $testRoot 'dependency'
+    $migratorName=if($IsWindows){'audiolib-migrate.exe'}else{'audiolib-migrate'}
+    Copy-Item -LiteralPath $binary -Destination (Join-Path $binaryRoot $migratorName)
+    New-Item -ItemType Directory -Path (Join-Path $testRoot 'crates/audiolib-db') -Force|Out-Null
     New-Item -ItemType Directory -Path $licenseRoot | Out-Null
     Set-Content -LiteralPath (Join-Path $licenseRoot 'LICENSE-MIT') -Value 'Synthetic MIT license notice.' -Encoding utf8NoBOM
     $fakeMetadata = [ordered]@{
         packages=@(
             @{ id='server'; name='audiolib-server'; version='0.4.4'; source=$null; license='GPL-3.0-only'; license_file=$null; repository=$null; manifest_path=(Join-Path $testRoot 'server/audiolib-server/Cargo.toml') },
+            @{ id='db'; name='audiolib-db'; version='0.4.4'; source=$null; license='GPL-3.0-only'; license_file=$null; repository=$null; manifest_path=(Join-Path $testRoot 'crates/audiolib-db/Cargo.toml') },
             @{ id='normal'; name='normal-dependency'; version='1.0.0'; source='registry+public'; license='MIT'; license_file='LICENSE-MIT'; repository='https://example.com/normal'; manifest_path=(Join-Path $licenseRoot 'Cargo.toml') },
             @{ id='dev'; name='private-dev-dependency'; version='1.0.0'; source='registry+public'; license='MIT'; license_file=$null; repository=$null; manifest_path=(Join-Path $testRoot 'must-not-be-opened/Cargo.toml') }
         )
@@ -84,6 +103,10 @@ try {
     $metadataState = @{ AsioRequests=0 }
     # These functions mask only the external commands in this invocation's child scope.
     $metadataCommand = {
+        if($args[0] -ceq 'tree'){
+            if($args -notcontains '--locked' -or $args -notcontains '--offline' -or $args -notcontains '--target' -or $args -notcontains 'normal,build'){throw 'Package tree must use the locked selected target/edges.'}
+            $selected=if($args -contains '--features'){$fakeAsioMetadata}else{$fakeMetadata};foreach($p in $selected.packages){if($p.name -ceq 'private-dev-dependency'){continue};"$($p.name) v$($p.version)"};$global:LASTEXITCODE=0;return
+        }
         if ($args -notcontains '--locked' -or $args -notcontains '--filter-platform') { throw 'Package metadata must use the locked target filter.' }
         if ($args -contains '--features') {
             $position = [array]::IndexOf($args, '--features')
@@ -106,8 +129,21 @@ try {
     }
     $packager = Join-Path $testRoot 'tools/package-server.ps1'
     $validator = Join-Path $testRoot 'tools/validate-server-package.ps1'
-    Expect-Rejection { & $packager -Tag v0.4.4 -Target x86_64-unknown-linux-gnu -Asio } '-Asio requires'
-    Expect-Rejection { & $validator -Tag v0.4.4 -Target x86_64-unknown-linux-gnu -Asio } '-Asio requires'
+    $compatibilityValidator = Join-Path $testRoot 'tools/validate-update-compatibility.ps1'
+    foreach ($compatibilityBinary in @('audiolib-server', 'audiolib-server.exe')) {
+        & $compatibilityValidator -Product Server -ServerBinaryName $compatibilityBinary -Entries @($compatibilityBinary, 'licenses/future-dependency-9.0/LICENSE-MIT', 'licenses/dependencies.json')
+        $otherBinary = if ($compatibilityBinary -ceq 'audiolib-server') { 'audiolib-server.exe' } else { 'audiolib-server' }
+        Expect-Rejection { & $compatibilityValidator -Product Server -ServerBinaryName $compatibilityBinary -Entries @($otherBinary) } 'Update compatibility.*Non-public update file'
+    }
+    Expect-Rejection { & $compatibilityValidator -Product Server -Entries @('licenses/evil.ps1') } 'Update compatibility.*Non-public update file'
+    foreach ($linuxTarget in @('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')) {
+        Expect-Rejection { & $packager -Tag v0.4.4 -Target $linuxTarget -Asio } '-Asio requires'
+        Expect-Rejection { & $validator -Tag v0.4.4 -Target $linuxTarget -Asio } '-Asio requires'
+    }
+    $otherLinuxTarget = if ($IsLinux -and $taskProcessArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) { 'x86_64-unknown-linux-gnu' } else { 'aarch64-unknown-linux-gnu' }
+    $otherLinuxPlatform = if ($otherLinuxTarget -ceq 'x86_64-unknown-linux-gnu') { 'Linux x64' } else { 'Linux arm64' }
+    Expect-Rejection { & $packager -Tag v0.4.4 -Target $otherLinuxTarget } $otherLinuxPlatform
+    Expect-Rejection { & $validator -Tag v0.4.4 -Target $otherLinuxTarget } $otherLinuxPlatform
     & $packager -Tag v0.4.4 -Target $target
     if ((Get-Content -LiteralPath (Join-Path $payload 'update-channel.txt') -Raw).Trim() -cne 'stable' -or
         (Get-Content -LiteralPath (Join-Path $payload 'update-version.txt') -Raw).Trim() -cne '0.4.4') { throw 'Stable server update metadata differs.' }
@@ -127,8 +163,9 @@ try {
     if ((Get-Content -LiteralPath ($archive + '.sha256') -Raw).Trim() -cne ($archiveHash + '  ' + [IO.Path]::GetFileName($archive))) { throw 'Server archive checksum differs.' }
     $reportText = Get-Content -LiteralPath (Join-Path $latest "AudioLibServer-v0.4.4-$platformName-report.json") -Raw
     $report = $reportText | ConvertFrom-Json
-    if (@($report.PSObject.Properties.Name | Sort-Object) -join ',' -cne 'archive_sha256,binary_sha256,checks,commit,success,tag,target,version' -or !$report.success -or
+    if (@($report.PSObject.Properties.Name | Sort-Object) -join ',' -cne 'archive_sha256,automatic_upgrade_compatible,binary_sha256,checks,commit,layout_revision,manual_bootstrap_required,migrator_sha256,minimum_updater_version,old_updater_policy,success,tag,target,version' -or !$report.success -or
         $report.archive_sha256 -cne $archiveHash -or $report.binary_sha256 -cne (Get-FileHash -LiteralPath $binary).Hash -or
+        $report.migrator_sha256 -cne (Get-FileHash -LiteralPath (Join-Path $binaryRoot $migratorName)).Hash -or $report.automatic_upgrade_compatible -or !$report.manual_bootstrap_required -or $report.minimum_updater_version -cne '0.9.0' -or $report.layout_revision -ne 2 -or $report.old_updater_policy -cne 'refused' -or
         $reportText.Contains($testRoot) -or @($report.checks.PSObject.Properties.Value | Where-Object { $_ -ne $true }).Count) { throw 'Server public report schema/identity failed.' }
     if (!$IsWindows) {
         $extracted = Join-Path $testRoot 'extracted'
@@ -234,17 +271,14 @@ try {
                 $savedIdentity = $identity.$field
                 $identity.$field = if ($field -eq 'repository') { 'https://example.com/unrelated' } elseif ($field -eq 'license') { 'MIT' } else { '9.9.9' }
                 try {
-                    & $packager -Tag v0.4.4 -Target $target -Asio
-                    Expect-Rejection { & $validator -Tag v0.4.4 -Target $target -Asio } 'shared CPAL license identity is invalid or missing'
+                    Expect-Rejection { & $packager -Tag v0.4.4 -Target $target -Asio; & $validator -Tag v0.4.4 -Target $target -Asio } 'shared CPAL license identity is invalid or missing'
                 } finally { $identity.$field = $savedIdentity }
             }
         }
         [IO.File]::WriteAllText($cpalLicense, 'Altered shared upstream license.', [Text.UTF8Encoding]::new($false))
-        & $packager -Tag v0.4.4 -Target $target -Asio
-        Expect-Rejection { & $validator -Tag v0.4.4 -Target $target -Asio } 'shared CPAL license differs from the audited upstream notice'
+        Expect-Rejection { & $packager -Tag v0.4.4 -Target $target -Asio; & $validator -Tag v0.4.4 -Target $target -Asio } 'shared CPAL license differs from the audited upstream notice'
         Remove-Item -LiteralPath $cpalLicense
-        & $packager -Tag v0.4.4 -Target $target -Asio
-        Expect-Rejection { & $validator -Tag v0.4.4 -Target $target -Asio } 'shared CPAL license identity is invalid or missing'
+        Expect-Rejection { & $packager -Tag v0.4.4 -Target $target -Asio; & $validator -Tag v0.4.4 -Target $target -Asio } 'shared CPAL license identity is invalid or missing'
         Write-Host 'ASIO shared CPAL notice regression passed: independent precedence, audited fallback, both crate identities, absent notice and actual notice hash.'
         & $packager -Tag v0.4.4 -Target $target
         $archiveHash = (Get-FileHash -LiteralPath $archive).Hash
@@ -257,6 +291,15 @@ try {
     Expect-Rejection { & $packager -Tag v0.4.4 -Target $target -BinaryPath $binary } 'Local build/user path'
     Set-Content -LiteralPath $document -Value 'Synthetic public documentation.'
     $manifest = Join-Path $testRoot 'tools/server-files.json'
+    $futureDocument = 'doc/Rust_Future_Update.md'
+    Set-Content -LiteralPath (Join-Path $testRoot $futureDocument) -Value 'Synthetic public future documentation.' -Encoding utf8NoBOM
+    try {
+        $files + @($futureDocument) | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
+        Expect-Rejection { & $packager -Tag v0.4.4 -Target $target } 'Update compatibility.*Non-public update file'
+    } finally { ConvertTo-Json -InputObject $files | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM }
+    if ((Get-FileHash -LiteralPath $archive).Hash -cne $archiveHash -or (Test-Path -LiteralPath (Join-Path $payload $futureDocument))) {
+        throw 'An incompatible server package replaced the verified output.'
+    }
     $files + @('../outside.txt') | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
     Expect-Rejection { & $packager -Tag v0.4.4 -Target $target } 'Unsafe relative'
     ConvertTo-Json -InputObject $files | Set-Content -LiteralPath $manifest -Encoding utf8NoBOM
@@ -275,7 +318,7 @@ try {
         $link = Get-Item -LiteralPath $dist -Force -ErrorAction SilentlyContinue
         if ($null -ne $link -and ($link.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Assert-TestPath $dist; Remove-Item -LiteralPath $dist -Force }
     }
-    Write-Host 'Server package boundary regression passed: allowlist, dependency closure, safe report/checksums, rejection preservation, linked-path guard and ASIO target/SDK boundary (positive ASIO fixture on Windows).'
+    Write-Host 'Server package boundary regression passed: layout 2 with both binaries, frozen old-updater refusal, manual-bootstrap metadata, complete licenses, dependency closure, safe report/checksums, incompatible public doc rejection/preservation, linked-path guard and ASIO target/SDK boundary (positive ASIO fixture on Windows).'
 } finally {
     $env:CARGO_TARGET_DIR = $savedTargetDirectory
     if (Test-Path -LiteralPath $testRoot) {

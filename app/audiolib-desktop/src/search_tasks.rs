@@ -15,12 +15,21 @@ mod tests;
 #[path = "search_task_presentation.rs"]
 mod presentation;
 
+#[path = "search_task_album_bindings.rs"]
+mod album_bindings;
+use album_bindings::{album_filter_unavailable, reconcile_workspace_albums, resolve_album_filter};
+
 #[derive(Clone)]
 struct TaskCache {
     provider: Weak<SqliteProvider>,
     revision: u64,
     tree: TreeState,
     records: Vec<AudioFile>,
+    /// Raw positions and continuations belonging to exactly these visible records.
+    /// Kept in memory only; a cold restore rebuilds them with bounded queries.
+    window_coverage: Option<result_window::WindowCoverage>,
+    /// Visible row budget; gaps in the original SQL span do not enlarge it.
+    limit: usize,
     summary: String,
     page: String,
     previous: bool,
@@ -38,10 +47,13 @@ pub(super) struct TaskWorkspaceState {
     epoch: u64,
     loading: bool,
     restoring: bool,
+    deferred_search: Option<(bool, bool)>,
     restore_failed: bool,
     resume_after_close: Option<WorkspaceResume>,
     pending_view: Option<SearchTaskView>,
     unavailable_folder: Option<SearchFolderRef>,
+    unavailable_album: Option<i64>,
+    album_bindings: HashMap<i64, audiolib_core::search_workspace::AlbumFilterBinding>,
     protected: bool,
 }
 
@@ -57,10 +69,13 @@ impl Default for TaskWorkspaceState {
             epoch: 0,
             loading: false,
             restoring: false,
+            deferred_search: None,
             restore_failed: false,
             resume_after_close: None,
             pending_view: None,
             unavailable_folder: None,
+            unavailable_album: None,
+            album_bindings: HashMap::new(),
             protected: false,
         }
     }
@@ -111,7 +126,12 @@ fn folder_ref(folder: &Folder) -> SearchFolderRef {
     }
 }
 
-fn fresh_task(order_by: SortOrder, descending: bool, chinese: bool) -> SearchTask {
+fn fresh_task(
+    order_by: SortOrder,
+    descending: bool,
+    scope: SearchScope,
+    chinese: bool,
+) -> SearchTask {
     SearchTask {
         id: unique_id(),
         title: if chinese { "默认搜索" } else { "default" }.into(),
@@ -119,6 +139,7 @@ fn fresh_task(order_by: SortOrder, descending: bool, chinese: bool) -> SearchTas
         definition: SearchTaskDefinition {
             order_by,
             descending,
+            scope,
             ..Default::default()
         },
         view: SearchTaskView::default(),
@@ -131,8 +152,22 @@ fn fresh_task(order_by: SortOrder, descending: bool, chinese: bool) -> SearchTas
 // different contents and must not be silently merged by a task switch.
 fn same_search_definition(left: &SearchTaskDefinition, right: &SearchTaskDefinition) -> bool {
     left.query == right.query
+        && left.scope == right.scope
         && left.include_subfolders == right.include_subfolders
         && left.filters == right.filters
+        && match (&left.album_binding, &right.album_binding) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.kind == right.kind
+                    && left.metadata_key == right.metadata_key
+                    && match (&left.folder_path, &right.folder_path) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => audiolib_db::indexed_paths_equal(left, right),
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
         && left.order_by == right.order_by
         && left.descending == right.descending
         && match (&left.folder, &right.folder) {
@@ -163,9 +198,25 @@ impl Controller {
         state.restore_failed = false;
     }
 
-    pub(super) fn task_folder_unavailable(&self, ui: &AppWindow) -> bool {
-        let folder_id = self.request.lock().unwrap().folder_id;
+    pub(super) fn cancel_deferred_task_search(&self) {
+        self.task_workspace.lock().unwrap().deferred_search = None;
+    }
+
+    pub(super) fn task_folder_unavailable(
+        &self,
+        ui: &AppWindow,
+        immediate: bool,
+        reset: bool,
+    ) -> bool {
+        let request = self.request.lock().unwrap().clone();
+        let folder_id = request.folder_id;
         let mut state = self.task_workspace.lock().unwrap();
+        if state.loading || state.restoring {
+            if state.loading && !state.restoring {
+                state.deferred_search = Some((immediate, reset));
+            }
+            return true;
+        }
         if state.restore_failed {
             ui.set_status(self.localized(
                 "任务恢复失败，原条件已保留；按 F5 重试后再修改检索",
@@ -173,6 +224,14 @@ impl Controller {
             ));
             return true;
         }
+        if state.unavailable_album.is_some_and(|id| {
+            request.filters.album_id == Some(id)
+                && ui.get_album_filter_id().parse::<i64>().ok() == Some(id)
+        }) {
+            ui.set_status(self.localized("任务专辑已失效，请重新选择专辑或重置过滤条件；检索范围未扩大", "Task album is unavailable; choose an album or reset filters. The search scope was retained"));
+            return true;
+        }
+        state.unavailable_album = None;
         if state
             .unavailable_folder
             .as_ref()
@@ -193,6 +252,7 @@ impl Controller {
         let mut state = self.task_workspace.lock().unwrap();
         state.loading = true;
         state.restoring = false;
+        state.deferred_search = None;
         state.restore_failed = false;
         state.pending_view = None;
         state.resume_after_close = None;
@@ -418,6 +478,7 @@ impl Controller {
             let mut state = self.task_workspace.lock().unwrap();
             state.epoch += 1;
             state.loading = true;
+            state.deferred_search = None;
             state.caches.clear();
             state.page_revision = None;
             state.folders_revision = None;
@@ -457,7 +518,14 @@ impl Controller {
                     audiolib_db::local_play_history::local_library_id(provider.database_path())?
                 };
                 let target = SearchWorkspaceTarget::new(data_root, scope);
-                let workspace = provider.load_search_workspace(&target);
+                let workspace =
+                    provider
+                        .load_search_workspace(&target)
+                        .and_then(|mut workspace| {
+                            reconcile_workspace_albums(&provider, &mut workspace)
+                                .map_err(audiolib_core::Error::Validation)?;
+                            Ok(workspace)
+                        });
                 Ok((target, workspace))
             })();
             let c2 = c.clone();
@@ -507,6 +575,7 @@ impl Controller {
                     let task = fresh_task(
                         preferences.order_by,
                         preferences.descending,
+                        search_scope_from_index(ui.get_search_scope_index()),
                         c2.chinese.load(Ordering::Acquire),
                     );
                     state.workspace.session.active_task_id = Some(task.id.clone());
@@ -534,6 +603,7 @@ impl Controller {
                     })
                     .unwrap_or_else(|| state.workspace.session.tasks[0].id.clone());
                 state.workspace.session.active_task_id = Some(id.clone());
+                let deferred_search = state.deferred_search.take();
                 drop(state);
                 ui.set_search_workspace_loading(false);
                 if fresh_workspace {
@@ -541,6 +611,14 @@ impl Controller {
                     // Do not cancel a selection or query requested while startup
                     // completed merely to restore an identical blank task.
                     c2.persist_search_task(&ui);
+                    if c2.request.lock().unwrap().filters.album_id.is_some() {
+                        // Resolve retained IDs even when a short query cancelled
+                        // the deferred search. Identity validation must complete
+                        // before a later valid query can dispatch this task.
+                        c2.restore_search_task(&id);
+                    } else if let Some((immediate, reset)) = deferred_search {
+                        c2.request_navigation_search(&ui, immediate, reset);
+                    }
                 } else {
                     c2.restore_search_task(&id);
                 }
@@ -566,7 +644,11 @@ impl Controller {
         };
         let request = self.request.lock().unwrap().clone();
         let tree = self.tree.lock().unwrap().clone();
-        let records = self.records.lock().unwrap().clone();
+        let (records, window_coverage) = {
+            let records = self.records.lock().unwrap();
+            let coverage = self.window_coverage.lock().unwrap();
+            (records.clone(), coverage.clone())
+        };
         let selected = self.selected.lock().unwrap().as_ref().map(audio_ref);
         let checked = self.multi_selection.lock().unwrap().clone();
         let anchor = *self.selection_anchor.lock().unwrap();
@@ -583,6 +665,11 @@ impl Controller {
         }
         raw.insert("favorites_only".into(), ui.get_favorites_only().to_string());
         raw.insert("tagged_only".into(), ui.get_tagged_only().to_string());
+        if !self.result_scroll_belongs_to_workspace() {
+            // A server viewport must not be written into the local library's task,
+            // and a local viewport must not be written into a server workspace.
+            return;
+        }
         let row_height = ui.get_task_result_row_height().max(1.0);
         let scroll_y = ui.get_task_result_scroll_y();
         let view = SearchTaskView {
@@ -640,8 +727,15 @@ impl Controller {
             filter_scroll_y: ui.get_task_filter_scroll_y(),
             inspector_scroll_y: ui.get_task_inspector_scroll_y(),
         };
+        let album_binding = self.capture_task_album_binding(&request, previous.as_ref(), &records);
+        let displayed_range = self
+            .result_pages
+            .lock()
+            .unwrap()
+            .matches_current_request(&request);
         let definition = SearchTaskDefinition {
             query: request.query,
+            scope: search_scope_from_index(ui.get_search_scope_index()),
             folder: tree
                 .selected
                 .and_then(|id| tree.known.get(&id).map(folder_ref))
@@ -653,6 +747,7 @@ impl Controller {
                 }),
             include_subfolders: request.include_subfolders,
             filters: request.filters,
+            album_binding,
             order_by: table_sort_order(ui.get_sort_index()),
             descending: ui.get_sort_descending(),
         };
@@ -674,7 +769,11 @@ impl Controller {
             task.view = view;
         }
         if let Some(revision) = state.page_revision.filter(|revision| {
-            state.page_complete && state.folders_revision == Some(*revision) && !ui.get_searching()
+            state.page_complete
+                && state.folders_revision == Some(*revision)
+                && !ui.get_searching()
+                && displayed_range
+                && search_scope_from_index(ui.get_search_scope_index()) == request.scope
         }) {
             state.caches.insert(
                 id,
@@ -683,6 +782,8 @@ impl Controller {
                     revision,
                     tree,
                     records,
+                    window_coverage,
+                    limit: request.limit,
                     summary: ui.get_result_summary().to_string(),
                     page: ui.get_page_label().to_string(),
                     previous: ui.get_can_previous(),
@@ -757,7 +858,7 @@ impl Controller {
 
     pub(super) fn set_search_task_limit(&self, limit: i32) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let limit = limit.clamp(1, 6) as u32;
+        let limit = audiolib_core::config::normalize_max_search_tasks(limit.max(1) as u32);
         let count = self
             .task_workspace
             .lock()
@@ -810,6 +911,7 @@ impl Controller {
         let task = fresh_task(
             prefs.order_by,
             prefs.descending,
+            search_scope_from_index(ui.get_search_scope_index()),
             self.chinese.load(Ordering::Acquire),
         );
         let id = task.id.clone();
@@ -886,6 +988,7 @@ impl Controller {
             state.workspace.session.tasks.push(fresh_task(
                 SortOrder::Relevance,
                 false,
+                search_scope_from_index(ui.get_search_scope_index()),
                 self.chinese.load(Ordering::Acquire),
             ));
         }
@@ -1133,6 +1236,7 @@ impl Controller {
             state.folders_revision = None;
             state.page_complete = false;
             state.restoring = true;
+            state.deferred_search = None;
             state.restore_failed = false;
             state.pending_view = None;
             state.resume_after_close = None;
@@ -1146,6 +1250,7 @@ impl Controller {
             .unwrap()
             .store(true, Ordering::Release);
         self.search_generation.fetch_add(1, Ordering::AcqRel);
+        ui.set_albums(ModelRc::new(VecModel::<crate::AlbumRow>::default()));
         self.tree_generation.fetch_add(1, Ordering::AcqRel);
         // Load admission uses this same mutex. An older selection cannot pass its
         // generation check and enqueue Load after the task switch has cancelled it.
@@ -1163,7 +1268,15 @@ impl Controller {
         *self.search_publication.lock().unwrap() = None;
         // Install one safe runtime for B before any fallible I/O. If validation
         // fails, none of A's request, directory IDs or checked rows can leak into B.
-        *self.request.lock().unwrap() = task.definition.to_request(PAGE_SIZE, task.view.offset);
+        self.result_pages.lock().unwrap().clear();
+        self.window_coverage.lock().unwrap().take();
+        *self.request.lock().unwrap() = task.definition.to_request(
+            cache.as_ref().map_or_else(
+                || task_result_window_limit(&task.view, task_viewport_rows(ui)),
+                |cache| cache.limit.clamp(PAGE_SIZE, PAGE_SIZE * 3),
+            ),
+            task.view.offset,
+        );
         let stats = self.tree.lock().unwrap().stats.clone();
         *self.tree.lock().unwrap() = TreeState {
             stats,
@@ -1226,7 +1339,12 @@ impl Controller {
             return;
         }
         ui.set_search_workspace_loading(false);
-        self.task_workspace.lock().unwrap().restoring = false;
+        {
+            let mut state = self.task_workspace.lock().unwrap();
+            state.restoring = false;
+            state.loading = false;
+            state.deferred_search = None;
+        }
         match result {
             Ok((task, cache, selected, folder_missing, folders)) => {
                 self.task_workspace.lock().unwrap().restore_failed = false;
@@ -1278,8 +1396,17 @@ impl Controller {
         folder_missing: bool,
         folders: Vec<Folder>,
     ) {
+        let album_missing = album_filter_unavailable(&task.definition);
+        self.result_pages.lock().unwrap().clear();
+        self.window_coverage.lock().unwrap().take();
         apply_task_controls(ui, &task);
-        *self.request.lock().unwrap() = task.definition.to_request(PAGE_SIZE, task.view.offset);
+        *self.request.lock().unwrap() = task.definition.to_request(
+            cache.as_ref().map_or_else(
+                || task_result_window_limit(&task.view, task_viewport_rows(ui)),
+                |cache| cache.limit.clamp(PAGE_SIZE, PAGE_SIZE * 3),
+            ),
+            task.view.offset,
+        );
         let stats = self.tree.lock().unwrap().stats.clone();
         *self.tree.lock().unwrap() = cache.as_ref().map_or_else(
             || TreeState {
@@ -1321,6 +1448,7 @@ impl Controller {
             let (file, dirty) = self.metadata.lock().unwrap().for_display(&file, 0);
             *self.selected.lock().unwrap() = Some(file.clone());
             present_file(ui, &file);
+            self.queue_artwork(&file);
             ui.set_metadata_dirty(dirty);
             self.restore_task_audio_selection(&file);
         } else {
@@ -1377,12 +1505,24 @@ impl Controller {
         );
         ui.set_can_previous(cache.as_ref().is_some_and(|cache| cache.previous));
         ui.set_can_next(cache.as_ref().is_some_and(|cache| cache.next));
+        if let Some(coverage) = cache
+            .as_ref()
+            .and_then(|cache| cache.window_coverage.clone())
+        {
+            let request = self.request.lock().unwrap().clone();
+            self.result_pages
+                .lock()
+                .unwrap()
+                .install_window(&request, &coverage);
+            *self.window_coverage.lock().unwrap() = Some(coverage);
+        }
         {
             let mut state = self.task_workspace.lock().unwrap();
             state.page_revision = cache.as_ref().map(|cache| cache.revision);
             state.folders_revision = state.page_revision;
             state.page_complete = cache.is_some();
             state.unavailable_folder = task.definition.folder.clone().filter(|_| folder_missing);
+            state.unavailable_album = task.definition.filters.album_id.filter(|_| album_missing);
             if let Some(stored) = state
                 .workspace
                 .session
@@ -1393,7 +1533,14 @@ impl Controller {
                 *stored = task.clone();
             }
         }
-        if folder_missing {
+        if album_missing {
+            self.reload_tree();
+            ui.set_status(self.localized("任务专辑已失效，请重新选择专辑或重置过滤条件；检索范围未扩大", "Task album is unavailable; choose an album or reset filters. The search scope was retained"));
+            self.queue_unavailable_album_choices(
+                ui,
+                self.search_generation.load(Ordering::Acquire),
+            );
+        } else if folder_missing {
             ui.set_selected_folder_path("".into());
             self.reload_tree();
             ui.set_status(self.localized(
@@ -1404,7 +1551,26 @@ impl Controller {
             self.task_workspace.lock().unwrap().pending_view = Some(task.view.clone());
             self.request_navigation_search(ui, true, false);
         } else {
+            self.admit_displayed_window_reads();
             self.reload_tree();
+            // A restored result cache still needs facets for this task's conditions.
+            // Reuse the bounded directory worker instead of retaining another tab's albums.
+            if !self.remote_read_only() {
+                let cancel = Arc::new(AtomicBool::new(false));
+                *self.search_cancel.lock().unwrap() = cancel.clone();
+                *self.facet_job.lock().unwrap() = Some(SearchJob {
+                    path_probe: None,
+                    window: None,
+                    backward_before: None,
+                    request: self.request.lock().unwrap().clone(),
+                    generation: self.search_generation.load(Ordering::Acquire),
+                    not_before: Instant::now(),
+                    cancel,
+                    facet_revision: self.facet_revision.load(Ordering::Acquire),
+                    provider: self.provider(),
+                });
+                self.facet_wake.notify_one();
+            }
         }
         self.restore_task_scroll(ui, &task.view);
         self.publish_search_tasks(ui);
@@ -1504,12 +1670,45 @@ impl Controller {
             .filter(|file| !file.missing)
     }
 
+    /// Stored workspace scopes use a `server-` prefix for a server library and any
+    /// other non-empty string for a local library. An empty scope is not loaded yet.
+    fn workspace_scope_matches_source(scope: &str, remote: bool) -> bool {
+        if scope.is_empty() {
+            return true;
+        }
+        remote == scope.starts_with("server-")
+    }
+
+    fn result_scroll_belongs_to_workspace(&self) -> bool {
+        let remote = self.remote_read_only();
+        let state = self.task_workspace.lock().unwrap();
+        let scope = state
+            .target
+            .as_ref()
+            .map(|target| target.library_scope.as_str())
+            .filter(|scope| !scope.is_empty())
+            .unwrap_or(state.workspace.library_scope.as_str());
+        Self::workspace_scope_matches_source(scope, remote)
+    }
+
     fn restore_task_scroll(&self, ui: &AppWindow, view: &SearchTaskView) {
-        let y = -(view.list_top_row as f32 + view.list_row_offset)
-            * ui.get_task_result_row_height().max(1.0);
+        if !self.result_scroll_belongs_to_workspace() {
+            return;
+        }
+        let rows = ui.get_rows().row_count();
+        // No rows yet (or an empty page): park the result list at the top. The saved
+        // row index stays on the task and is applied only after rows are published.
+        let (y, x) = if rows == 0 {
+            (0.0, 0.0)
+        } else {
+            let row_height = ui.get_task_result_row_height().max(1.0);
+            let top = view.list_top_row.min(rows - 1);
+            let fraction = view.list_row_offset.clamp(0.0, 0.999);
+            (-((top as f32) + fraction) * row_height, view.list_scroll_x)
+        };
         ui.invoke_restore_search_task_viewport(
             y,
-            view.list_scroll_x,
+            x,
             view.folder_scroll_y,
             view.filter_scroll_y,
             view.inspector_scroll_y,
@@ -1518,6 +1717,12 @@ impl Controller {
 
     pub(super) fn search_task_page_ready(&self, ui: &AppWindow, revision: Option<u64>) {
         self.task_workspace.lock().unwrap().page_revision = revision;
+        // Rows for this page are already on the list. Apply a scroll that was
+        // parked while the page was still empty (task switch or library reload).
+        let pending_scroll = self.task_workspace.lock().unwrap().pending_view.take();
+        if let Some(view) = pending_scroll {
+            self.restore_task_scroll(ui, &view);
+        }
         self.persist_search_task(ui);
         let state = self.task_workspace.lock().unwrap();
         if !state.protected
@@ -1540,6 +1745,27 @@ impl Controller {
         }
         self.persist_search_task(ui);
     }
+}
+
+/// The whole window height is a conservative upper bound for the result viewport,
+/// including while a task's cleared model has not completed its new layout.
+fn task_viewport_rows(ui: &AppWindow) -> usize {
+    let height = ui
+        .window()
+        .size()
+        .to_logical(ui.window().scale_factor())
+        .height;
+    (height / ui.get_task_result_row_height().max(1.0)).ceil() as usize
+}
+
+/// Include the saved top row's full screen when no result cache survives.
+/// Persisted positions cannot expand the result window beyond 600 rows.
+fn task_result_window_limit(view: &SearchTaskView, visible_rows: usize) -> usize {
+    view.list_top_row
+        .saturating_add(visible_rows.max(1))
+        .div_ceil(PAGE_SIZE)
+        .clamp(1, 3)
+        * PAGE_SIZE
 }
 
 fn task_inputs_valid(task: &SearchTask) -> bool {
@@ -1611,6 +1837,33 @@ fn task_inputs_valid(task: &SearchTask) -> bool {
 
 fn apply_task_controls(ui: &AppWindow, task: &SearchTask) {
     let definition = &task.definition;
+    ui.set_search_scope_index(search_scope_index(definition.scope));
+    ui.set_album_filter_unavailable(album_filter_unavailable(definition));
+    let label = definition
+        .album_binding
+        .as_ref()
+        .map(|binding| album_bindings::binding_label(binding, ui.get_chinese()))
+        .or_else(|| definition.filters.album.clone())
+        .unwrap_or_else(|| {
+            if definition.filters.album_id.is_some() {
+                if ui.get_chinese() {
+                    "专辑身份不可用".into()
+                } else {
+                    "Unavailable album".into()
+                }
+            } else {
+                String::new()
+            }
+        });
+    ui.set_album_filter(label.into());
+    ui.set_album_filter_id(
+        definition
+            .filters
+            .album_id
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
     let view = &task.view;
     let raw = &view.raw_inputs;
     ui.set_query(
@@ -1722,6 +1975,7 @@ fn resolve_task(
     mut task: SearchTask,
     cache: Option<TaskCache>,
 ) -> Result<ResolvedTask, String> {
+    let album_missing = resolve_album_filter(provider, &mut task.definition)?;
     let resolve_audio = |reference: &SearchAudioRef| -> Result<Option<AudioFile>, String> {
         match provider.get_audio(reference.id) {
             Ok(file) if audiolib_db::indexed_paths_equal(&file.file_path, &reference.file_path) => {
@@ -1797,8 +2051,15 @@ fn resolve_task(
         .map_err(|error| error.to_string())?;
     let cache = cache.filter(|cache| {
         !folder_missing
+            && !album_missing
             && cache.provider.ptr_eq(&Arc::downgrade(provider))
             && Some(cache.revision) == revision
+            && cache.window_coverage.as_ref().is_some_and(|coverage| {
+                coverage.revision == Some(cache.revision)
+                    && coverage.positions.len() == cache.records.len()
+                    && coverage.positions.len() <= PAGE_SIZE * 3
+                    && coverage.before_raw == task.view.offset
+            })
     });
     Ok((task, cache, selected, folder_missing, Vec::new()))
 }

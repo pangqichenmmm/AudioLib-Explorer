@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "audiolib/migration-report.schema.json",
+  "title": "AudioLib schema 8→9 migration report",
+  "description": "Last stdout line of `audiolib-migrate <action> --db <path>` (exit 0 = ok, otherwise read error_code; second start while running exits 2 with already_running) and the JSON body of GET /admin/api/migration/status and POST /admin/api/migration/{start,pause,resume,cancel,rollback} (409 with the same body for already_running). HTTP-level rules: doc/schemas/migration-http.schema.json.",
+  "type": "object",
+  "required": [
+    "state",
+    "error_code",
+    "progress",
+    "phases",
+    "switch",
+    "batches",
+    "eta_s"
+  ],
+  "properties": {
+    "state": {
+      "enum": [
+        "idle",
+        "deferred",
+        "preflight",
+        "backing_up",
+        "running",
+        "paused",
+        "switching",
+        "done",
+        "failed",
+        "cancelled",
+        "rolled_back"
+      ]
+    },
+    "error_code": {
+      "description": "null on success. disk_full: state paused, checkpoint kept, resume continues. read_only: blocked at preflight, state failed, no backup, DB untouched. io_error: other IO errors.",
+      "enum": [
+        null,
+        "insufficient_space",
+        "locked",
+        "already_running",
+        "backup_failed",
+        "integrity_failed",
+        "disk_full",
+        "read_only",
+        "io_error",
+        "not_migrated"
+      ]
+    },
+    "progress": {
+      "type": "object",
+      "required": [
+        "done",
+        "total"
+      ],
+      "properties": {
+        "done": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "phases": {
+      "description": "Phase name → elapsed ms. backup, path_build, optimize, switch are always present.",
+      "type": "object",
+      "properties": {
+        "backup": {
+          "type": "number",
+          "minimum": 0
+        },
+        "path_build": {
+          "type": "number",
+          "minimum": 0
+        },
+        "optimize": {
+          "type": "number",
+          "minimum": 0
+        },
+        "switch": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0
+      },
+      "required": [
+        "backup",
+        "path_build",
+        "optimize",
+        "switch"
+      ]
+    },
+    "switch": {
+      "description": "source_search_rev is 2 before the switch and 3 after.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "source_search_rev",
+        "features"
+      ],
+      "properties": {
+        "source_search_rev": {
+          "enum": [
+            2,
+            3
+          ]
+        },
+        "user_version": {
+          "type": "integer"
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "batches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "rows",
+          "ms"
+        ],
+        "properties": {
+          "rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ms": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "eta_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "ids": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "description": "Search actions only (main_search/path_search --q --limit --cursor): {ids, next_cursor}. This projection omits SearchPage.total_count. Directory searches use limit + 1 lookahead; their total_count is an observed prefix lower bound without a cursor, or a page-local suffix count after a cursor, never a guaranteed global total while more results remain. See doc/api/README.md section 5."
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Authoritative directory-search continuation: nonempty when lookahead found another hit, null when there are no more pages. The migration search projection uses null; the HTTP SearchPage omits this field on its last page. Internal has_more is not an additional response field."
+    }
+  }
+}

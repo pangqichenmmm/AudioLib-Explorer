@@ -205,6 +205,7 @@ fn cold_fragment_facets_never_publish_unscored_ids_as_a_bm25_ranking() {
                     visibility,
                     ..Default::default()
                 },
+                ..Default::default()
             };
             assert_eq!(
                 counts(&provider, &scoped),

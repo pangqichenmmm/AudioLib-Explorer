@@ -96,7 +96,7 @@ async fn get(app: &Router, path: &str) -> (Value, f64) {
 }
 
 fn assert_library(value: &Value, revision: u64) {
-    assert_eq!(value["schema_version"], 6);
+    assert_eq!(value["schema_version"], audiolib_db::SCHEMA_VERSION);
     assert_eq!(value["snapshot_format"]["id"], PLAN_B_FORMAT);
     assert_eq!(
         value["snapshot_format"]["format"]["features"]["play_history_retired"],
@@ -147,7 +147,10 @@ async fn full_library_v6_router_benchmark() {
     .unwrap();
     assert_eq!(inspection.format, LibraryFormat::target());
     assert!(inspection.decision.direct_use);
-    assert_eq!(PLAN_B_FORMAT, "ale-s6-cld1-t3-m2-p1");
+    assert_eq!(
+        LibraryFormat::target().snapshot_format_id().as_deref(),
+        Some(PLAN_B_FORMAT)
+    );
     let mut report_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -203,7 +206,7 @@ async fn full_library_v6_router_benchmark() {
     let (health, _) = get(&app, "/api/v1/health").await;
     assert_eq!(health["status"], "ok");
     assert_eq!(health["version"], VERSION);
-    assert_eq!(health["schema_version"], 6);
+    assert_eq!(health["schema_version"], audiolib_db::SCHEMA_VERSION);
     assert_eq!(health["compatibility_catalog_revision"], CATALOG_REVISION);
     let (capabilities, _) = get(&app, "/api/v1/capabilities").await;
     assert_eq!(
@@ -260,7 +263,7 @@ async fn full_library_v6_router_benchmark() {
         "sqlite_version":sqlite_version,
         "database_bytes_before_startup":database_bytes,
         "format":inspection.format,
-        "schema_version":6,
+        "schema_version":audiolib_db::SCHEMA_VERSION,
         "retirement_revision":2,
         "audio_files":EXPECTED_RECORDS,
         "stats":first["stats"],
